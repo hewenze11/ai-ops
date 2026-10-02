@@ -1,0 +1,26 @@
+services:
+  control:
+    image: ${AI_OPS_IMAGE:-ai-ops-service:local}
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${AI_OPS_PORT:-18765}:8765"
+    environment:
+      AI_OPS_ADMIN_TOKEN_FILE: /run/secrets/admin_token
+    volumes:
+      - ./state:/data
+      - ./secrets/admin_token:/run/secrets/admin_token:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

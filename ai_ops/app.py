@@ -59,12 +59,13 @@ class Claim(StrictModel):
 
 class Result(StrictModel):
     claim_id: str = Field(min_length=16, max_length=128)
-    status: Literal["succeeded", "failed", "unknown"]
+    status: Literal["succeeded", "failed", "unknown", "cancelled"]
     exit_code: int | None = None
     stdout: str = Field(default="", max_length=65536)
     stderr: str = Field(default="", max_length=65536)
     error_code: str | None = Field(default=None, max_length=100)
     output_truncated: bool = False
+    output_archives: dict | None = None
 
     @model_validator(mode="after")
     def success_requires_zero(self):
@@ -94,14 +95,16 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
     with sqlite3.connect(path) as db:
         db.row_factory = sqlite3.Row
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3):
+        if version not in (0, 1, 2, 3, 4):
             raise ValueError("Unsupported database schema; refusing to modify it")
         from .custom_tasks import SCHEMA as CUSTOM_SCHEMA
         from .turns import SCHEMA as TURN_SCHEMA, migrate, enqueue_turn, set_turn_state
         db.execute("PRAGMA journal_mode=WAL")
-        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA)
+        from .execution import SCHEMA as EXEC_SCHEMA, migrate as migrate_execution
+        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA)
         migrate(db)
-        db.execute("PRAGMA user_version=3")
+        migrate_execution(db)
+        db.execute("PRAGMA user_version=4")
         # Do not repeat a provider call whose response was lost during a crash.
         interrupted = db.execute("SELECT id FROM role_turns WHERE state='calling'").fetchall()
         for row in interrupted:
@@ -153,11 +156,13 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
         result["result"] = json.loads(result["result"]) if result["result"] else None
         return result
 
-    app = FastAPI(title="AI Ops backend preview", version="0.1.0.dev3")
+    app = FastAPI(title="AI Ops backend preview", version="0.1.0.dev4")
     from .custom_tasks import install_custom_tasks
     from .turns import install_turns
     install_custom_tasks(app, transaction, audit, admin, admin_token)
     install_turns(app, transaction, audit, admin, default_model)
+    from .execution import install_execution, cancel_task, check_archives
+    install_execution(app, transaction, audit, admin, agent_auth)
 
     @app.get("/healthz")
     def health():
@@ -236,19 +241,20 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
     @app.post("/api/v1/tasks/{task_id}/cancel", dependencies=[Depends(admin)])
     def cancel(task_id: str):
         with transaction() as db:
-            changed = db.execute("UPDATE tasks SET state='cancelled',updated_at=? WHERE id=? AND state IN ('queued','awaiting_approval')", (time.time(), task_id)).rowcount
-            if not changed:
-                raise HTTPException(409, "Only unclaimed tasks can be cancelled in this preview; running cancellation is not implemented")
-            task = db.execute("SELECT turn_id FROM tasks WHERE id=?", (task_id,)).fetchone()
-            set_turn_state(db, task['turn_id'], 'cancelled')
-            audit(db, "task.cancelled", task_id, "admin", {})
-        return {"state": "cancelled"}
+            task = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if task is None:
+                raise HTTPException(404, 'Task not found')
+            state = cancel_task(db, audit, task)
+            if state == 'cancelled':
+                set_turn_state(db, task['turn_id'], 'cancelled')
+                audit(db, 'task.cancelled', task_id, 'admin', {})
+        return {'state': state}
 
     @app.post("/api/v1/agents/{asset_id}/claim")
     def claim(asset_id: Identifier, body: Claim, authorization: str | None = Header(default=None)):
         with transaction() as db:
             asset = agent_auth(db, asset_id, authorization)
-            if body.protocol_version != PROTOCOL:
+            if body.protocol_version not in ('1.0', '1.1'):
                 raise HTTPException(409, "Unsupported protocol version")
             # FIFO is now by parent ROLE TURN, not command insertion order.
             # A multi-step model turn may add a child after a later manual turn.
@@ -260,14 +266,14 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
                   AND prior.state IN ('queued','awaiting_approval','claimed','unknown'))
                 ORDER BY rt.seq,t.seq LIMIT 1""", (asset_id,)).fetchone()
             if row is None:
-                return {"task": None, "protocol_version": PROTOCOL}
+                return {"task": None, "protocol_version": body.protocol_version}
             payload = json.loads(row["payload"])
             if payload["run_as"] not in json.loads(asset["allowed_users"]):
                 raise HTTPException(403, "Execution account is no longer available")
             claim_id = secrets.token_urlsafe(24)
-            db.execute("UPDATE tasks SET state='claimed',claim_id=?,updated_at=? WHERE id=?", (claim_id, time.time(), row["id"]))
+            db.execute("UPDATE tasks SET state='claimed',claim_id=?,claimed_protocol=?,updated_at=? WHERE id=?", (claim_id, body.protocol_version, time.time(), row["id"]))
             audit(db, "task.claimed", row["id"], "agent:" + asset_id, {"claim_id": claim_id})
-            return {"protocol_version": PROTOCOL, "task": {"id": row["id"], "claim_id": claim_id, **payload}}
+            return {"protocol_version": body.protocol_version, "task": {"id": row["id"], "claim_id": claim_id, **payload}}
 
     @app.post("/api/v1/agents/{asset_id}/tasks/{task_id}/result")
     def report_result(asset_id: Identifier, task_id: str, body: Result, authorization: str | None = Header(default=None)):
@@ -280,15 +286,22 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
                 raise HTTPException(403, "Claim does not match")
             result = body.model_dump_json()
             if row["result"] is not None:
-                if json.loads(row["result"]) == body.model_dump():
+                if Result.model_validate_json(row['result']).model_dump() == body.model_dump():
                     return {"accepted": True, "duplicate": True}
                 raise HTTPException(409, "A different result is already recorded")
             if row["state"] != "claimed":
                 raise HTTPException(409, "Task is not claimed")
+            if body.status == 'cancelled' and (row['claimed_protocol'] != '1.1' or row['cancel_requested_at'] is None):
+                raise HTTPException(409, 'Cancelled outcome requires an acknowledged cancellation request')
+            check_archives(db, task_id, body.output_archives)
             db.execute("UPDATE tasks SET state=?,result=?,updated_at=? WHERE id=?", (body.status, result, time.time(), task_id))
             parent = db.execute("SELECT * FROM role_turns WHERE id=?", (row['turn_id'],)).fetchone()
             if body.status == 'unknown':
                 set_turn_state(db, parent['id'], 'blocked_unknown', 'EXECUTION_UNKNOWN')
+            elif body.status == 'cancelled' or row['cancel_requested_at'] is not None:
+                # A completion racing with cancel remains an honest task result,
+                # but no more model tools run in this cancelled parent turn.
+                set_turn_state(db, parent['id'], 'cancelled')
             elif parent['source'] == 'command':
                 set_turn_state(db, parent['id'], 'completed' if body.status == 'succeeded' else 'failed')
             audit(db, "task.result", task_id, "agent:" + asset_id, body.model_dump())

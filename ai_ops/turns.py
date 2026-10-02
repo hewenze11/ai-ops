@@ -324,9 +324,13 @@ def install_turns(app, transaction, audit, admin, default_model=""):
                 raise HTTPException(404, "Turn not found")
             if row["state"] not in ("queued", "ready", "waiting_tool"):
                 raise HTTPException(409, "Cannot cancel active model call or unknown/terminal turn in this preview")
-            task = db.execute("SELECT state FROM tasks WHERE id=?", (row["pending_task_id"],)).fetchone()
-            if task and task["state"] in ("claimed", "unknown"):
-                raise HTTPException(409, "Running or unknown remote execution requires separate control")
+            task = db.execute("SELECT * FROM tasks WHERE id=?", (row["pending_task_id"],)).fetchone()
+            if task and task['state'] == 'unknown':
+                raise HTTPException(409, 'Unknown execution cannot be cleared by cancellation')
+            if task and task['state'] == 'claimed':
+                from .execution import cancel_task
+                state = cancel_task(db, audit, task)
+                return {'state': state}
             db.execute("UPDATE tasks SET state='cancelled',updated_at=? WHERE turn_id=? AND state IN ('queued','awaiting_approval')", (time.time(), turn_id))
             set_turn_state(db, turn_id, "cancelled")
             audit(db, "turn.cancelled", turn_id, "admin", {})

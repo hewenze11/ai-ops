@@ -267,7 +267,7 @@ def test_v1_database_migration_preserves_execution_tasks(tmp_path):
         db.execute("INSERT INTO audit(event,entity_id,actor,details,created_at) VALUES('task.result','old-task','test','{}',0)")
     create_app(str(path), ADMIN)
     with sqlite3.connect(path) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
         assert db.execute("SELECT name FROM roles WHERE id='original'").fetchone()[0] == "Original role"
         assert db.execute("SELECT state FROM tasks WHERE id='old-task'").fetchone()[0] == "succeeded"
         assert db.execute("SELECT count(*) FROM audit WHERE entity_id='old-task'").fetchone()[0] == 1

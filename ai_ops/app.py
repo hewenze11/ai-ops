@@ -8,18 +8,14 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import Field, model_validator
 
-Identifier = Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")]
-UserName = Annotated[str, StringConstraints(pattern=r"^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}\$?$")]
+from .models import Identifier, StrictModel, UserName
+
 PROTOCOL = "1.0"
-
-
-class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
 
 
 class Role(StrictModel):
@@ -95,16 +91,18 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
     with sqlite3.connect(path) as db:
         db.row_factory = sqlite3.Row
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4):
+        if version not in (0, 1, 2, 3, 4, 5):
             raise ValueError("Unsupported database schema; refusing to modify it")
         from .custom_tasks import SCHEMA as CUSTOM_SCHEMA
         from .turns import SCHEMA as TURN_SCHEMA, migrate, enqueue_turn, set_turn_state
         db.execute("PRAGMA journal_mode=WAL")
         from .execution import SCHEMA as EXEC_SCHEMA, migrate as migrate_execution
-        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA)
+        from .leases import SCHEMA as LEASE_SCHEMA, migrate as migrate_leases
+        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA + LEASE_SCHEMA)
         migrate(db)
         migrate_execution(db)
-        db.execute("PRAGMA user_version=4")
+        migrate_leases(db)
+        db.execute("PRAGMA user_version=5")
         # Do not repeat a provider call whose response was lost during a crash.
         interrupted = db.execute("SELECT id FROM role_turns WHERE state='calling'").fetchall()
         for row in interrupted:
@@ -150,19 +148,27 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
             raise HTTPException(403, "Invalid asset credential")
         return row
 
-    def view(row):
+    from .leases import LEASE_SECONDS, lease_view, open_lease, close_lease
+
+    def view(row, db=None):
+        # Callers pass the transaction they already hold; opening a second
+        # connection here would self-deadlock on SQLite's write lock.
         result = dict(row)
         result["payload"] = json.loads(result["payload"])
         result["result"] = json.loads(result["result"]) if result["result"] else None
+        if db is not None:
+            result["lease"] = lease_view(db, row["id"])
         return result
 
-    app = FastAPI(title="AI Ops backend preview", version="0.1.0.dev4")
+    app = FastAPI(title="AI Ops backend preview", version="0.1.0.dev5")
     from .custom_tasks import install_custom_tasks
     from .turns import install_turns
     install_custom_tasks(app, transaction, audit, admin, admin_token)
     install_turns(app, transaction, audit, admin, default_model)
     from .execution import install_execution, cancel_task, check_archives
     install_execution(app, transaction, audit, admin, agent_auth)
+    from .leases import install_leases
+    install_leases(app, transaction, audit, admin)
 
     @app.get("/healthz")
     def health():
@@ -203,7 +209,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
             if old:
                 if json.loads(old["payload"]) != body.model_dump():
                     raise HTTPException(409, "Idempotency key reused with different payload")
-                return view(old)
+                return view(old, db)
             if not db.execute("SELECT 1 FROM roles WHERE id=?", (body.role_id,)).fetchone():
                 raise HTTPException(404, "Role not found")
             asset = db.execute("SELECT * FROM assets WHERE id=?", (body.asset_id,)).fetchone()
@@ -219,7 +225,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
             db.execute("INSERT INTO tasks(id,role_id,asset_id,payload,state,idempotency_key,created_at,updated_at,turn_id) VALUES(?,?,?,?,?,?,?,?,?)",
                        (task_id, body.role_id, body.asset_id, payload, state, body.idempotency_key, now, now, turn_id))
             audit(db, "task.submitted", task_id, "admin", body.model_dump())
-            return view(db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
+            return view(db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone(), db)
 
     @app.get("/api/v1/tasks/{task_id}", dependencies=[Depends(admin)])
     def get_task(task_id: str):
@@ -227,7 +233,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if row is None:
                 raise HTTPException(404, "Task not found")
-            return view(row)
+            return view(row, db)
 
     @app.post("/api/v1/tasks/{task_id}/approve", dependencies=[Depends(admin)])
     def approve(task_id: str):
@@ -245,8 +251,10 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
             if task is None:
                 raise HTTPException(404, 'Task not found')
             state = cancel_task(db, audit, task)
+            from .leases import close_lease
             if state == 'cancelled':
                 set_turn_state(db, task['turn_id'], 'cancelled')
+                close_lease(db, task_id)
                 audit(db, 'task.cancelled', task_id, 'admin', {})
         return {'state': state}
 
@@ -271,7 +279,8 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
             if payload["run_as"] not in json.loads(asset["allowed_users"]):
                 raise HTTPException(403, "Execution account is no longer available")
             claim_id = secrets.token_urlsafe(24)
-            db.execute("UPDATE tasks SET state='claimed',claim_id=?,claimed_protocol=?,updated_at=? WHERE id=?", (claim_id, body.protocol_version, time.time(), row["id"]))
+            db.execute("UPDATE tasks SET state='claimed',claim_id=?,claimed_protocol=?,lease_seconds=?,claim_count=claim_count+1,updated_at=? WHERE id=?", (claim_id, body.protocol_version, LEASE_SECONDS, time.time(), row["id"]))
+            open_lease(db, row['id'], asset_id, claim_id)
             audit(db, "task.claimed", row["id"], "agent:" + asset_id, {"claim_id": claim_id})
             return {"protocol_version": body.protocol_version, "task": {"id": row["id"], "claim_id": claim_id, **payload}}
 
@@ -294,6 +303,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
             if body.status == 'cancelled' and (row['claimed_protocol'] != '1.1' or row['cancel_requested_at'] is None):
                 raise HTTPException(409, 'Cancelled outcome requires an acknowledged cancellation request')
             check_archives(db, task_id, body.output_archives)
+            close_lease(db, task_id)
             db.execute("UPDATE tasks SET state=?,result=?,updated_at=? WHERE id=?", (body.status, result, time.time(), task_id))
             parent = db.execute("SELECT * FROM role_turns WHERE id=?", (row['turn_id'],)).fetchone()
             if body.status == 'unknown':

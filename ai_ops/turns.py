@@ -5,12 +5,10 @@ import uuid
 from typing import Annotated, Literal
 
 from fastapi import Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field
 
 from .model_client import ModelFailure
-
-ID = Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")]
-USER = Annotated[str, StringConstraints(pattern=r"^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}\$?$")]
+from .models import Identifier as ID, UserName as USER
 TERMINAL = ("completed", "failed", "cancelled")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS role_models(

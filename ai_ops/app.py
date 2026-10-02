@@ -83,7 +83,6 @@ CREATE TABLE IF NOT EXISTS tasks(
  idempotency_key TEXT UNIQUE NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS task_queue ON tasks(role_id,state,seq);
 CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, entity_id TEXT, actor TEXT NOT NULL, details TEXT NOT NULL, created_at REAL NOT NULL);
-PRAGMA user_version=1;
 """
 
 
@@ -94,10 +93,11 @@ def create_app(db_path: str, admin_token: str) -> FastAPI:
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as db:
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1):
+        if version not in (0, 1, 2):
             raise ValueError("Unsupported database schema; refusing to modify it")
+        from .custom_tasks import SCHEMA as CUSTOM_SCHEMA
         db.execute("PRAGMA journal_mode=WAL")
-        db.executescript(SCHEMA)
+        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + "\nPRAGMA user_version=2;\nCOMMIT;")
 
     @contextmanager
     def transaction():
@@ -143,7 +143,9 @@ def create_app(db_path: str, admin_token: str) -> FastAPI:
         result["result"] = json.loads(result["result"]) if result["result"] else None
         return result
 
-    app = FastAPI(title="AI Ops execution protocol preview", version="0.1.0.dev1")
+    app = FastAPI(title="AI Ops backend preview", version="0.1.0.dev2")
+    from .custom_tasks import install_custom_tasks
+    install_custom_tasks(app, transaction, audit, admin, admin_token)
 
     @app.get("/healthz")
     def health():

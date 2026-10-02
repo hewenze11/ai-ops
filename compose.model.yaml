@@ -1,0 +1,9 @@
+# Optional overlay. Keep the real key in a restricted, gitignored secret file.
+services:
+  control:
+    environment:
+      AI_OPS_MODEL_BASE_URL: ${AI_OPS_MODEL_BASE_URL:?Set a trusted HTTPS model API base URL}
+      AI_OPS_MODEL: ${AI_OPS_MODEL:-}
+      AI_OPS_MODEL_KEY_FILE: /run/secrets/model_key
+    volumes:
+      - ./secrets/model_key:/run/secrets/model_key:ro

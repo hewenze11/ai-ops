@@ -311,7 +311,7 @@ def install_custom_tasks(app, transaction, audit, admin, admin_token):
             if existing:
                 if json.loads(existing["payload"]) != payload:
                     raise HTTPException(409, "Event ID reused with a different payload")
-                answer = {"accepted": True, "event_id": existing["id"], "state": existing["state"], "duplicate": True}
+                answer = {"accepted": True, "event_id": existing["id"], "turn_id": existing["turn_id"], "state": existing["state"], "duplicate": True}
             elif row["deleted_at"] is not None or not cfg["enabled"] or (x_schedule_event_id and item["state"] == "cancelled"):
                 audit(db, "trigger.rejected", custom_id, "scheduler" if internal else "trigger", {"reason": "disabled_or_deleted", "payload": payload})
                 rejection = HTTPException(409, "Custom task disabled or deleted")
@@ -320,8 +320,11 @@ def install_custom_tasks(app, transaction, audit, admin, admin_token):
                 event_id = str(uuid.uuid4())
                 db.execute("INSERT INTO trigger_events(id,custom_task_id,dedupe_key,source,scheduled_for,payload,snapshot,revision,role_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                            (event_id, custom_id, key, source, scheduled_for, json.dumps(payload, ensure_ascii=False), snapshot, revision, template["role_id"], time.time()))
-                audit(db, "trigger.accepted", event_id, source, {"custom_task_id": custom_id, "role_id": template["role_id"], "revision": revision, "source": source})
-                answer = {"accepted": True, "event_id": event_id, "state": "queued", "duplicate": False}
+                from .turns import enqueue_turn
+                turn_id = enqueue_turn(db, template['role_id'], source, event_id, template['execution_users'], template['mode'], template['prompt'], payload)
+                db.execute("UPDATE trigger_events SET turn_id=? WHERE id=?", (turn_id, event_id))
+                audit(db, "trigger.accepted", event_id, source, {"custom_task_id": custom_id, "role_id": template["role_id"], "revision": revision, "source": source, "turn_id": turn_id})
+                answer = {"accepted": True, "event_id": event_id, "turn_id": turn_id, "state": "queued", "duplicate": False}
         if rejection:
             raise rejection
         return answer

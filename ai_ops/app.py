@@ -86,18 +86,28 @@ CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, event TE
 """
 
 
-def create_app(db_path: str, admin_token: str) -> FastAPI:
+def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastAPI:
     if len(admin_token) < 32:
         raise ValueError("A random admin token of at least 32 characters is required")
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as db:
+        db.row_factory = sqlite3.Row
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2):
+        if version not in (0, 1, 2, 3):
             raise ValueError("Unsupported database schema; refusing to modify it")
         from .custom_tasks import SCHEMA as CUSTOM_SCHEMA
+        from .turns import SCHEMA as TURN_SCHEMA, migrate, enqueue_turn, set_turn_state
         db.execute("PRAGMA journal_mode=WAL")
-        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + "\nPRAGMA user_version=2;\nCOMMIT;")
+        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA)
+        migrate(db)
+        db.execute("PRAGMA user_version=3")
+        # Do not repeat a provider call whose response was lost during a crash.
+        interrupted = db.execute("SELECT id FROM role_turns WHERE state='calling'").fetchall()
+        for row in interrupted:
+            set_turn_state(db, row['id'], 'failed', 'MODEL_CALL_INTERRUPTED')
+            db.execute("UPDATE model_calls SET state='failed',error_code='MODEL_CALL_INTERRUPTED',finished_at=? WHERE turn_id=? AND state='calling'", (time.time(), row['id']))
+            db.execute("INSERT INTO audit(event,entity_id,actor,details,created_at) VALUES('model.interrupted',?,'service','{}',?)", (row['id'], time.time()))
 
     @contextmanager
     def transaction():
@@ -143,9 +153,11 @@ def create_app(db_path: str, admin_token: str) -> FastAPI:
         result["result"] = json.loads(result["result"]) if result["result"] else None
         return result
 
-    app = FastAPI(title="AI Ops backend preview", version="0.1.0.dev2")
+    app = FastAPI(title="AI Ops backend preview", version="0.1.0.dev3")
     from .custom_tasks import install_custom_tasks
+    from .turns import install_turns
     install_custom_tasks(app, transaction, audit, admin, admin_token)
+    install_turns(app, transaction, audit, admin, default_model)
 
     @app.get("/healthz")
     def health():
@@ -197,8 +209,10 @@ def create_app(db_path: str, admin_token: str) -> FastAPI:
             now = time.time()
             task_id = str(uuid.uuid4())
             state = "awaiting_approval" if body.mode == "confirm" else "queued"
-            db.execute("INSERT INTO tasks(id,role_id,asset_id,payload,state,idempotency_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                       (task_id, body.role_id, body.asset_id, payload, state, body.idempotency_key, now, now))
+            turn_id = enqueue_turn(db, body.role_id, "command", task_id, body.execution_users, body.mode, "Administrative command", {}, now)
+            db.execute("UPDATE role_turns SET state='waiting_tool',pending_task_id=? WHERE id=?", (task_id, turn_id))
+            db.execute("INSERT INTO tasks(id,role_id,asset_id,payload,state,idempotency_key,created_at,updated_at,turn_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                       (task_id, body.role_id, body.asset_id, payload, state, body.idempotency_key, now, now, turn_id))
             audit(db, "task.submitted", task_id, "admin", body.model_dump())
             return view(db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
 
@@ -225,6 +239,8 @@ def create_app(db_path: str, admin_token: str) -> FastAPI:
             changed = db.execute("UPDATE tasks SET state='cancelled',updated_at=? WHERE id=? AND state IN ('queued','awaiting_approval')", (time.time(), task_id)).rowcount
             if not changed:
                 raise HTTPException(409, "Only unclaimed tasks can be cancelled in this preview; running cancellation is not implemented")
+            task = db.execute("SELECT turn_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+            set_turn_state(db, task['turn_id'], 'cancelled')
             audit(db, "task.cancelled", task_id, "admin", {})
         return {"state": "cancelled"}
 
@@ -234,11 +250,15 @@ def create_app(db_path: str, admin_token: str) -> FastAPI:
             asset = agent_auth(db, asset_id, authorization)
             if body.protocol_version != PROTOCOL:
                 raise HTTPException(409, "Unsupported protocol version")
-            # Strict FIFO PER ROLE, even when earlier tasks target other assets.
-            row = db.execute("""SELECT t.* FROM tasks t WHERE t.state='queued' AND t.asset_id=?
-                AND NOT EXISTS (SELECT 1 FROM tasks p WHERE p.role_id=t.role_id AND p.seq<t.seq
-                  AND p.state IN ('queued','awaiting_approval','claimed','unknown'))
-                ORDER BY t.seq LIMIT 1""", (asset_id,)).fetchone()
+            # FIFO is now by parent ROLE TURN, not command insertion order.
+            # A multi-step model turn may add a child after a later manual turn.
+            row = db.execute("""SELECT t.* FROM tasks t JOIN role_turns rt ON rt.id=t.turn_id
+                WHERE t.state='queued' AND t.asset_id=? AND rt.state='waiting_tool'
+                AND NOT EXISTS (SELECT 1 FROM role_turns p WHERE p.role_id=rt.role_id AND p.seq<rt.seq
+                  AND p.state NOT IN ('completed','failed','cancelled'))
+                AND NOT EXISTS (SELECT 1 FROM tasks prior WHERE prior.turn_id=t.turn_id AND prior.seq<t.seq
+                  AND prior.state IN ('queued','awaiting_approval','claimed','unknown'))
+                ORDER BY rt.seq,t.seq LIMIT 1""", (asset_id,)).fetchone()
             if row is None:
                 return {"task": None, "protocol_version": PROTOCOL}
             payload = json.loads(row["payload"])
@@ -266,6 +286,11 @@ def create_app(db_path: str, admin_token: str) -> FastAPI:
             if row["state"] != "claimed":
                 raise HTTPException(409, "Task is not claimed")
             db.execute("UPDATE tasks SET state=?,result=?,updated_at=? WHERE id=?", (body.status, result, time.time(), task_id))
+            parent = db.execute("SELECT * FROM role_turns WHERE id=?", (row['turn_id'],)).fetchone()
+            if body.status == 'unknown':
+                set_turn_state(db, parent['id'], 'blocked_unknown', 'EXECUTION_UNKNOWN')
+            elif parent['source'] == 'command':
+                set_turn_state(db, parent['id'], 'completed' if body.status == 'succeeded' else 'failed')
             audit(db, "task.result", task_id, "agent:" + asset_id, body.model_dump())
         return {"accepted": True, "duplicate": False}
 

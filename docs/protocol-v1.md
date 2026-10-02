@@ -4,7 +4,7 @@ Authority: this repository. Agent compatibility: `0.1.0.dev1`, exact protocol `1
 
 ## Trust boundaries
 
-Administrative API Bearer credential authorizes role/asset creation and task submission. It must NOT be available to an LLM tool. A future model tool receives server-owned round context and can choose only among its selected account references. Until that layer exists, API tasks are trusted human/admin submissions only.
+Administrative API Bearer credential authorizes role/asset creation and task submission. It must NOT be available to an LLM tool. The model tool receives server-owned round context and can choose only among its selected native accounts. Public POST /tasks remains a trusted human/admin endpoint; model tools create child commands internally without receiving an admin credential.
 
 Asset provisioning is an admin operation, usable from deployment CLI/API, not a Web registration wizard. Returns one random token once; server stores SHA-256 token hash. Agent authenticates with that token and matching asset ID. Account allowlists exist both at server and worker. Native operating-system permissions remain authoritative.
 
@@ -25,7 +25,7 @@ Asset provisioning is an admin operation, usable from deployment CLI/API, not a 
 }
 ```
 
-All selected users are stored as immutable task payload. The actual run_as must be among them and configured for this asset. Missing user fails; never try another account. One task currently contains one shell operation. Future multi-operation role turns must introduce a distinct parent turn ID; do not pretend this preview implements whole-conversation scheduling.
+All selected users are stored as immutable task payload. The actual run_as must be among them and configured for this asset. Missing user fails; never try another account. One Agent task contains one shell operation. Since dev3, control-side tasks have a distinct parent turn_id. Multi-operation role turns, manual commands and trigger inputs share one parent FIFO per role; see model-turns.md. Agent wire format remains 1.0.
 
 `mode=confirm` starts awaiting_approval. Administrative `POST /tasks/{id}/approve` is a separate control request, not a queued role message. Cancellation presently supports only awaiting_approval/queued.
 
@@ -33,7 +33,7 @@ All selected users are stored as immutable task payload. The actual run_as must 
 
 `POST /api/v1/agents/{asset_id}/claim`, body `{"protocol_version":"1.0"}`.
 
-Empty response: `{"protocol_version":"1.0","task":null}`. Otherwise task contains id (UUID), claim_id (random delivery nonce), and original task fields. Server atomically transitions queued → claimed and appends audit, then responds. Different roles may advance independently. Tasks within one role cannot bypass earlier queued/awaiting_approval/claimed/unknown entries, even across different assets.
+Empty response: `{"protocol_version":"1.0","task":null}`. Otherwise task contains id (UUID), claim_id (random delivery nonce), and original task fields. Server atomically transitions queued → claimed and appends audit, then responds. Different roles may advance independently. Commands cannot bypass an earlier unfinished parent role turn, even across different assets. A later command within the CURRENT multi-step turn runs before commands belonging to later turns; command insertion order alone no longer defines the role queue.
 
 `POST /api/v1/agents/{asset_id}/tasks/{task_id}/result`:
 

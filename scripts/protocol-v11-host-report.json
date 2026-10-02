@@ -1,0 +1,262 @@
+{
+  "run": "27812a3c15",
+  "checks": [
+    {
+      "case": "agent_reports_heartbeat",
+      "passed": true,
+      "evidence": {
+        "asset_id": "p11-host-27812a3c15",
+        "online": true,
+        "presence": {
+          "asset_id": "p11-host-27812a3c15",
+          "instance_id": "d438df6f-1b3a-49e5-b2b9-9f4232d1e50b",
+          "agent_version": "0.1.0.dev2",
+          "protocol_version": "1.1",
+          "last_seen": 1790945930.0660732
+        },
+        "unfinished_tasks": []
+      }
+    },
+    {
+      "case": "cancel_is_a_request_not_a_lie",
+      "passed": true,
+      "evidence": {
+        "state": "cancel_requested"
+      }
+    },
+    {
+      "case": "cancel_reached_the_native_process",
+      "passed": true,
+      "evidence": {
+        "claim_id": "DgpO2TKaC6PswdE3kDlTOTDEYNOUIArj",
+        "status": "cancelled",
+        "exit_code": -9,
+        "stdout": "started\n",
+        "stderr": "",
+        "error_code": "CANCELLED_BY_OPERATOR",
+        "output_truncated": false,
+        "output_archives": {
+          "stdout": {
+            "size": 8,
+            "sha256": "eff64b343dcb2b1dc113648e7089b9ce9f8a7f6c7808a03a2cffb4ad7302f606",
+            "complete": true
+          },
+          "stderr": {
+            "size": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "complete": true
+          }
+        }
+      }
+    },
+    {
+      "case": "cancelled_output_archived",
+      "passed": true,
+      "evidence": [
+        {
+          "stream": "stderr",
+          "size": 0,
+          "complete": 1
+        },
+        {
+          "stream": "stdout",
+          "size": 8,
+          "complete": 1
+        }
+      ]
+    },
+    {
+      "case": "no_process_survived_cancel",
+      "passed": true,
+      "evidence": null
+    },
+    {
+      "case": "archived_bytes_are_exact",
+      "passed": true,
+      "evidence": {
+        "stdout": 768000,
+        "stderr": 100000
+      }
+    },
+    {
+      "case": "archive_digest_matches",
+      "passed": true,
+      "evidence": null
+    },
+    {
+      "case": "complete_flag_is_honest",
+      "passed": true,
+      "evidence": {
+        "stderr": {
+          "task_id": "ee9c973f-56ea-41e1-8d75-9060eafd4cb2",
+          "stream": "stderr",
+          "size": 100000,
+          "sha256": "bd0c6c5974908ab9c44b0f7a3babe7f99f2049680556b186a4867dcde89ad6ee",
+          "complete": 1,
+          "finalized": 1
+        },
+        "stdout": {
+          "task_id": "ee9c973f-56ea-41e1-8d75-9060eafd4cb2",
+          "stream": "stdout",
+          "size": 768000,
+          "sha256": "ac454a8c77462fc1e25633be4df674cc16d3ebb3c1361d2967767f6c600a1f2f",
+          "complete": 1,
+          "finalized": 1
+        }
+      }
+    },
+    {
+      "case": "dns_and_cp_see_the_same_file",
+      "passed": true,
+      "evidence": null
+    },
+    {
+      "case": "first_step_was_claimed",
+      "passed": true,
+      "evidence": {
+        "seq": 45,
+        "id": "2328be33-7d3d-4995-bdcd-c8099bc41178",
+        "role_id": "p11-role-27812a3c15",
+        "asset_id": "p11-host-27812a3c15",
+        "payload": {
+          "role_id": "p11-role-27812a3c15",
+          "asset_id": "p11-host-27812a3c15",
+          "execution_users": [
+            "aiops_probe"
+          ],
+          "run_as": "aiops_probe",
+          "command": "id -un",
+          "timeout_seconds": 30,
+          "mode": "direct",
+          "idempotency_key": "p11-step1-27812a3c15"
+        },
+        "state": "succeeded",
+        "claim_id": "JJgL8kM6Dv6W66QmgaZb82N-o2oT3Cue",
+        "result": {
+          "claim_id": "JJgL8kM6Dv6W66QmgaZb82N-o2oT3Cue",
+          "status": "succeeded",
+          "exit_code": 0,
+          "stdout": "aiops_probe\n",
+          "stderr": "",
+          "error_code": null,
+          "output_truncated": false,
+          "output_archives": {
+            "stdout": {
+              "size": 12,
+              "sha256": "15e7be349714b62959451f32254d0f45c96880ab4169e7de5a7e3b23c649282a",
+              "complete": true
+            },
+            "stderr": {
+              "size": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "complete": true
+            }
+          }
+        },
+        "idempotency_key": "p11-step1-27812a3c15",
+        "created_at": 1790945933.2507775,
+        "updated_at": 1790945934.022621,
+        "turn_id": "370b73de-88e5-4b2b-8745-82eddf111e0c",
+        "claimed_protocol": "1.1",
+        "cancel_requested_at": null
+      }
+    },
+    {
+      "case": "running_agent_already_reported_the_step",
+      "passed": true,
+      "evidence": {
+        "state": "succeeded",
+        "result": {
+          "claim_id": "JJgL8kM6Dv6W66QmgaZb82N-o2oT3Cue",
+          "status": "succeeded",
+          "exit_code": 0,
+          "stdout": "aiops_probe\n",
+          "stderr": "",
+          "error_code": null,
+          "output_truncated": false,
+          "output_archives": {
+            "stdout": {
+              "size": 12,
+              "sha256": "15e7be349714b62959451f32254d0f45c96880ab4169e7de5a7e3b23c649282a",
+              "complete": true
+            },
+            "stderr": {
+              "size": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "complete": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "case": "queued_step_got_its_turn",
+      "passed": true,
+      "evidence": {
+        "seq": 44,
+        "id": "be75e954-c181-4b19-b819-7ad478458717",
+        "role_id": "p11-role-27812a3c15",
+        "asset_id": "p11-host-27812a3c15",
+        "payload": {
+          "role_id": "p11-role-27812a3c15",
+          "asset_id": "p11-host-27812a3c15",
+          "execution_users": [
+            "aiops_probe"
+          ],
+          "run_as": "aiops_probe",
+          "command": "id -un",
+          "timeout_seconds": 60,
+          "mode": "direct",
+          "idempotency_key": "p11-step2-27812a3c15"
+        },
+        "state": "succeeded",
+        "claim_id": "lw4Aq4Ge4r48eEgdIXgOShd-nc3dkaeA",
+        "result": {
+          "claim_id": "lw4Aq4Ge4r48eEgdIXgOShd-nc3dkaeA",
+          "status": "succeeded",
+          "exit_code": 0,
+          "stdout": "aiops_probe\n",
+          "stderr": "",
+          "error_code": null,
+          "output_truncated": false,
+          "output_archives": {
+            "stdout": {
+              "size": 12,
+              "sha256": "15e7be349714b62959451f32254d0f45c96880ab4169e7de5a7e3b23c649282a",
+              "complete": true
+            },
+            "stderr": {
+              "size": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "complete": true
+            }
+          }
+        },
+        "idempotency_key": "p11-step2-27812a3c15",
+        "created_at": 1790945933.2472806,
+        "updated_at": 1790945933.5986238,
+        "turn_id": "c194ad76-3b1e-4566-b8bf-642a069fe2c5",
+        "claimed_protocol": "1.1",
+        "cancel_requested_at": null
+      }
+    },
+    {
+      "case": "legacy_1_0_agent_still_claims",
+      "passed": true,
+      "evidence": null
+    },
+    {
+      "case": "cancel_refuses_unconfirmable_legacy_claim",
+      "passed": true,
+      "evidence": {
+        "note": "protocol 1.0 claim cannot be force-cancelled; 409 returned"
+      }
+    },
+    {
+      "case": "offline_status_is_observable",
+      "passed": true,
+      "evidence": null
+    }
+  ],
+  "passed": true
+}

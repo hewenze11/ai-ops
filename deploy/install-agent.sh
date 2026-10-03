@@ -83,14 +83,19 @@ esac
 
 # --- 1. least-privilege accounts ----------------------------------------
 say "Creating least-privilege execution accounts"
+# The accounts must be able to run a command as their target user (the agent
+# drops into them), so they need a real shell. Least privilege comes from
+# sudo/file permissions, NOT from nologin — a nologin shell makes the agent's
+# command spawn fail with PROCESS_START_FAILED.
+ACCOUNT_SHELL="$(command -v bash || command -v sh || echo /bin/sh)"
 if ! id "$READ_USER" >/dev/null 2>&1; then
-  useradd --system --create-home --shell /usr/sbin/nologin "$READ_USER"
+  useradd --system --create-home --shell "$ACCOUNT_SHELL" "$READ_USER"
   echo "created $READ_USER (read-only)"
 else
   echo "$READ_USER already exists"
 fi
 if ! id "$OPS_USER" >/dev/null 2>&1; then
-  useradd --system --create-home --shell /usr/sbin/nologin "$OPS_USER"
+  useradd --system --create-home --shell "$ACCOUNT_SHELL" "$OPS_USER"
   echo "created $OPS_USER (change)"
 else
   echo "$OPS_USER already exists"

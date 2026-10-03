@@ -168,3 +168,111 @@ def test_compress_keeps_head_and_tail():
     assert out.startswith("AAAA")
     assert out.endswith("BBBB")
     assert "omitted" in out
+
+
+def _seed_role_with_turn(client, headers, key="archive-model-0001"):
+    client.post("/api/v1/roles", headers=headers, json={"id": "ops", "name": "Ops"})
+    client.put("/api/v1/roles/ops/model", headers=headers,
+               json={"enabled": True, "model": "m", "max_model_steps": 4})
+    client.post("/api/v1/roles/ops/messages", headers=headers,
+                json={"text": "restart nginx on web-1", "execution_users": [], "mode": "readonly",
+                      "idempotency_key": key})
+
+    class FakeModel:
+        def complete(self, body):
+            return {"message": {"role": "assistant", "content": "done"}, "usage": {}, "model": "m"}
+
+    client.app.state.role_engine.advance(FakeModel())
+
+
+def test_model_archiver_writes_model_authored_forms():
+    """The role's OWN model authors the day's compressed/summary off the context
+    path; the deterministic forms are only the fallback."""
+    from ai_ops import memory_worker
+    client = make_client()
+    headers = {"Authorization": "Bearer " + ADMIN}
+    _seed_role_with_turn(client, headers)
+
+    class ArchiverModel:
+        def __init__(self): self.calls = []
+        def complete(self, body):
+            self.calls.append(body)
+            return {"message": {"role": "assistant", "content":
+                    "COMPRESSED: restarted nginx on web-1.\nSUMMARY: nginx restarted on web-1."},
+                    "usage": {}, "model": "m"}
+
+    model = ArchiverModel()
+    assert memory_worker.archive_once(client.app, model) is True
+    rows = client.get("/api/v1/roles/ops/memory-archive", headers=headers).json()
+    assert rows and rows[0]["state"] == memory.ARCHIVE_DONE
+    import time as _time
+    today = _time.strftime("%Y-%m-%d", _time.localtime())
+    row = client.get("/api/v1/roles/ops/memory/" + today, headers=headers).json()
+    assert row["compressed"].startswith("COMPRESSED".replace("COMPRESSED", "restarted")) or "restarted nginx" in row["compressed"]
+    assert "nginx restarted on web-1" in row["summary"]
+    # exactly one archiver call, and it carried the transcript (not today's live turn as context)
+    assert len(model.calls) == 1
+    assert "restart nginx on web-1" in json.dumps(model.calls[0]["messages"])
+
+
+def test_model_archiver_falls_back_without_losing_memory():
+    """If the model call fails, the deterministic forms stay and the state is
+    'fallback' — memory is never lost and it is not retried forever."""
+    from ai_ops import memory_worker
+    from ai_ops.model_client import ModelFailure
+    client = make_client()
+    headers = {"Authorization": "Bearer " + ADMIN}
+    _seed_role_with_turn(client, headers)
+
+    class FailingModel:
+        def complete(self, body):
+            raise ModelFailure("MODEL_HTTP_500")
+
+    for _ in range(memory_worker.MAX_ATTEMPTS):
+        assert memory_worker.archive_once(client.app, FailingModel()) is True
+    rows = client.get("/api/v1/roles/ops/memory-archive", headers=headers).json()
+    assert rows and rows[0]["state"] == memory.ARCHIVE_FALLBACK
+    import time as _time
+    today = _time.strftime("%Y-%m-%d", _time.localtime())
+    row = client.get("/api/v1/roles/ops/memory/" + today, headers=headers).json()
+    # deterministic fallback still carries the day, so memory exists.
+    assert "restart nginx on web-1" in row["full_text"]
+    assert row["compressed"]
+
+
+def test_model_archive_never_overwrites_operator_edit():
+    from ai_ops import memory_worker
+    client = make_client()
+    headers = {"Authorization": "Bearer " + ADMIN}
+    _seed_role_with_turn(client, headers)
+    import time as _time
+    today = _time.strftime("%Y-%m-%d", _time.localtime())
+    client.put("/api/v1/roles/ops/memory/" + today, headers=headers,
+               json={"day": today, "full_text": "OPERATOR PINNED"})
+
+    class ArchiverModel:
+        def complete(self, body):
+            return {"message": {"role": "assistant", "content":
+                    "COMPRESSED: model text\nSUMMARY: model summary"}, "usage": {}, "model": "m"}
+
+    memory_worker.archive_once(client.app, ArchiverModel())
+    row = client.get("/api/v1/roles/ops/memory/" + today, headers=headers).json()
+    assert row["full_text"] == "OPERATOR PINNED"
+    assert row["source"] == "edited"
+    assert "model summary" not in (row["summary"] or "")
+
+
+def test_build_day_queues_archive_without_calling_model():
+    """The context path must only QUEUE archival; it must never call the model."""
+    client = make_client()
+    headers = {"Authorization": "Bearer " + ADMIN}
+    _seed_role_with_turn(client, headers)
+    rows = client.get("/api/v1/roles/ops/memory-archive", headers=headers).json()
+    assert rows and rows[0]["state"] == memory.ARCHIVE_PENDING
+
+
+def test_parse_archive_reply_rejects_missing_markers():
+    assert memory.parse_archive_reply("no markers here") is None
+    assert memory.parse_archive_reply("COMPRESSED: a\nSUMMARY: ") is None
+    parsed = memory.parse_archive_reply("COMPRESSED: a\nSUMMARY: b")
+    assert parsed == ("a", "b")

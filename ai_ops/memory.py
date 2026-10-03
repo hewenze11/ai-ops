@@ -34,7 +34,21 @@ CREATE TABLE IF NOT EXISTS role_memory(
  PRIMARY KEY(role_id, day));
 CREATE TABLE IF NOT EXISTS role_memory_policy(
  role_id TEXT PRIMARY KEY REFERENCES roles(id), config TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS memory_archive(
+ role_id TEXT NOT NULL REFERENCES roles(id), day TEXT NOT NULL,
+ state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+ requested_at REAL NOT NULL, updated_at REAL NOT NULL, error_code TEXT,
+ PRIMARY KEY(role_id, day));
 """
+
+# A day is re-archived when its turns change (revision bump) and the last model
+# attempt did not already cover the same content. States:
+#   pending  -> waiting for a background model archive call
+#   archived -> the user's model wrote the compressed/summary forms
+#   fallback -> model unavailable/failed; deterministic forms kept (never lost)
+ARCHIVE_PENDING = "pending"
+ARCHIVE_DONE = "archived"
+ARCHIVE_FALLBACK = "fallback"
 
 # The default policy encodes the user's example: two days full, then up to five
 # days compressed, everything older as a summary. [start, end) in days of age;
@@ -156,6 +170,10 @@ def build_day(db, role_id, day):
         "full_text=excluded.full_text,compressed=excluded.compressed,summary=excluded.summary,"
         "source=excluded.source,turn_count=excluded.turn_count,generated_at=excluded.generated_at",
         (role_id, day, full_text, compress(full_text), _summarise(full_text), "derived", count, now))
+    # Queue a background job to let the role's OWN model write the archive forms.
+    # Deterministic compressed/summary above are the fallback if the model is
+    # disabled or fails, so memory is never lost. This NEVER calls the model here.
+    mark_day_for_archive(db, role_id, day)
     return db.execute("SELECT * FROM role_memory WHERE role_id=? AND day=?", (role_id, day)).fetchone()
 
 
@@ -170,6 +188,105 @@ def _summarise(text):
     if not flat:
         return ""
     return compress(flat, 300)
+
+
+def mark_day_for_archive(db, role_id, day):
+    """Queue a day for background model archiving. NEVER calls the model.
+
+    Called when a day's memory is (re)materialised. The context path only ever
+    writes PENDING here; a background worker does the paid call. If a row is
+    already pending we keep it pending; if it was archived/fallback and the day
+    changed since, we re-queue it (turn_count is bumped by build_day).
+    """
+    row = db.execute("SELECT * FROM memory_archive WHERE role_id=? AND day=?", (role_id, day)).fetchone()
+    now = time.time()
+    if row is None:
+        db.execute("INSERT INTO memory_archive(role_id,day,state,attempts,requested_at,updated_at) "
+                   "VALUES(?,?,?,0,?,?)", (role_id, day, ARCHIVE_PENDING, now, now))
+        return
+    if row["state"] != ARCHIVE_PENDING:
+        db.execute("UPDATE memory_archive SET state=?,attempts=0,requested_at=?,updated_at=?,error_code=NULL "
+                   "WHERE role_id=? AND day=?", (ARCHIVE_PENDING, now, now, role_id, day))
+
+
+def claim_archive_jobs(db, limit=1):
+    """Return up to `limit` (role_id, day) jobs awaiting a model archive call.
+
+    The queue is drained oldest-first so a backlog cannot starve. No state
+    change here: the caller marks done/fallback after its (idempotent) call.
+    """
+    rows = db.execute("SELECT role_id,day FROM memory_archive WHERE state=? "
+                      "ORDER BY requested_at LIMIT ?", (ARCHIVE_PENDING, limit)).fetchall()
+    return [(r["role_id"], r["day"]) for r in rows]
+
+
+def build_archive_messages(full_text):
+    """The prompt given to the user's OWN model to archive a day of memory.
+
+    It is a plain, closed summarisation task: no tools, no authority. The model
+    writes what happened and what was decided, in the same language as the
+    transcript, and nothing else.
+    """
+    return [
+        {"role": "system", "content":
+         "You are the role's own memory archivist. Read the day's operations "
+         "transcript and write a concise, factual memory of it. Preserve durable "
+         "facts (assets touched, commands run and their real results, decisions, "
+         "open questions) and drop pleasantries. Do not invent anything not in "
+         "the transcript. Answer in the same language as the transcript."}, 
+        {"role": "user", "content": "DAY TRANSCRIPT:\n" + full_text +
+         "\n\nWrite two parts, exactly in this form:\n"
+         "COMPRESSED: <a near-verbatim but tightened version, up to ~1200 chars>\n"
+         "SUMMARY: <one short paragraph, up to ~300 chars>"},
+    ]
+
+
+def parse_archive_reply(reply):
+    """Split the model reply into (compressed, summary). None if unusable."""
+    if not isinstance(reply, str) or not reply.strip():
+        return None
+    text = reply.strip()
+    marker_c = "COMPRESSED:"
+    marker_s = "SUMMARY:"
+    if marker_c not in text or marker_s not in text:
+        return None
+    after_c = text.split(marker_c, 1)[1]
+    if marker_s not in after_c:
+        return None
+    compressed, summary = after_c.split(marker_s, 1)
+    compressed, summary = compressed.strip(), summary.strip()
+    if not compressed or not summary:
+        return None
+    return compressed[:4000], summary[:800]
+
+
+def apply_model_archive(db, role_id, day, compressed, summary):
+    """Store a model-authored archive. Never overwrites an operator-pinned edit."""
+    row = db.execute("SELECT * FROM role_memory WHERE role_id=? AND day=?", (role_id, day)).fetchone()
+    if row is None or row["edited_at"] is not None:
+        # Pinned edits win; nothing to write, just close the job.
+        _close_archive(db, role_id, day, ARCHIVE_DONE, None)
+        return False
+    now = time.time()
+    db.execute("UPDATE role_memory SET compressed=?,summary=?,generated_at=? WHERE role_id=? AND day=?",
+               (compressed, summary, now, role_id, day))
+    _close_archive(db, role_id, day, ARCHIVE_DONE, None)
+    return True
+
+
+def mark_archive_fallback(db, role_id, day, error_code="MODEL_UNAVAILABLE"):
+    """Model archiving failed: keep the deterministic forms and record why.
+
+    The deterministic compressed/summary already exist (build_day wrote them),
+    so the role still has usable memory; we only record that it was not model-
+    authored so an operator can see it and it can be retried later.
+    """
+    _close_archive(db, role_id, day, ARCHIVE_FALLBACK, error_code)
+
+
+def _close_archive(db, role_id, day, state, error_code):
+    db.execute("UPDATE memory_archive SET state=?,updated_at=?,error_code=? WHERE role_id=? AND day=?",
+               (state, time.time(), error_code, role_id, day))
 
 
 def render_memory(db, role_id, today, policy=None):
@@ -282,5 +399,15 @@ def install_memory(app, transaction, audit, admin):
                 build_day(db, role_id, day)
             audit(db, "memory.rebuilt", role_id, "admin", {"days": days})
             return {"days": days}
+
+    @app.get("/api/v1/roles/{role_id}/memory-archive", dependencies=[Depends(admin)])
+    def archive_status(role_id: str):
+        # Visibility for operators: which days were authored by the role's own
+        # model, which fell back to the deterministic forms, which are pending.
+        with transaction() as db:
+            require_role(db, role_id)
+            rows = db.execute("SELECT role_id,day,state,attempts,error_code,updated_at "
+                              "FROM memory_archive WHERE role_id=? ORDER BY day", (role_id,)).fetchall()
+            return [dict(r) for r in rows]
 
     return {"render_memory": render_memory}

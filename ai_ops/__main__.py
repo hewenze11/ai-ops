@@ -21,8 +21,13 @@ def main():
     if os.environ.get("AI_OPS_MODEL_KEY_FILE"):
         from .model_client import OpenAICompatible
         from .model_worker import start_model_workers
+        from .memory_worker import start_memory_archiver
         client = OpenAICompatible(os.environ.get("AI_OPS_MODEL_BASE_URL", ""), os.environ["AI_OPS_MODEL_KEY_FILE"])
         background.append(start_model_workers(app.state.role_engine, client))
+        # Let the role's own model author each day's memory archive, off the
+        # context path. Disable with AI_OPS_MEMORY_ARCHIVER_ENABLED=0.
+        if os.environ.get("AI_OPS_MEMORY_ARCHIVER_ENABLED", "1") == "1":
+            background.append(start_memory_archiver(app, client))
     if os.environ.get("AI_OPS_SSH_CONNECTOR_ENABLED", "1") == "1":
         from .connector_ssh import start_connector_workers
         stop, threads = start_connector_workers(app, app.state.transaction, app.state.audit)

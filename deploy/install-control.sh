@@ -47,6 +47,20 @@ die() { printf '\n\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" = "0" ] || die "run as root (use: ... | sudo bash)"
 
+# --- 0. python3 (used for token generation, pairing code, JSON parsing) ---
+if ! command -v python3 >/dev/null 2>&1; then
+  say "python3 not found — installing via the system package manager"
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq && apt-get install -y -qq python3 || die "could not install python3"
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y -q python3 || die "could not install python3"
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y -q python3 || die "could not install python3"
+  else
+    die "python3 is required and no known package manager was found; install python3 and re-run"
+  fi
+fi
+
 # --- 1. Docker ------------------------------------------------------------
 if ! command -v docker >/dev/null 2>&1; then
   [ "$ALLOW_DOCKER_INSTALL" = "1" ] || die "docker not found; install it or drop --no-docker-install"

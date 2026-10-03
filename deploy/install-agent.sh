@@ -50,6 +50,22 @@ die() { printf '\n\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" = "0" ] || die "run as root (use: ... | sudo bash -s -- --pairing-code '...')"
 [ -n "$PAIRING" ] || die "--pairing-code is required (copy it from install-control.sh output)"
 
+# --- prerequisites (python3 is used from here on) ------------------------
+if ! command -v python3 >/dev/null 2>&1; then
+  say "python3 not found — installing via the system package manager"
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq && apt-get install -y -qq python3 python3-venv || die "could not install python3"
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y -q python3 || die "could not install python3"
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y -q python3 || die "could not install python3"
+  else
+    die "python3 is required and no known package manager was found"
+  fi
+fi
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)' || die "Python 3.11+ is required"
+command -v useradd >/dev/null 2>&1 || die "useradd is required (shadow-utils / passwd package)"
+
 # --- decode the pairing code ---------------------------------------------
 PAIRING="$PAIRING" python3 - <<'PY'
 import base64, json, os, sys
@@ -120,8 +136,6 @@ fi
 
 # --- 2. agent venv -------------------------------------------------------
 say "Installing the agent into /opt/ai-ops-agent"
-if ! command -v python3 >/dev/null 2>&1; then die "python3 is required"; fi
-python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)' || die "Python 3.11+ is required"
 if [ -d /opt/ai-ops-agent/venv ]; then
   rm -rf /opt/ai-ops-agent/venv
 fi

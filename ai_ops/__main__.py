@@ -19,6 +19,10 @@ def main():
         from .model_worker import start_model_workers
         client = OpenAICompatible(os.environ.get("AI_OPS_MODEL_BASE_URL", ""), os.environ["AI_OPS_MODEL_KEY_FILE"])
         background.append(start_model_workers(app.state.role_engine, client))
+    if os.environ.get("AI_OPS_SSH_CONNECTOR_ENABLED", "1") == "1":
+        from .connector_ssh import start_connector_workers
+        stop, threads = start_connector_workers(app, app.state.transaction, app.state.audit)
+        background.append((stop, threads[0] if threads else None))
     try:
         uvicorn.run(app, host=os.environ.get("AI_OPS_HOST", "127.0.0.1"), port=port, access_log=False)
     finally:

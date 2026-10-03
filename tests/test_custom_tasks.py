@@ -257,21 +257,28 @@ def test_scheduler_http_destination_is_not_user_configurable():
 
 def test_v1_database_migration_preserves_execution_tasks(tmp_path):
     # Build the genuine v1 shape first. Applying the current schema must preserve records.
-    from ai_ops.app import SCHEMA as BASE_SCHEMA
     path = tmp_path / "old.db"
     with sqlite3.connect(path) as db:
-        db.executescript(BASE_SCHEMA + "PRAGMA user_version=1;")
+        # A real v1 assets table had no connection_type column.
+        db.executescript(
+            "CREATE TABLE roles(id TEXT PRIMARY KEY, name TEXT NOT NULL);"
+            "CREATE TABLE assets(id TEXT PRIMARY KEY, name TEXT NOT NULL, allowed_users TEXT NOT NULL, notes TEXT NOT NULL, token_hash TEXT NOT NULL);"
+            "CREATE TABLE tasks(seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, role_id TEXT NOT NULL, asset_id TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL, claim_id TEXT, result TEXT, idempotency_key TEXT UNIQUE NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL);"
+            "CREATE TABLE audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, entity_id TEXT, actor TEXT NOT NULL, details TEXT NOT NULL, created_at REAL NOT NULL);"
+            "PRAGMA user_version=1;")
         db.execute("INSERT INTO roles VALUES('original','Original role')")
         db.execute("INSERT INTO assets VALUES('original-host','Original host','[\"reader\"]','','not-a-real-hash')")
         db.execute("INSERT INTO tasks(id,role_id,asset_id,payload,state,idempotency_key,created_at,updated_at) VALUES('old-task','original','original-host','{}','succeeded','old-request',0,0)")
         db.execute("INSERT INTO audit(event,entity_id,actor,details,created_at) VALUES('task.result','old-task','test','{}',0)")
     create_app(str(path), ADMIN)
     with sqlite3.connect(path) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 6
         assert db.execute("SELECT name FROM roles WHERE id='original'").fetchone()[0] == "Original role"
         assert db.execute("SELECT state FROM tasks WHERE id='old-task'").fetchone()[0] == "succeeded"
         assert db.execute("SELECT count(*) FROM audit WHERE entity_id='old-task'").fetchone()[0] == 1
         assert db.execute("SELECT state FROM role_turns WHERE source='command' AND source_id='old-task'").fetchone()[0] == 'completed'
+        # The legacy asset is preserved and defaults to the agent connection type.
+        assert db.execute("SELECT connection_type FROM assets WHERE id='original-host'").fetchone()[0] == 'agent'
 
 
 def test_schedule_audit_failure_rolls_back_outbox(env):

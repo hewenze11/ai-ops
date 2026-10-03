@@ -28,6 +28,24 @@ class Asset(StrictModel):
     name: str = Field(min_length=1, max_length=200)
     allowed_users: list[UserName] = Field(min_length=1, max_length=100)
     notes: str = Field(default="", max_length=16000)
+    connection_type: Literal["agent", "ssh"] = "agent"
+    # Only meaningful for connection_type="ssh". Credentials are never stored
+    # inline here; ssh_host/ssh_port/ssh_user/ssh_auth_kind describe the endpoint
+    # and the secret itself lives in asset_connections.secret_ref.
+    ssh_host: str | None = Field(default=None, max_length=255)
+    ssh_port: int = Field(default=22, ge=1, le=65535)
+    ssh_user: str | None = Field(default=None, max_length=64)
+    ssh_auth_kind: Literal["key", "password"] | None = None
+    ssh_secret_ref: str | None = Field(default=None, max_length=512)
+
+    @model_validator(mode="after")
+    def validate_connection(self):
+        if self.connection_type == "ssh":
+            if not self.ssh_host or not self.ssh_user or not self.ssh_auth_kind:
+                raise ValueError("ssh assets require ssh_host, ssh_user and ssh_auth_kind")
+            if not self.ssh_secret_ref:
+                raise ValueError("ssh assets require ssh_secret_ref")
+        return self
 
 
 class Task(StrictModel):
@@ -72,7 +90,7 @@ class Result(StrictModel):
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS roles(id TEXT PRIMARY KEY, name TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY, name TEXT NOT NULL, allowed_users TEXT NOT NULL, notes TEXT NOT NULL, token_hash TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY, name TEXT NOT NULL, allowed_users TEXT NOT NULL, notes TEXT NOT NULL, token_hash TEXT NOT NULL, connection_type TEXT NOT NULL DEFAULT 'agent');
 CREATE TABLE IF NOT EXISTS tasks(
  seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
  role_id TEXT NOT NULL REFERENCES roles(id), asset_id TEXT NOT NULL REFERENCES assets(id),
@@ -91,18 +109,20 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
     with sqlite3.connect(path) as db:
         db.row_factory = sqlite3.Row
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4, 5):
+        if version not in (0, 1, 2, 3, 4, 5, 6):
             raise ValueError("Unsupported database schema; refusing to modify it")
         from .custom_tasks import SCHEMA as CUSTOM_SCHEMA
         from .turns import SCHEMA as TURN_SCHEMA, migrate, enqueue_turn, set_turn_state
         db.execute("PRAGMA journal_mode=WAL")
         from .execution import SCHEMA as EXEC_SCHEMA, migrate as migrate_execution
         from .leases import SCHEMA as LEASE_SCHEMA, migrate as migrate_leases
-        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA + LEASE_SCHEMA)
+        from .connector_ssh import SCHEMA as CONNECTOR_SCHEMA, migrate as migrate_connector
+        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA + LEASE_SCHEMA + CONNECTOR_SCHEMA)
         migrate(db)
         migrate_execution(db)
         migrate_leases(db)
-        db.execute("PRAGMA user_version=5")
+        migrate_connector(db)
+        db.execute("PRAGMA user_version=6")
         # Do not repeat a provider call whose response was lost during a crash.
         interrupted = db.execute("SELECT id FROM role_turns WHERE state='calling'").fetchall()
         for row in interrupted:
@@ -160,7 +180,9 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
             result["lease"] = lease_view(db, row["id"])
         return result
 
-    app = FastAPI(title="AI Ops backend preview", version="0.1.0.dev5")
+    app = FastAPI(title="AI Ops backend preview", version="0.1.0.dev6")
+    app.state.transaction = transaction
+    app.state.audit = audit
     from .custom_tasks import install_custom_tasks
     from .turns import install_turns
     install_custom_tasks(app, transaction, audit, admin, admin_token)
@@ -169,6 +191,8 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
     install_execution(app, transaction, audit, admin, agent_auth)
     from .leases import install_leases
     install_leases(app, transaction, audit, admin)
+    from .connector_ssh import install_connector, start_connector_workers
+    install_connector(app, transaction, audit, admin)
 
     @app.get("/healthz")
     def health():
@@ -191,15 +215,20 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
         with transaction() as db:
             if db.execute("SELECT 1 FROM assets WHERE id=?", (body.id,)).fetchone():
                 raise HTTPException(409, "Asset already exists")
-            db.execute("INSERT INTO assets VALUES(?,?,?,?,?)", (body.id, body.name, json.dumps(body.allowed_users), body.notes, hashlib.sha256(token.encode()).hexdigest()))
-            audit(db, "asset.provisioned", body.id, "admin", body.model_dump())
+            db.execute("INSERT INTO assets(id,name,allowed_users,notes,token_hash,connection_type) VALUES(?,?,?,?,?,?)", (body.id, body.name, json.dumps(body.allowed_users), body.notes, hashlib.sha256(token.encode()).hexdigest(), body.connection_type))
+            if body.connection_type == "ssh":
+                from .connector_ssh import save_connection
+                save_connection(db, body)
+            audit(db, "asset.provisioned", body.id, "admin", {**body.model_dump(), "ssh_secret_ref": "[redacted]"})
         # One-time credential: never include it in an audit event or GET route.
-        return {"asset_id": body.id, "agent_token": token, "protocol_version": PROTOCOL}
+        return {"asset_id": body.id, "agent_token": token, "connection_type": body.connection_type, "protocol_version": PROTOCOL}
 
     @app.get("/api/v1/assets", dependencies=[Depends(admin)])
     def list_assets():
         with transaction() as db:
-            return [{"id": r["id"], "name": r["name"], "allowed_users": json.loads(r["allowed_users"]), "notes": r["notes"], "connection_type": "agent"} for r in db.execute("SELECT * FROM assets ORDER BY id")]
+            from .connector_ssh import connection_view
+            return [{"id": r["id"], "name": r["name"], "allowed_users": json.loads(r["allowed_users"]), "notes": r["notes"],
+                     "connection_type": connection_view(db, r["id"])["connection_type"]} for r in db.execute("SELECT * FROM assets ORDER BY id")]
 
     @app.post("/api/v1/tasks", dependencies=[Depends(admin)], status_code=201)
     def submit(body: Task):

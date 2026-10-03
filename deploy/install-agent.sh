@@ -76,8 +76,8 @@ ASSET_ID="$(python3 -c 'import json; print(json.load(open("/tmp/.aiops-pairing.j
 AGENT_TOKEN="$(python3 -c 'import json; print(json.load(open("/tmp/.aiops-pairing.json"))["agent_token"])')"
 
 case "$SERVER_URL" in
-  https://*) ;;
-  http://127.0.0.1*|http://localhost*) warn "loopback HTTP pairing: allowed only for local testing";;
+  https://*) ALLOW_LOOPBACK=0;;
+  http://127.0.0.1*|http://localhost*) warn "loopback HTTP pairing: allowed only for local testing"; ALLOW_LOOPBACK=1;;
   *) die "refusing a non-loopback plain-HTTP control URL; use HTTPS for remote hosts";;
 esac
 
@@ -129,7 +129,7 @@ say "Writing config and systemd unit"
 install -d -m 700 /etc/ai-ops-agent "$JOURNAL"
 CFG="/etc/ai-ops-agent/config.json"
 SERVER_URL="$SERVER_URL" ASSET_ID="$ASSET_ID" AGENT_TOKEN="$AGENT_TOKEN" \
-READ_USER="$READ_USER" OPS_USER="$OPS_USER" JOURNAL="$JOURNAL" python3 - <<'PY'
+READ_USER="$READ_USER" OPS_USER="$OPS_USER" JOURNAL="$JOURNAL" ALLOW_LOOPBACK="$ALLOW_LOOPBACK" python3 - <<'PY'
 import json, os
 cfg = {
     "server_url": os.environ["SERVER_URL"],
@@ -138,6 +138,8 @@ cfg = {
     "allowed_users": [os.environ["READ_USER"], os.environ["OPS_USER"]],
     "journal_dir": os.environ["JOURNAL"],
 }
+if os.environ.get("ALLOW_LOOPBACK") == "1":
+    cfg["allow_loopback_http"] = True
 path = "/etc/ai-ops-agent/config.json"
 with open(path, "w") as handle:
     json.dump(cfg, handle, indent=2)
@@ -150,9 +152,11 @@ rm -f /tmp/.aiops-pairing.json
 # PATH or it falls back to the bare interpreter and loses the entry point.
 export PATH="/opt/ai-ops-agent/venv/bin:$PATH"
 if command -v /opt/ai-ops-agent/venv/bin/ai-ops-agent-install >/dev/null 2>&1; then
+  LOOP_FLAG=""
+  [ "$ALLOW_LOOPBACK" = "1" ] && LOOP_FLAG="--allow-loopback-http"
   /opt/ai-ops-agent/venv/bin/ai-ops-agent-install \
     --server-url "$SERVER_URL" --asset-id "$ASSET_ID" --token "$AGENT_TOKEN" \
-    --user "$READ_USER" --user "$OPS_USER" --journal-dir "$JOURNAL" >/dev/null
+    --user "$READ_USER" --user "$OPS_USER" --journal-dir "$JOURNAL" $LOOP_FLAG >/dev/null
 else
   cat >/etc/systemd/system/ai-ops-agent.service <<EOF
 [Unit]

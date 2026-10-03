@@ -32,7 +32,8 @@ def test_ssh_asset_requires_endpoint_fields(env):
 
 def test_ssh_asset_metadata_never_exposes_secret_ref(env):
     c, h, _, _ = env
-    ssh_asset(env)
+    provisioned = ssh_asset(env)
+    assert provisioned["connection_type"] == "ssh" and "agent_token" not in provisioned
     listed = c.get("/api/v1/assets", headers=h).json()
     row = [a for a in listed if a["id"] == "ssh-host"][0]
     assert row["connection_type"] == "ssh"

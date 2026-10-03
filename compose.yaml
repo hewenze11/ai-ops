@@ -12,6 +12,8 @@ services:
     volumes:
       - ./state:/data
       - ./secrets/admin_token:/run/secrets/admin_token:ro
+      # SSH connector keys live outside the image and are mounted read-only.
+      - ./connector:/run/connector:ro
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=32m

@@ -221,7 +221,11 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
                 save_connection(db, body)
             audit(db, "asset.provisioned", body.id, "admin", {**body.model_dump(), "ssh_secret_ref": "[redacted]"})
         # One-time credential: never include it in an audit event or GET route.
-        return {"asset_id": body.id, "agent_token": token, "connection_type": body.connection_type, "protocol_version": PROTOCOL}
+        # SSH assets have no agent, so no token is issued for them.
+        response = {"asset_id": body.id, "connection_type": body.connection_type, "protocol_version": PROTOCOL}
+        if body.connection_type == "agent":
+            response["agent_token"] = token
+        return response
 
     @app.get("/api/v1/assets", dependencies=[Depends(admin)])
     def list_assets():

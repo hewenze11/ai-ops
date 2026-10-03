@@ -1,0 +1,526 @@
+"use strict";
+/* Minimal hand-written console. No external dependencies, no build step.
+ *
+ * Security posture, deliberately conservative for an operations surface:
+ *  - The admin token lives ONLY in a module variable in this tab's memory. It is
+ *    never written to localStorage/sessionStorage/cookies/URL, so a reload or a
+ *    closed tab drops it and a second tab cannot read it.
+ *  - All dynamic content is inserted with textContent, never innerHTML, so alarm
+ *    payloads and command output cannot inject markup into the console.
+ *  - The UI never fabricates execution outcomes: it renders exactly the states
+ *    the backend reports, including unknown and awaiting_approval.
+ */
+(function () {
+  let token = "";
+  let state = { view: "chat", roleId: null, tab: "overview" };
+
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, cls, text) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  };
+  const fmt = (epoch) => {
+    if (!epoch) return "-";
+    const d = new Date(epoch * 1000);
+    return d.toLocaleString("zh-CN", { hour12: false });
+  };
+  const shortId = (id, n) => (id && id.length > (n || 10) ? id.slice(0, n || 10) + "…" : id || "-");
+  const usersToText = (users) => (Array.isArray(users) ? users.join(", ") : "");
+  const textToUsers = (text) => text.split(",").map((s) => s.trim()).filter(Boolean);
+
+  async function api(method, path, body) {
+    const options = { method, headers: {} };
+    if (token) options.headers["Authorization"] = "Bearer " + token;
+    if (body !== undefined) {
+      options.headers["Content-Type"] = "application/json";
+      options.body = JSON.stringify(body);
+    }
+    const response = await fetch(path, options);
+    const text = await response.text();
+    let data = null;
+    if (text) { try { data = JSON.parse(text); } catch (e) { data = text; } }
+    if (!response.ok) {
+      const message = data && data.detail ? (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)) : ("HTTP " + response.status);
+      const error = new Error(message);
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  }
+
+  function say(message, kind) {
+    const node = $("status");
+    node.textContent = message || "";
+    node.className = kind === "error" ? "error" : "muted";
+  }
+
+  function modal(title, data) {
+    $("modal-title").textContent = title;
+    $("modal-body").textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+    $("modal").hidden = false;
+  }
+  $("modal-close").onclick = () => { $("modal").hidden = true; };
+  $("modal").onclick = (e) => { if (e.target === $("modal")) $("modal").hidden = true; };
+
+  /* ---------- login ---------- */
+  $("login-form").onsubmit = async (e) => {
+    e.preventDefault();
+    const candidate = $("token").value.trim();
+    $("login-error").hidden = true;
+    try {
+      token = candidate;
+      await api("GET", "/api/v1/console/overview");
+      sessionStorage.setItem("aiops.view", state.view || "chat"); // view only, no secret
+      $("login").hidden = true;
+      $("app").hidden = false;
+      $("token").value = "";
+      boot();
+    } catch (err) {
+      token = "";
+      const box = $("login-error");
+      box.textContent = err.status === 403 ? "凭据无效。" : ("无法连接：" + err.message);
+      box.hidden = false;
+    }
+  };
+  $("lock").onclick = () => {
+    token = "";
+    state = { view: "chat", roleId: null, tab: "overview" };
+    $("app").hidden = true;
+    $("login").hidden = false;
+    say("");
+  };
+
+  /* ---------- navigation ---------- */
+  const VIEWS = [["chat", "聊天"], ["console", "控制台"]];
+  function renderNav() {
+    const nav = $("nav");
+    nav.textContent = "";
+    VIEWS.forEach(([id, label]) => {
+      const button = el("button", state.view === id ? "active" : "", label);
+      button.onclick = () => { state.view = id; renderNav(); renderView(); };
+      nav.appendChild(button);
+    });
+  }
+  function renderView() {
+    $("view-chat").hidden = state.view !== "chat";
+    $("view-console").hidden = state.view !== "console";
+    if (state.view === "chat") loadChat();
+    else renderConsole();
+  }
+
+  /* ---------- chat ---------- */
+  let chatBusy = false;
+  async function loadChat() {
+    try {
+      const roles = await api("GET", "/api/v1/roles");
+      const list = $("chat-roles");
+      list.textContent = "";
+      if (!roles.length) list.appendChild(el("li", "muted", "尚无角色，请先在控制台创建（当前后端未提供角色创建接口）。"));
+      roles.forEach((role) => {
+        const item = el("li", state.roleId === role.id ? "active" : "");
+        item.appendChild(el("span", "", role.name));
+        item.appendChild(el("span", "muted small", role.id));
+        item.onclick = () => { state.roleId = role.id; loadChat(); };
+        list.appendChild(item);
+      });
+      if (!state.roleId && roles.length) { state.roleId = roles[0].id; loadChat(); return; }
+      $("chat-title").textContent = state.roleId ? ("聊天 · " + state.roleId) : "聊天";
+      if (state.roleId) {
+        const model = await api("GET", "/api/v1/roles/" + state.roleId + "/model");
+        $("chat-model").textContent = model.enabled ? ("模型已启用 · " + (model.model || "默认")) : "模型未启用（轮次会停留在 queued）";
+      }
+      renderChatLog();
+    } catch (err) { say("加载失败：" + err.message, "error"); }
+  }
+
+  async function renderChatLog() {
+    const log = $("chat-log");
+    log.textContent = "";
+    if (!state.roleId) return;
+    const turns = await api("GET", "/api/v1/roles/" + state.roleId + "/turns?limit=100");
+    turns.slice().reverse().forEach((turn) => log.appendChild(turnCard(turn)));
+    log.scrollTop = 0;
+  }
+
+  function turnCard(turn) {
+    const card = el("div", "msg " + (turn.source === "chat" ? "user" : ""));
+    const meta = el("div", "meta");
+    meta.appendChild(el("span", "", turn.source + " · " + fmt(turn.created_at)));
+    meta.appendChild(el("span", "", "轮次 " + shortId(turn.id)));
+    meta.appendChild(el("span", pillClass(turn.state), turn.state));
+    if (turn.mode) meta.appendChild(el("span", "pill", turn.mode));
+    meta.appendChild(el("span", "muted small", "账号: " + (usersToText(turn.execution_users) || "无")));
+    card.appendChild(meta);
+    card.appendChild(el("pre", "", turn.prompt));
+
+    if (turn.payload && Object.keys(turn.payload).length) {
+      card.appendChild(el("div", "tool", "事件数据：" + JSON.stringify(turn.payload)));
+    }
+    if (turn.error_code) card.appendChild(el("div", "error small", "错误：" + turn.error_code));
+    if (turn.state === "awaiting_approval" || (turn.pending_task_id && turn.state === "waiting_tool")) {
+      card.appendChild(actionsForTurn(turn));
+    }
+    const details = el("button", "ghost small", "查看完整轮次 / 模型调用");
+    details.style.marginTop = "8px";
+    details.onclick = async () => {
+      const full = await api("GET", "/api/v1/turns/" + turn.id);
+      modal("轮次 " + turn.id, full);
+    };
+    card.appendChild(details);
+    if (turn.final_text) {
+      const final = el("div", "");
+      final.style.marginTop = "8px";
+      final.appendChild(el("div", "muted small", "最终回复"));
+      final.appendChild(el("pre", "", turn.final_text));
+      card.appendChild(final);
+    }
+    return card;
+  }
+
+  function pillClass(value) {
+    if (["completed", "succeeded"].includes(value)) return "pill ok";
+    if (["failed", "cancelled", "blocked_unknown"].includes(value)) return "pill bad";
+    return "pill warn";
+  }
+
+  function actionsForTurn(turn) {
+    const box = el("div", "row");
+    box.style.marginTop = "8px";
+    const taskId = turn.pending_task_id;
+    if (taskId) {
+      const approve = el("button", "small", "批准并入队");
+      approve.onclick = async () => {
+        try { await api("POST", "/api/v1/tasks/" + taskId + "/approve"); say("已批准"); await renderChatLog(); }
+        catch (err) { say("批准失败：" + err.message, "error"); }
+      };
+      const reject = el("button", "small danger", "取消该命令");
+      reject.onclick = async () => {
+        try { await api("POST", "/api/v1/tasks/" + taskId + "/cancel"); say("已取消"); await renderChatLog(); }
+        catch (err) { say("取消失败：" + err.message, "error"); }
+      };
+      box.appendChild(el("span", "muted small", "待处理命令 " + shortId(taskId)));
+      box.appendChild(approve);
+      box.appendChild(reject);
+    }
+    const cancelTurn = el("button", "ghost small", "取消整轮");
+    cancelTurn.onclick = async () => {
+      try { await api("POST", "/api/v1/turns/" + turn.id + "/cancel"); say("已取消轮次"); await renderChatLog(); }
+      catch (err) { say("取消失败：" + err.message, "error"); }
+    };
+    box.appendChild(cancelTurn);
+    return box;
+  }
+
+  $("chat-refresh").onclick = () => loadChat();
+  $("chat-form").onsubmit = async (e) => {
+    e.preventDefault();
+    if (!state.roleId) { say("请先选择角色", "error"); return; }
+    if (chatBusy) return;
+    const text = $("chat-text").value.trim();
+    if (!text) return;
+    const body = {
+      text,
+      execution_users: textToUsers($("chat-users").value),
+      mode: $("chat-mode").value,
+      idempotency_key: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random()).replace(/-/g, ""),
+    };
+    if (body.idempotency_key.length < 8) body.idempotency_key = "k" + body.idempotency_key;
+    chatBusy = true;
+    try {
+      const answer = await api("POST", "/api/v1/roles/" + state.roleId + "/messages", body);
+      $("chat-text").value = "";
+      say(answer.duplicate ? "重复消息，已复用原轮次" : "已入队，等待模型处理…");
+      await renderChatLog();
+      watchTurn(answer.turn_id);
+    } catch (err) { say("发送失败：" + err.message, "error"); }
+    finally { chatBusy = false; }
+  };
+
+  function watchTurn(turnId, tries) {
+    const budget = tries === undefined ? 20 : tries;
+    if (budget <= 0 || !turnId) return;
+    setTimeout(async () => {
+      try {
+        const turn = await api("GET", "/api/v1/turns/" + turnId);
+        await renderChatLog();
+        if (["queued", "ready", "calling", "waiting_tool"].includes(turn.state)) watchTurn(turnId, budget - 1);
+      } catch (err) { /* transient; stop watching */ }
+    }, 3000);
+  }
+
+  /* ---------- console ---------- */
+  const TABS = [
+    ["overview", "总览"], ["attention", "需人工处置"], ["alarms", "告警日志"],
+    ["tasks", "任务"], ["turns", "角色轮次"], ["custom", "定制任务"],
+    ["turns-loop", "触发器事件"], ["documents", "文档"], ["assets", "资产"],
+    ["memory", "记忆"], ["audit", "审计"], ["output", "输出"],
+  ];
+  function renderConsole() {
+    const tabs = $("console-tabs");
+    tabs.textContent = "";
+    TABS.forEach(([id, label]) => {
+      const item = el("li", state.tab === id ? "active" : "", label);
+      item.onclick = () => { state.tab = id; renderConsole(); };
+      tabs.appendChild(item);
+    });
+    const body = $("console-body");
+    body.textContent = "";
+    const head = el("div", "pane-head");
+    head.appendChild(el("h2", "", TABS.find((t) => t[0] === state.tab)[1]));
+    body.appendChild(head);
+    const holder = el("div", "");
+    holder.style.overflow = "auto";
+    body.appendChild(holder);
+    const loaders = {
+      overview: loadOverview, attention: loadAttention, alarms: loadAlarms, tasks: loadTasks,
+      turns: loadTurns, custom: loadCustom, "turns-loop": loadEvents, documents: loadDocuments,
+      assets: loadAssets, memory: loadMemory, audit: loadAudit, output: loadOutput,
+    };
+    loaders[state.tab](holder).catch((err) => holder.appendChild(el("div", "card error", "加载失败：" + err.message)));
+  }
+
+  function card(title) {
+    const box = el("div", "card");
+    if (title) box.appendChild(el("h3", "", title));
+    return box;
+  }
+  function kv(key, value) {
+    const box = el("div", "kv");
+    box.appendChild(el("div", "k", key));
+    box.appendChild(el("div", "v", value === undefined || value === null ? "-" : value));
+    return box;
+  }
+  function table(columns, rows, onRow) {
+    const wrap = el("div", "");
+    const node = el("table");
+    const head = el("tr");
+    columns.forEach((c) => head.appendChild(el("th", "", c)));
+    node.appendChild(head);
+    rows.forEach((row) => {
+      const tr = el("tr", onRow ? "click" : "");
+      row.forEach((cell) => tr.appendChild(el("td", "", cell === undefined || cell === null ? "-" : cell)));
+      if (onRow) tr.onclick = () => onRow(row);
+      node.appendChild(tr);
+    });
+    wrap.appendChild(node);
+    if (!rows.length) wrap.appendChild(el("p", "muted small", "无数据"));
+    return wrap;
+  }
+
+  async function loadOverview(host) {
+    const box = card("服务概况");
+    const grid = el("div", "grid");
+    const health = await api("GET", "/healthz");
+    grid.appendChild(kv("状态", health.status));
+    grid.appendChild(kv("执行协议", health.protocol_version));
+    const output = await api("GET", "/api/v1/console/overview");
+    Object.keys(output.counts).forEach((key) => grid.appendChild(kv(key, output.counts[key])));
+    box.appendChild(grid);
+    host.appendChild(box);
+
+    const notice = card("当前缺口（如实呈现，不假装完成）");
+    notice.appendChild(el("p", "muted small", output.notices.join("；")));
+    host.appendChild(notice);
+
+    const attention = await api("GET", "/api/v1/operator/attention");
+    const box2 = card("需人工处置");
+    const grid2 = el("div", "grid");
+    grid2.appendChild(kv("未知执行", attention.unknown_executions.length));
+    grid2.appendChild(kv("陈旧租约", attention.stale_leases.length));
+    grid2.appendChild(kv("离线资产", attention.offline_assets.length));
+    box2.appendChild(grid2);
+    host.appendChild(box2);
+  }
+
+  async function loadAttention(host) {
+    const data = await api("GET", "/api/v1/operator/attention");
+    const unknown = data.unknown_executions;
+    host.appendChild(card("未知执行（必须人工核实后处置，不能用取消代替）")).appendChild(
+      table(["任务", "资产", "角色", "更新时间", "操作"], unknown.map((r) => [shortId(r.id), r.asset_id, r.role_id, fmt(r.updated_at), "处置"]), (row) => resolveDialog(unknown.find((r) => shortId(r.id) === row[0]))));
+    host.appendChild(card("陈旧租约（仅观测，未重派）")).appendChild(
+      table(["任务", "资产", "状态", "超期秒", "说明"], data.stale_leases.map((r) => [shortId(r.task_id), r.asset_id, r.state, r.expired_for, r.note])));
+    host.appendChild(card("离线资产")).appendChild(
+      table(["资产", "静默秒"], data.offline_assets.map((r) => [r.asset_id, r.silent_for])));
+  }
+
+  function resolveDialog(row) {
+    if (!row) return;
+    const box = el("div", "");
+    box.appendChild(el("p", "muted small", "任务 " + row.id + " @ " + row.asset_id + " · 角色 " + row.role_id));
+    const note = el("input", "");
+    note.placeholder = "至少 3 个字符的核实说明";
+    note.style.margin = "8px 0";
+    box.appendChild(note);
+    const feedback = el("p", "error small", "");
+    const actions = [["confirm_succeeded", "核实：成功"], ["confirm_failed", "核实：失败"], ["abandon", "无法查明，搁置"]];
+    const buttons = el("div", "row");
+    actions.forEach(([action, label]) => {
+      const button = el("button", action === "abandon" ? "ghost" : "small", label);
+      button.onclick = async () => {
+        try {
+          await api("POST", "/api/v1/tasks/" + row.id + "/resolve", { action, note: note.value, confirm_task_id: row.id });
+          $("modal").hidden = true;
+          say("已处置");
+          renderConsole();
+        } catch (err) { feedback.textContent = err.message; }
+      };
+      buttons.appendChild(button);
+    });
+    box.appendChild(buttons);
+    box.appendChild(feedback);
+    $("modal-title").textContent = "处置 " + shortId(row.id);
+    $("modal-body").textContent = "";
+    $("modal-body").appendChild(box);
+    $("modal").hidden = false;
+  }
+
+  async function loadAlarms(host) {
+    const data = await api("GET", "/api/v1/alarms?limit=100");
+    const sources = await api("GET", "/api/v1/alarms/sources");
+    const summary = card("按来源计数");
+    summary.appendChild(table(["来源", "条数", "最近序号"], sources.map((s) => [s.source, s.count, s.last_seq])));
+    host.appendChild(summary);
+    host.appendChild(card("告警日志（最近 100 条，payload 已脱敏）")).appendChild(
+      table(["时间", "状态", "来源", "严重度", "标题", "任务"], data.map((r) => [fmt(r.received_at), r.state, r.source, r.severity, r.title, shortId(r.custom_task_id)]), (row) => {
+        const record = data.find((r) => fmt(r.received_at) === row[0] && r.title === row[4]);
+        modal("告警 " + shortId(record.id), record);
+      }));
+  }
+
+  async function loadTasks(host) {
+    const data = await api("GET", "/api/v1/console/tasks?limit=100");
+    host.appendChild(card("任务（最近 100 条）")).appendChild(
+      table(["任务", "角色", "资产", "状态", "运行账号", "命令", "更新时间"], data.map((r) => [shortId(r.id), r.role_id, r.asset_id, r.state, (r.payload && r.payload.run_as) || "-", (r.payload && r.payload.command) || "-", fmt(r.updated_at)]), (row) => {
+        const record = data.find((r) => shortId(r.id) === row[0]);
+        modal("任务 " + record.id, record);
+      }));
+  }
+
+  async function loadTurns(host) {
+    const roles = await api("GET", "/api/v1/roles");
+    if (!roles.length) { host.appendChild(el("div", "card muted", "尚无角色")); return; }
+    const picker = card("选择角色");
+    const select = el("select");
+    roles.forEach((role) => { const option = el("option", "", role.name + " (" + role.id + ")"); option.value = role.id; select.appendChild(option); });
+    if (state.roleId) select.value = state.roleId;
+    const button = el("button", "", "查看");
+    const holder = el("div", "");
+    button.onclick = async () => {
+      holder.textContent = "";
+      const turns = await api("GET", "/api/v1/roles/" + select.value + "/turns?limit=100");
+      holder.appendChild(table(["时间", "来源", "状态", "模式", "账号", "提示词"], turns.map((t) => [fmt(t.created_at), t.source, t.state, t.mode, usersToText(t.execution_users), t.prompt]), (row) => {
+        const turn = turns.find((t) => fmt(t.created_at) === row[0] && t.prompt === row[5]);
+        modal("轮次 " + turn.id, turn);
+      }));
+    };
+    picker.appendChild(select); picker.appendChild(button); picker.appendChild(holder);
+    host.appendChild(picker);
+    if (state.roleId) button.onclick();
+  }
+
+  async function loadCustom(host) {
+    const data = await api("GET", "/api/v1/custom-tasks");
+    const box = card("定制任务（触发任务 / 定时任务）");
+    box.appendChild(table(["ID", "名称", "类型", "角色", "模式", "启用", "下次触发", "触发路径"], data.map((r) => [r.id, r.name, r.kind, r.role_id, r.mode, r.enabled ? "是" : "否", fmt(r.next_fire_at), r.trigger_path]), (row) => {
+      const record = data.find((r) => r.id === row[0]);
+      modal("定制任务 " + record.id, record);
+    }));
+    host.appendChild(box);
+    const outbox = await api("GET", "/api/v1/schedule-deliveries?limit=50");
+    host.appendChild(card("定时投递箱")).appendChild(table(["计划时间", "任务", "状态", "尝试", "最近错误"], outbox.map((o) => [fmt(o.scheduled_for), o.custom_task_id, o.state, o.attempts, o.last_error])));
+    const events = await api("GET", "/api/v1/custom-task-events?limit=50");
+    host.appendChild(card("最近事件")).appendChild(table(["时间", "来源", "角色", "状态", "轮次"], events.map((e) => [fmt(e.created_at), e.source, e.role_id, e.state, shortId(e.turn_id)])));
+  }
+
+  async function loadEvents(host) {
+    const data = await api("GET", "/api/v1/custom-task-events?limit=100");
+    host.appendChild(card("触发器事件")).appendChild(
+      table(["时间", "任务", "来源", "角色", "状态", "轮次"], data.map((e) => [fmt(e.created_at), e.custom_task_id, e.source, e.role_id, e.state, shortId(e.turn_id)]), (row) => {
+        const record = data.find((e) => fmt(e.created_at) === row[0] && e.custom_task_id === row[1]);
+        modal("事件 " + record.id, record);
+      }));
+  }
+
+  async function loadDocuments(host) {
+    const data = await api("GET", "/api/v1/documents");
+    host.appendChild(card("文档（核心文档强制注入，跨角色共享）")).appendChild(
+      table(["ID", "名称", "核心", "角色", "修订", "正文字符"], data.map((r) => [r.id, r.name, r.core ? "是" : "否", usersToText(r.role_ids), r.revision, (r.content || "").length]), (row) => {
+        const record = data.find((r) => r.id === row[0]);
+        modal("文档 " + record.id, record);
+      }));
+  }
+
+  async function loadAssets(host) {
+    const data = await api("GET", "/api/v1/assets");
+    const box = card("资产（注册为管理员操作，控制台只读）");
+    box.appendChild(table(["ID", "名称", "接入方式", "允许账号"], data.map((r) => [r.id, r.name, r.connection_type, usersToText(r.allowed_users)]), (row) => {
+      const record = data.find((r) => r.id === row[0]);
+      modal("资产 " + record.id, record);
+    }));
+    host.appendChild(box);
+    for (const asset of data) {
+      try {
+        const status = await api("GET", "/api/v1/agents/" + asset.id + "/status");
+        host.appendChild(card("在线状态 · " + asset.id)).appendChild(
+          table(["在线", "最近心跳", "未完成任务"], [[status.online ? "在线" : "离线", status.presence ? fmt(status.presence.last_seen) : "-", status.unfinished_tasks.length]]));
+      } catch (err) { /* ssh assets have no agent presence */ }
+    }
+  }
+
+  async function loadMemory(host) {
+    const roles = await api("GET", "/api/v1/roles");
+    if (!roles.length) { host.appendChild(el("div", "card muted", "尚无角色")); return; }
+    const box = card("按天分层记忆");
+    const select = el("select");
+    roles.forEach((role) => { const option = el("option", "", role.name + " (" + role.id + ")"); option.value = role.id; select.appendChild(option); });
+    if (state.roleId) select.value = state.roleId;
+    const button = el("button", "", "查看");
+    const holder = el("div", "");
+    button.onclick = async () => {
+      holder.textContent = "";
+      const policy = await api("GET", "/api/v1/roles/" + select.value + "/memory/policy");
+      holder.appendChild(el("p", "muted small", "策略：" + JSON.stringify(policy)));
+      const days = await api("GET", "/api/v1/roles/" + select.value + "/memory");
+      holder.appendChild(table(["日期", "来源", "轮次", "编辑时间", "全文/压缩/梗概字符"], days.map((d) => [d.day, d.source, d.turn_count, fmt(d.edited_at), (d.full_text || "").length + " / " + (d.compressed || "").length + " / " + (d.summary || "").length]), (row) => {
+        const day = days.find((d) => d.day === row[0]);
+        modal("记忆 " + day.day, day);
+      }));
+    };
+    box.appendChild(select); box.appendChild(button); box.appendChild(holder);
+    host.appendChild(box);
+    button.onclick();
+  }
+
+  async function loadAudit(host) {
+    const data = await api("GET", "/api/v1/audit?limit=100");
+    host.appendChild(card("审计（不可编辑）")).appendChild(
+      table(["时间", "事件", "对象", "操作者"], data.map((r) => [fmt(r.created_at), r.event, r.entity_id, r.actor]), (row) => {
+        const record = data.find((r) => fmt(r.created_at) === row[0] && r.event === row[1]);
+        modal("审计 " + record.seq, record);
+      }));
+  }
+
+  async function loadOutput(host) {
+    const data = await api("GET", "/api/v1/output/usage");
+    const grid = el("div", "grid");
+    grid.appendChild(kv("原始字节总量", data.total_bytes));
+    grid.appendChild(kv("分块数", data.chunks));
+    grid.appendChild(kv("已冻结归档", data.archives));
+    grid.appendChild(kv("最旧归档", fmt(data.oldest_archive_at)));
+    host.appendChild(card("输出归档用量")).appendChild(grid);
+    const policy = card("生效策略（环境变量配置）");
+    policy.appendChild(el("pre", "pre-list", JSON.stringify(data.policy, null, 2)));
+    host.appendChild(policy);
+  }
+
+  /* ---------- boot ---------- */
+  function boot() {
+    const remembered = sessionStorage.getItem("aiops.view");
+    if (remembered === "console" || remembered === "chat") state.view = remembered;
+    renderNav();
+    renderView();
+  }
+  window.addEventListener("beforeunload", () => { token = ""; });
+})();

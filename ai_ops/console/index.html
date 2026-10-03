@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI 运维控制台</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<div id="login" class="login">
+  <form id="login-form" autocomplete="off">
+    <h1>AI 运维控制台</h1>
+    <p class="muted">管理端凭据仅保存于本标签页内存，关闭即失效；不写入浏览器存储。</p>
+    <label>管理员 Token
+      <input id="token" type="password" required minlength="32" autocomplete="off" spellcheck="false">
+    </label>
+    <button type="submit">进入控制台</button>
+    <p id="login-error" class="error" role="alert" hidden></p>
+  </form>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <div class="brand">AI 运维控制台</div>
+    <nav id="nav"></nav>
+    <div class="spacer"></div>
+    <span id="status" class="muted"></span>
+    <button id="lock" class="ghost" title="清除内存中的凭据">锁定</button>
+  </header>
+
+  <main>
+    <section id="view-chat" class="view">
+      <div class="split">
+        <aside class="pane pane-left">
+          <div class="pane-head"><h2>角色</h2><button id="chat-refresh" class="ghost small">刷新</button></div>
+          <ul id="chat-roles" class="list"></ul>
+        </aside>
+        <div class="pane pane-main">
+          <div class="pane-head"><h2 id="chat-title">聊天</h2><span id="chat-model" class="muted small"></span></div>
+          <div id="chat-log" class="log"></div>
+          <form id="chat-form" class="composer">
+            <label class="inline">模式
+              <select id="chat-mode">
+                <option value="confirm">confirm（逐条审批）</option>
+                <option value="readonly">readonly（只读分析）</option>
+                <option value="direct">direct（直接执行）</option>
+              </select>
+            </label>
+            <label class="inline grow">执行账号（逗号分隔）
+              <input id="chat-users" placeholder="ops_read" autocomplete="off">
+            </label>
+            <textarea id="chat-text" rows="3" placeholder="描述要运维处理的事情…" required></textarea>
+            <button type="submit">发送</button>
+          </form>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-console" class="view" hidden>
+      <div class="split">
+        <aside class="pane pane-left">
+          <div class="pane-head"><h2>控制台</h2></div>
+          <ul id="console-tabs" class="list tabs"></ul>
+        </aside>
+        <div id="console-body" class="pane pane-main"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="modal" class="modal" hidden>
+    <div class="modal-box">
+      <div class="modal-head"><h3 id="modal-title"></h3><button id="modal-close" class="ghost">关闭</button></div>
+      <pre id="modal-body" class="json"></pre>
+    </div>
+  </div>
+</div>
+
+<script src="/assets/app.js"></script>
+</body>
+</html>

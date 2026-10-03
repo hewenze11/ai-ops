@@ -22,5 +22,8 @@ ai-ops-admin-token = "ai_ops.admin_cli:main"
 [tool.setuptools.packages.find]
 include = ["ai_ops*"]
 
+[tool.setuptools.package-data]
+"ai_ops.console" = ["*.html", "*.css", "*.js"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

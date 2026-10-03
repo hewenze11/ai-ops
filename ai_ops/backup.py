@@ -110,8 +110,14 @@ def create_backup(db_path, out_path):
     finally:
         src.close()
     os.chmod(tmp, 0o600)
-    with open(tmp, "rb") as handle:
-        os.fsync(handle.fileno())
+    # Flush the snapshot to disk before the sidecar claims it exists. On Windows
+    # os.fsync requires a handle with write access, so open read-write and close
+    # it explicitly rather than relying on the read-only context manager flush.
+    flush = open(tmp, "rb+")
+    try:
+        os.fsync(flush.fileno())
+    finally:
+        flush.close()
     report = inspect(tmp)
     os.replace(tmp, out)
     meta = {"created_at": time.time(), "source": str(source), "schema_version": report["schema_version"],
@@ -176,13 +182,27 @@ def restore_backup(backup_path, db_path):
     if live.exists():
         # Fold the live database's WAL back into the main file first: in WAL mode
         # recent commits live in the -wal file, so a raw rename of just the main
-        # file would silently drop them and leave an unusable safety copy.
+        # file would silently drop them and leave an unusable safety copy. Also
+        # leave WAL mode: the service is stopped for a restore, and dropping the
+        # -wal/-shm sidecars makes the rename reliable on platforms that refuse
+        # to rename a file they already have open.
         try:
             _checkpoint(live)
+            _leave_wal_mode(live)
         except sqlite3.Error as error:
             raise BackupError("Cannot checkpoint the live database before restore: %s" % type(error).__name__)
         safety = live.with_name(live.name + ".pre-restore-%d" % int(time.time()))
-        os.replace(live, safety)
+        # On Windows a leftover connection can hold the main file briefly; retry
+        # the rename so a transient handle does not abort an already-validated
+        # restore.
+        for attempt in range(20):
+            try:
+                os.replace(live, safety)
+                break
+            except PermissionError:
+                if attempt == 19:
+                    raise BackupError("Cannot take the live database offline for restore")
+                time.sleep(0.25)
     # Remove old WAL/SHM so the restored file is not shadowed by stale journal.
     for suffix in ("-wal", "-shm"):
         stale = Path(str(live) + suffix)
@@ -193,9 +213,34 @@ def restore_backup(backup_path, db_path):
             "previous_kept_at": str(safety) if safety else None}
 
 
+def _leave_wal_mode(path):
+    """Switch a stopped database out of WAL. Best effort: some platforms raise
+    while a stale reader still holds the file, and the checkpoint already made
+    the main file self-contained, so the caller can still proceed."""
+    try:
+        db = sqlite3.connect(str(path), timeout=30)
+        try:
+            db.execute("PRAGMA journal_mode=DELETE")
+            db.commit()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        pass
+
+
 def _checkpoint(path):
-    """Flush a WAL-mode database fully into its main file."""
-    db = sqlite3.connect(str(path), timeout=30)
+    """Flush a WAL-mode database fully into its main file.
+
+    Opening read-write can fail on Windows while another process holds the file
+    (e.g. an open TestClient connection), so fall back to a read-only connection,
+    which is enough to run the checkpoint.
+    """
+    try:
+        db = sqlite3.connect(str(path), timeout=30)
+    except MemoryError:
+        raise
+    except sqlite3.Error:
+        db = sqlite3.connect("file:%s?mode=ro" % Path(path).as_posix(), uri=True, timeout=30)
     try:
         db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         db.commit()

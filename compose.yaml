@@ -6,7 +6,10 @@ services:
       target: runtime
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${AI_OPS_PORT:-18765}:8765"
+      # Bind address is configurable so the console can be reached from a
+      # browser on the test host. Keep 127.0.0.1 for a strictly local service;
+      # set AI_OPS_BIND=0.0.0.0 only when the host is not publicly reachable.
+      - "${AI_OPS_BIND:-127.0.0.1}:${AI_OPS_PORT:-8765}:8765"
     environment:
       AI_OPS_ADMIN_TOKEN_FILE: /run/secrets/admin_token
     volumes:

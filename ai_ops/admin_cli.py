@@ -35,8 +35,27 @@ def rotate(path, length=48):
     finally:
         os.close(handle)
     os.replace(tmp, target)
-    os.chmod(target, 0o600)
+    _restrict(target)
     return {"path": str(target), "backup": str(backup) if backup else None, "length": len(new_token)}
+
+
+def _restrict(path):
+    """Best-effort 0600. POSIX enforces the mode directly; Windows ignores it for
+    the read-only bit, so also clear inherited ACEs via icacls when available.
+    Rotation never fails just because hardening the ACL was unavailable."""
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    if os.name == "nt":
+        try:
+            import subprocess
+            user = os.environ.get("USERNAME")
+            if user:
+                subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", user + ":F"],
+                               capture_output=True, check=False, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
 def main(argv=None):

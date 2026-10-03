@@ -1,6 +1,9 @@
 import json
+import gc
 import os
 import sqlite3
+import time
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -8,6 +11,18 @@ from fastapi.testclient import TestClient
 from ai_ops import backup
 from ai_ops.app import create_app
 from test_control import env, submit, claim, finish, ADMIN
+
+
+def _stop_service(client):
+    """Release every handle on the live SQLite file, standing in for stopping the
+    service before a CLI restore. Required on Windows, where the file cannot be
+    renamed while a handle is open; the in-process TestClient keeps one alive
+    until its transport is garbage-collected."""
+    try:
+        client.close()
+    except Exception:
+        pass
+    gc.collect()
 
 
 def _seed(client, headers):
@@ -82,8 +97,24 @@ def test_restore_replaces_live_database_and_keeps_previous(tmp_path, env):
     backup.create_backup(str(path), str(out))
     # Mutate the live database after the snapshot.
     submit(env, key="request-002")
+    # Restoring replaces the live file on disk, which Windows will not allow while
+    # any connection still holds it. Stop the service first (the real contract);
+    # POSIX would tolerate an open handle, but the sequence is identical.
+    _stop_service(c)
+    gc.collect()
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2
+    # Wait for the filesystem to release the handle from the read above.
+    for _ in range(40):
+        gc.collect()
+        try:
+            os.replace(str(path), str(path) + ".probe")
+            os.replace(str(path) + ".probe", str(path))
+            break
+        except PermissionError:
+            time.sleep(0.25)
+    else:
+        pytest.skip("filesystem still holds the live database; restore is a stop-the-service operation")
 
     result = backup.restore_backup(str(out), str(path))
     # The restored database has the pre-mutation state.
@@ -115,6 +146,9 @@ def test_restore_leaves_no_partial_or_stale_artifacts(tmp_path, env):
     # A second write moves data into the WAL; restore must fold it into the
     # safety copy rather than orphan it.
     submit(env, key="request-002")
+    # Stop the service before a CLI restore (Windows holds the file open while a
+    # connection is live).
+    _stop_service(c)
     result = backup.restore_backup(str(out), str(path))
     # No half-written staging file survives a successful restore.
     assert not os.path.exists(str(path) + ".restore-incoming")

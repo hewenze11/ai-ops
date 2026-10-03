@@ -120,8 +120,10 @@ def test_admin_token_cli_rotates_and_keeps_backup(tmp_path):
     assert len(new_value) >= 32 and new_value != "old-token-value-000000000000000000"
     assert result["backup"] and os.path.exists(result["backup"])
     assert open(result["backup"]).read() == "old-token-value-000000000000000000"
-    # File mode is private.
-    assert oct(target.stat().st_mode & 0o777) == "0o600"
+    # POSIX reports the mode directly; Windows cannot express 0600 via chmod
+    # (os.chmod only toggles the read-only bit), so don't assert it there.
+    if os.name == "posix":
+        assert oct(target.stat().st_mode & 0o777) == "0o600"
 
 
 def test_admin_token_cli_refuses_without_path():

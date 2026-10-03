@@ -249,6 +249,8 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     install_leases(app, transaction, audit, admin)
     from .connector_ssh import install_connector, start_connector_workers
     install_connector(app, transaction, audit, admin)
+    from .console import install_console
+    install_console(app, transaction, audit, admin)
 
     @app.get("/healthz")
     def health():

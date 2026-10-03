@@ -61,6 +61,12 @@
     $("modal-body").textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2);
     $("modal").hidden = false;
   }
+  function modalContent(title, node) {
+    $("modal-title").textContent = title;
+    $("modal-body").textContent = "";
+    $("modal-body").appendChild(node);
+    $("modal").hidden = false;
+  }
   $("modal-close").onclick = () => { $("modal").hidden = true; };
   $("modal").onclick = (e) => { if (e.target === $("modal")) $("modal").hidden = true; };
 
@@ -255,7 +261,7 @@
     ["overview", "总览"], ["attention", "需人工处置"], ["alarms", "告警日志"],
     ["tasks", "任务"], ["turns", "角色轮次"], ["custom", "定制任务"],
     ["turns-loop", "触发器事件"], ["channels", "渠道"], ["documents", "文档"], ["assets", "资产"],
-    ["memory", "记忆"], ["audit", "审计"], ["output", "输出"],
+    ["skills", "Skills"], ["memory", "记忆"], ["audit", "审计"], ["output", "输出"],
   ];
   function renderConsole() {
     const tabs = $("console-tabs");
@@ -276,7 +282,7 @@
     const loaders = {
       overview: loadOverview, attention: loadAttention, alarms: loadAlarms, tasks: loadTasks,
       turns: loadTurns, custom: loadCustom, "turns-loop": loadEvents, documents: loadDocuments,
-      assets: loadAssets, channels: loadChannels, memory: loadMemory, audit: loadAudit, output: loadOutput,
+      assets: loadAssets, channels: loadChannels, skills: loadSkills, memory: loadMemory, audit: loadAudit, output: loadOutput,
     };
     loaders[state.tab](holder).catch((err) => holder.appendChild(el("div", "card error", "加载失败：" + err.message)));
   }
@@ -445,11 +451,90 @@
 
   async function loadDocuments(host) {
     const data = await api("GET", "/api/v1/documents");
-    host.appendChild(card("文档（核心文档强制注入，跨角色共享）")).appendChild(
-      table(["ID", "名称", "核心", "角色", "修订", "正文字符"], data.map((r) => [r.id, r.name, r.core ? "是" : "否", usersToText(r.role_ids), r.revision, (r.content || "").length]), (row) => {
-        const record = data.find((r) => r.id === row[0]);
-        modal("文档 " + record.id, record);
-      }));
+    const box = card("文档（核心文档强制注入，跨角色共享）");
+    const add = el("button", "small", "新建 / 编辑文档");
+    add.onclick = () => documentEditor(null);
+    box.appendChild(add);
+    box.appendChild(table(["ID", "名称", "核心", "角色", "修订", "正文字符", "操作"], data.map((r) => [r.id, r.name, r.core ? "是" : "否", usersToText(r.role_ids), r.revision, (r.content || "").length, "编辑"]), (row) => {
+      documentEditor(data.find((r) => r.id === row[0]));
+    }));
+    host.appendChild(box);
+  }
+
+  function documentEditor(record) {
+    const box = el("div", "");
+    const fields = el("div", "fields");
+    const idInput = el("input"); idInput.placeholder = "id";
+    const nameInput = el("input"); nameInput.placeholder = "名称";
+    const rolesInput = el("input"); rolesInput.placeholder = "角色 id，逗号分隔（留空=仅核心）";
+    const coreInput = el("input"); coreInput.type = "checkbox"; coreInput.checked = true;
+    const coreWrap = el("label", "inline"); coreWrap.appendChild(coreInput); coreWrap.appendChild(el("span", "", "核心文档"));
+    if (record) { idInput.value = record.id; idInput.disabled = true; nameInput.value = record.name; rolesInput.value = usersToText(record.role_ids); coreInput.checked = !!record.core; }
+    fields.appendChild(idInput); fields.appendChild(nameInput); fields.appendChild(rolesInput); fields.appendChild(coreWrap);
+    const content = el("textarea"); content.rows = 12; content.style.width = "100%"; content.value = record ? record.content : "";
+    const feedback = el("p", "error small", "");
+    const save = el("button", "", record ? "保存" : "创建");
+    const del = el("button", "ghost danger", "删除");
+    del.onclick = async () => {
+      if (!record) return;
+      try { await api("DELETE", "/api/v1/documents/" + record.id); $("modal").hidden = true; say("文档已删除（审计保留）"); renderConsole(); }
+      catch (err) { feedback.textContent = err.message; }
+    };
+    save.onclick = async () => {
+      const body = { id: idInput.value.trim(), name: nameInput.value.trim(), content: content.value, core: coreInput.checked, role_ids: textToUsers(rolesInput.value) };
+      try { await api("PUT", "/api/v1/documents/" + body.id, body); $("modal").hidden = true; say("文档已保存"); renderConsole(); }
+      catch (err) { feedback.textContent = err.message; }
+    };
+    const actions = el("div", "row"); actions.appendChild(save);
+    if (record) actions.appendChild(del);
+    box.appendChild(el("p", "muted small", "核心文档强制注入所有角色；非核心文档仅注入指定角色；保存有修订号。"));
+    box.appendChild(fields); box.appendChild(content); box.appendChild(actions); box.appendChild(feedback);
+    modalContent(record ? "编辑文档 " + record.id : "新建文档", box);
+  }
+
+  async function loadSkills(host) {
+    const data = await api("GET", "/api/v1/skills");
+    const box = card("本地 Skills（作为参考文本注入本角色，不授予任何权限）");
+    const add = el("button", "small", "新建 Skill");
+    add.onclick = () => skillEditor(null);
+    box.appendChild(add);
+    box.appendChild(table(["ID", "名称", "启用", "角色", "修订", "字符", "操作"],
+      data.map((r) => [r.id, r.name, r.enabled ? "是" : "否", usersToText(r.role_ids), r.revision, (r.content || "").length, "编辑"]),
+      (row) => skillEditor(data.find((r) => r.id === row[0]))));
+    host.appendChild(box);
+    const note = card("边界");
+    note.appendChild(el("p", "muted small", "Skill 是数据不是代码：不能增加账号、改模式或授予工具，只作为参考材料注入模型上下文。"));
+    host.appendChild(note);
+  }
+
+  function skillEditor(record) {
+    const box = el("div", "");
+    const fields = el("div", "fields");
+    const idInput = el("input"); idInput.placeholder = "id";
+    const nameInput = el("input"); nameInput.placeholder = "名称";
+    const rolesInput = el("input"); rolesInput.placeholder = "角色 id，逗号分隔";
+    const enabledInput = el("input"); enabledInput.type = "checkbox"; enabledInput.checked = true;
+    const enabledWrap = el("label", "inline"); enabledWrap.appendChild(enabledInput); enabledWrap.appendChild(el("span", "", "启用"));
+    if (record) { idInput.value = record.id; idInput.disabled = true; nameInput.value = record.name; rolesInput.value = usersToText(record.role_ids); enabledInput.checked = !!record.enabled; }
+    fields.appendChild(idInput); fields.appendChild(nameInput); fields.appendChild(rolesInput); fields.appendChild(enabledWrap);
+    const content = el("textarea"); content.rows = 12; content.style.width = "100%"; content.value = record ? record.content : "";
+    const feedback = el("p", "error small", "");
+    const save = el("button", "", record ? "保存" : "创建");
+    const del = el("button", "ghost danger", "删除");
+    del.onclick = async () => {
+      if (!record) return;
+      try { await api("DELETE", "/api/v1/skills/" + record.id); $("modal").hidden = true; say("Skill 已删除"); renderConsole(); }
+      catch (err) { feedback.textContent = err.message; }
+    };
+    save.onclick = async () => {
+      const body = { id: idInput.value.trim(), name: nameInput.value.trim(), content: content.value, role_ids: textToUsers(rolesInput.value), enabled: enabledInput.checked };
+      try { await api("PUT", "/api/v1/skills/" + body.id, body); $("modal").hidden = true; say("Skill 已保存"); renderConsole(); }
+      catch (err) { feedback.textContent = err.message; }
+    };
+    const actions = el("div", "row"); actions.appendChild(save);
+    if (record) actions.appendChild(del);
+    box.appendChild(fields); box.appendChild(content); box.appendChild(actions); box.appendChild(feedback);
+    modalContent(record ? "编辑 Skill " + record.id : "新建 Skill", box);
   }
 
   async function loadChannels(host) {
@@ -495,10 +580,9 @@
 
   async function loadAssets(host) {
     const data = await api("GET", "/api/v1/assets");
-    const box = card("资产（注册为管理员操作，控制台只读）");
-    box.appendChild(table(["ID", "名称", "接入方式", "允许账号"], data.map((r) => [r.id, r.name, r.connection_type, usersToText(r.allowed_users)]), (row) => {
-      const record = data.find((r) => r.id === row[0]);
-      modal("资产 " + record.id, record);
+    const box = card("资产（注册为管理员操作；此处可改名/备注/允许账号）");
+    box.appendChild(table(["ID", "名称", "接入方式", "允许账号", "操作"], data.map((r) => [r.id, r.name, r.connection_type, usersToText(r.allowed_users), "编辑"]), (row) => {
+      assetEditor(data.find((r) => r.id === row[0]));
     }));
     host.appendChild(box);
     for (const asset of data) {
@@ -508,6 +592,27 @@
           table(["在线", "最近心跳", "未完成任务"], [[status.online ? "在线" : "离线", status.presence ? fmt(status.presence.last_seen) : "-", status.unfinished_tasks.length]]));
       } catch (err) { /* ssh assets have no agent presence */ }
     }
+  }
+
+  function assetEditor(record) {
+    if (!record) return;
+    const box = el("div", "");
+    const fields = el("div", "fields");
+    const nameInput = el("input"); nameInput.value = record.name; nameInput.placeholder = "名称";
+    const usersInput = el("input"); usersInput.value = usersToText(record.allowed_users); usersInput.placeholder = "允许账号，逗号分隔";
+    fields.appendChild(nameInput); fields.appendChild(usersInput);
+    const notes = el("textarea"); notes.rows = 6; notes.style.width = "100%"; notes.value = record.notes || "";
+    notes.placeholder = "备注（会注入模型上下文，作为资产说明）";
+    const feedback = el("p", "error small", "");
+    const save = el("button", "", "保存");
+    save.onclick = async () => {
+      const body = { name: nameInput.value.trim(), allowed_users: textToUsers(usersInput.value), notes: notes.value };
+      try { await api("PUT", "/api/v1/assets/" + record.id + "/notes", body); $("modal").hidden = true; say("资产已更新"); renderConsole(); }
+      catch (err) { feedback.textContent = err.message; }
+    };
+    box.appendChild(el("p", "muted small", "接入方式与凭据在这里不可改；token 轮换请用管理员 API。"));
+    box.appendChild(fields); box.appendChild(notes); box.appendChild(save); box.appendChild(feedback);
+    modalContent("资产 " + record.id, box);
   }
 
   async function loadMemory(host) {

@@ -59,6 +59,22 @@ def document_view(rows, role_id):
             for r in rows if r["core"] or role_id in json.loads(r["role_ids"])]
 
 
+def skill_view(db, role_id):
+    """Skills for this role: local reference text, injected like documents.
+
+    A skill NEVER widens authority — it cannot add accounts, change the mode or
+    grant tools. It is untrusted reference material for the model, not a
+    permission source. Only enabled, non-deleted skills are injected.
+    """
+    try:
+        rows = db.execute("SELECT * FROM skills WHERE deleted_at IS NULL AND enabled=1 ORDER BY id").fetchall()
+    except Exception:
+        # Older database without the skills table yet: nothing to inject.
+        return []
+    return [{"id": r["id"], "revision": r["revision"], "content": r["content"]}
+            for r in rows if role_id in json.loads(r["role_ids"])]
+
+
 def build_messages(app, db, turn, recent_query=None):
     users = json.loads(turn["execution_users"])
     assets = asset_view(db.execute("SELECT * FROM assets ORDER BY id"), users)
@@ -67,6 +83,7 @@ def build_messages(app, db, turn, recent_query=None):
     # after tool results. Never silently summarize/truncate core/API content.
     system = SYSTEM + "\nFULL_SERVICE_API_DOCUMENTATION\n" + json.dumps(app.openapi(), ensure_ascii=False)
     system += "\nCURRENT_DOCUMENTS_FULL_TEXT\n" + json.dumps(docs, ensure_ascii=False)
+    system += "\nCURRENT_SKILLS\n" + json.dumps(skill_view(db, turn["role_id"]), ensure_ascii=False)
     system += "\nCURRENT_TURN_AUTHORITY\n" + json.dumps({"role_id": turn["role_id"], "execution_users": users, "mode": turn["mode"]}, ensure_ascii=False)
     system += "\nREGISTERED_ASSET_DATA\n" + json.dumps(assets, ensure_ascii=False)
     messages = [{"role": "system", "content": system}]

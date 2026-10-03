@@ -79,6 +79,11 @@ class Claim(StrictModel):
     protocol_version: str
 
 
+class RotateToken(StrictModel):
+    # Seconds the superseded token stays valid after rotation. 0 = immediate.
+    grace_seconds: int = Field(default=0, ge=0, le=86400)
+
+
 class Result(StrictModel):
     claim_id: str = Field(min_length=16, max_length=128)
     status: Literal["succeeded", "failed", "unknown", "cancelled"]
@@ -98,7 +103,7 @@ class Result(StrictModel):
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS roles(id TEXT PRIMARY KEY, name TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY, name TEXT NOT NULL, allowed_users TEXT NOT NULL, notes TEXT NOT NULL, token_hash TEXT NOT NULL, connection_type TEXT NOT NULL DEFAULT 'agent');
+CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY, name TEXT NOT NULL, allowed_users TEXT NOT NULL, notes TEXT NOT NULL, token_hash TEXT NOT NULL, connection_type TEXT NOT NULL DEFAULT 'agent', previous_token_hash TEXT, previous_token_expires REAL);
 CREATE TABLE IF NOT EXISTS tasks(
  seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
  role_id TEXT NOT NULL REFERENCES roles(id), asset_id TEXT NOT NULL REFERENCES assets(id),
@@ -109,15 +114,30 @@ CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, event TE
 """
 
 
-def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastAPI:
+def create_app(db_path: str, admin_token: str, default_model: str = "", admin_token_file: str | None = None) -> FastAPI:
     if len(admin_token) < 32:
         raise ValueError("A random admin token of at least 32 characters is required")
     path = Path(db_path)
+
+    def current_admin_token():
+        # When the token is backed by a file we re-read it on every check so an
+        # operator can rotate the credential by replacing the file, without a
+        # restart. If the file is missing or unreadable we fall back to the
+        # token loaded at startup rather than locking the operator out.
+        if admin_token_file:
+            try:
+                value = Path(admin_token_file).read_text().strip()
+                if len(value) >= 32:
+                    return value
+            except OSError:
+                pass
+        return admin_token
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as db:
         db.row_factory = sqlite3.Row
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4, 5, 6):
+        if version not in (0, 1, 2, 3, 4, 5, 6, 7):
             raise ValueError("Unsupported database schema; refusing to modify it")
         from .custom_tasks import SCHEMA as CUSTOM_SCHEMA
         from .turns import SCHEMA as TURN_SCHEMA, migrate, enqueue_turn, set_turn_state
@@ -130,7 +150,13 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
         migrate_execution(db)
         migrate_leases(db)
         migrate_connector(db)
-        db.execute("PRAGMA user_version=6")
+        # Schema 7: asset credential rotation keeps a previous token hash for an
+        # optional grace window so a rollout can overlap token switches.
+        asset_columns = {r[1] for r in db.execute("PRAGMA table_info(assets)")}
+        for name, kind in (("previous_token_hash", "TEXT"), ("previous_token_expires", "REAL")):
+            if name not in asset_columns:
+                db.execute("ALTER TABLE assets ADD COLUMN " + name + " " + kind)
+        db.execute("PRAGMA user_version=7")
         # Do not repeat a provider call whose response was lost during a crash.
         interrupted = db.execute("SELECT id FROM role_turns WHERE state='calling'").fetchall()
         for row in interrupted:
@@ -169,15 +195,22 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
         return value[7:]
 
     def admin(authorization: str | None = Header(default=None)):
-        if not hmac.compare_digest(bearer(authorization).encode(), admin_token.encode()):
+        if not hmac.compare_digest(bearer(authorization).encode(), current_admin_token().encode()):
             raise HTTPException(403, "Invalid administrative credential")
 
     def agent_auth(db, asset_id, authorization):
         row = db.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
         candidate = hashlib.sha256(bearer(authorization).encode()).hexdigest()
-        if row is None or not hmac.compare_digest(candidate, row["token_hash"]):
+        if row is None:
             raise HTTPException(403, "Invalid asset credential")
-        return row
+        if hmac.compare_digest(candidate, row["token_hash"]):
+            return row
+        # A previous token stays valid only inside its grace window (if any).
+        previous = row["previous_token_hash"]
+        expires = row["previous_token_expires"]
+        if previous and expires is not None and time.time() <= expires and hmac.compare_digest(candidate, previous):
+            return row
+        raise HTTPException(403, "Invalid asset credential")
 
     from .leases import LEASE_SECONDS, lease_view, open_lease, close_lease
 
@@ -196,7 +229,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
     app.state.audit = audit
     from .custom_tasks import install_custom_tasks
     from .turns import install_turns
-    install_custom_tasks(app, transaction, audit, admin, admin_token)
+    install_custom_tasks(app, transaction, audit, admin, current_admin_token)
     install_turns(app, transaction, audit, admin, default_model)
     from .execution import install_execution, cancel_task, check_archives
     from .retention import install_retention, policy_from_env
@@ -250,6 +283,41 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
             from .connector_ssh import connection_view
             return [{"id": r["id"], "name": r["name"], "allowed_users": json.loads(r["allowed_users"]), "notes": r["notes"],
                      "connection_type": connection_view(db, r["id"])["connection_type"]} for r in db.execute("SELECT * FROM assets ORDER BY id")]
+
+    @app.post("/api/v1/assets/{asset_id}/rotate-token", dependencies=[Depends(admin)])
+    def rotate_asset_token(asset_id: str, body: RotateToken):
+        token = secrets.token_urlsafe(36)
+        now = time.time()
+        with transaction() as db:
+            row = db.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+            if row is None:
+                raise HTTPException(404, "Asset not found")
+            if row["connection_type"] != "agent":
+                raise HTTPException(409, "Only agent assets carry a rotatable token")
+            # Keep the old hash only for the grace window; otherwise drop it so a
+            # superseded token is invalid immediately.
+            if body.grace_seconds > 0:
+                db.execute("UPDATE assets SET token_hash=?,previous_token_hash=?,previous_token_expires=? WHERE id=?",
+                           (hashlib.sha256(token.encode()).hexdigest(), row["token_hash"], now + body.grace_seconds, asset_id))
+            else:
+                db.execute("UPDATE assets SET token_hash=?,previous_token_hash=NULL,previous_token_expires=NULL WHERE id=?",
+                           (hashlib.sha256(token.encode()).hexdigest(), asset_id))
+            audit(db, "asset.token_rotated", asset_id, "admin",
+                  {"grace_seconds": body.grace_seconds})
+        # The new credential is returned exactly once and never audited.
+        return {"asset_id": asset_id, "agent_token": token, "grace_seconds": body.grace_seconds}
+
+    @app.get("/api/v1/assets/{asset_id}", dependencies=[Depends(admin)])
+    def get_asset(asset_id: str):
+        with transaction() as db:
+            from .connector_ssh import connection_view
+            row = db.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+            if row is None:
+                raise HTTPException(404, "Asset not found")
+            return {"id": row["id"], "name": row["name"], "allowed_users": json.loads(row["allowed_users"]),
+                    "notes": row["notes"], "connection_type": connection_view(db, row["id"])["connection_type"],
+                    "previous_token_active": bool(row["previous_token_hash"] and row["previous_token_expires"] is not None and time.time() <= row["previous_token_expires"]),
+                    "previous_token_expires": row["previous_token_expires"]}
 
     @app.post("/api/v1/tasks", dependencies=[Depends(admin)], status_code=201)
     def submit(body: Task):

@@ -112,10 +112,14 @@ class CronPreview(BaseModel):
 
 
 class CustomTaskStore:
-    def __init__(self, transaction, audit, admin_token):
+    def __init__(self, transaction, audit, admin_token_provider):
         self.transaction = transaction
         self.audit = audit
-        self.admin_token = admin_token
+        # A callable returning the current admin token, so a rotated credential
+        # is honoured without restarting the service.
+        self.admin_token_provider = admin_token_provider
+        if isinstance(admin_token_provider, str):
+            self.admin_token_provider = lambda: admin_token_provider
 
     @staticmethod
     def view(row):
@@ -267,7 +271,7 @@ def install_custom_tasks(app, transaction, audit, admin, admin_token):
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(401, "Bearer authentication required")
         supplied = authorization[7:]
-        internal = hmac.compare_digest(supplied.encode(), admin_token.encode())
+        internal = hmac.compare_digest(supplied.encode(), store.admin_token_provider().encode())
         # Authenticate before reading an attacker-controlled request body.
         with transaction() as db:
             row = db.execute("SELECT * FROM custom_tasks WHERE id=?", (custom_id,)).fetchone()

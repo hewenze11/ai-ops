@@ -17,6 +17,7 @@ ai-ops-service = "ai_ops.__main__:main"
 ai-ops-backup = "ai_ops.backup_cli:backup_main"
 ai-ops-restore = "ai_ops.backup_cli:restore_main"
 ai-ops-verify-backup = "ai_ops.backup_cli:verify_main"
+ai-ops-admin-token = "ai_ops.admin_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["ai_ops*"]

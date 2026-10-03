@@ -8,7 +8,8 @@ def main():
     secret_file = os.environ.get("AI_OPS_ADMIN_TOKEN_FILE")
     token = Path(secret_file).read_text().strip() if secret_file else os.environ.get("AI_OPS_ADMIN_TOKEN", "")
     from .app import create_app
-    app = create_app(os.environ.get("AI_OPS_DB", "data/control.db"), token, os.environ.get("AI_OPS_MODEL", ""))
+    app = create_app(os.environ.get("AI_OPS_DB", "data/control.db"), token,
+                     os.environ.get("AI_OPS_MODEL", ""), admin_token_file=secret_file)
     port = int(os.environ.get("AI_OPS_PORT", "8765"))
     background = []
     if os.environ.get("AI_OPS_SCHEDULER_ENABLED", "1") == "1":

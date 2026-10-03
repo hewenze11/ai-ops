@@ -37,6 +37,10 @@ class Asset(StrictModel):
     ssh_user: str | None = Field(default=None, max_length=64)
     ssh_auth_kind: Literal["key", "password"] | None = None
     ssh_secret_ref: str | None = Field(default=None, max_length=512)
+    # Pinned host public key (openSSH "ssh-ed25519 AAAA..." form). The connector
+    # refuses to connect when this is absent.
+    ssh_host_key: str | None = Field(default=None, max_length=2000)
+    ssh_key_type: str | None = Field(default=None, max_length=32)
 
     @model_validator(mode="after")
     def validate_connection(self):
@@ -45,6 +49,8 @@ class Asset(StrictModel):
                 raise ValueError("ssh assets require ssh_host, ssh_user and ssh_auth_kind")
             if not self.ssh_secret_ref:
                 raise ValueError("ssh assets require ssh_secret_ref")
+            if not self.ssh_host_key:
+                raise ValueError("ssh assets require a pinned ssh_host_key")
         return self
 
 

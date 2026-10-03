@@ -17,7 +17,8 @@ def ssh_asset(env, asset_id="ssh-host", secret_ref=None):
         handle.write("not-a-real-key")
     body = {"id": asset_id, "name": "SSH host", "allowed_users": ["reader", "operator"], "notes": "ssh",
             "connection_type": "ssh", "ssh_host": "10.0.0.9", "ssh_port": 22, "ssh_user": "root",
-            "ssh_auth_kind": "key", "ssh_secret_ref": secret_ref}
+            "ssh_auth_kind": "key", "ssh_secret_ref": secret_ref,
+            "ssh_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJVEXyRCnfSva5S8OJcOBsqxXneRacM5thAfEH29aexe root@localhost"}
     response = c.post("/api/v1/assets", headers=h, json=body)
     assert response.status_code == 201, response.text
     return response.json()
@@ -38,9 +39,56 @@ def test_ssh_asset_metadata_never_exposes_secret_ref(env):
     row = [a for a in listed if a["id"] == "ssh-host"][0]
     assert row["connection_type"] == "ssh"
     assert "ssh_secret_ref" not in json.dumps(listed)
+    assert "ssh_host_key" not in json.dumps(listed)
     detail = c.get("/api/v1/assets/ssh-host/connection", headers=h).json()
     assert detail["connection_type"] == "ssh" and detail["ssh_host"] == "10.0.0.9"
     assert "ssh_secret_ref" not in detail
+    # The pinned key itself is never handed back to the caller either.
+    assert "ssh_host_key\"" not in json.dumps(detail)
+    assert detail["ssh_host_key_pinned"] is True
+
+
+def test_ssh_asset_without_pinned_key_is_rejected(env):
+    c, h, _, _ = env
+    body = {"id": "nopin", "name": "no pin", "allowed_users": ["reader"], "notes": "",
+            "connection_type": "ssh", "ssh_host": "10.0.0.9", "ssh_port": 22, "ssh_user": "root",
+            "ssh_auth_kind": "key", "ssh_secret_ref": "/tmp/x.secret"}
+    assert c.post("/api/v1/assets", headers=h, json=body).status_code == 422
+
+
+def test_connect_refuses_without_pinned_host_key():
+    # Fail closed: no pinned key means we cannot verify the peer, so refuse.
+    with pytest.raises(Exception):
+        connector_ssh._connect({"ssh_host": "10.0.0.9", "ssh_port": 22, "ssh_user": "root",
+                                "ssh_auth_kind": "password", "ssh_secret_ref": "/nope",
+                                "ssh_host_key": None})
+
+
+def test_connect_pins_operator_provided_key(monkeypatch, tmp_path):
+    # The exact pinned key must be the only host key the client trusts, and the
+    # client must reject anything not pinned in advance.
+    secret = tmp_path / "pw.secret"
+    secret.write_text("hunter2")
+    captured = {}
+
+    class Recorder:
+        def __init__(self): self.keys = []
+        def get_host_keys(self):
+            keys = self.keys
+            return type("HK", (), {"add": lambda self, host, kind, key: keys.append((host, kind, str(key)))} )()
+        def set_missing_host_key_policy(self, policy): captured["policy"] = policy
+        def connect(self, **kwargs): captured["kwargs"] = kwargs
+        def close(self): pass
+
+    pinned = ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJVEXyRCnfSva5S8OJcOBsqxXneRacM5thAfEH29aexe root@localhost")
+    monkeypatch.setattr(connector_ssh.paramiko, "SSHClient", Recorder)
+    client = connector_ssh._connect({"ssh_host": "10.0.0.9", "ssh_port": 22, "ssh_user": "root",
+                                     "ssh_auth_kind": "password", "ssh_secret_ref": str(secret),
+                                     "ssh_host_key": pinned, "ssh_key_type": "ssh-ed25519"})
+    assert client.keys and client.keys[0][0] == "10.0.0.9" and client.keys[0][1] == "ssh-ed25519"
+    assert isinstance(captured["policy"], connector_ssh.paramiko.RejectPolicy)
+    assert captured["kwargs"]["password"] == "hunter2"
+    assert captured["kwargs"]["allow_agent"] is False and captured["kwargs"]["look_for_keys"] is False
 
 
 class FakeChannel:

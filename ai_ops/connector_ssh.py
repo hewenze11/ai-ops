@@ -15,6 +15,7 @@ import time
 import uuid
 from typing import Literal
 
+import paramiko
 from fastapi import Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -29,7 +30,7 @@ CREATE TABLE IF NOT EXISTS asset_connections(
  asset_id TEXT PRIMARY KEY REFERENCES assets(id),
  connection_type TEXT NOT NULL DEFAULT 'agent',
  ssh_host TEXT, ssh_port INTEGER NOT NULL DEFAULT 22, ssh_user TEXT,
- ssh_auth_kind TEXT, ssh_secret_ref TEXT);
+ ssh_auth_kind TEXT, ssh_secret_ref TEXT, ssh_host_key TEXT);
 """
 
 
@@ -38,16 +39,19 @@ def migrate(db):
     # Older databases only ever had agent assets; the row default covers them.
     if 'connection_type' not in columns:
         db.execute("ALTER TABLE assets ADD COLUMN connection_type TEXT NOT NULL DEFAULT 'agent'")
+    conn_cols = {r[1] for r in db.execute('PRAGMA table_info(asset_connections)')}
+    if 'ssh_host_key' not in conn_cols:
+        db.execute("ALTER TABLE asset_connections ADD COLUMN ssh_host_key TEXT")
 
 
 def save_connection(db, asset):
     db.execute(
-        "INSERT INTO asset_connections(asset_id,connection_type,ssh_host,ssh_port,ssh_user,ssh_auth_kind,ssh_secret_ref) "
-        "VALUES(?,?,?,?,?,?,?) ON CONFLICT(asset_id) DO UPDATE SET connection_type=excluded.connection_type,"
+        "INSERT INTO asset_connections(asset_id,connection_type,ssh_host,ssh_port,ssh_user,ssh_auth_kind,ssh_secret_ref,ssh_host_key) "
+        "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(asset_id) DO UPDATE SET connection_type=excluded.connection_type,"
         "ssh_host=excluded.ssh_host,ssh_port=excluded.ssh_port,ssh_user=excluded.ssh_user,"
-        "ssh_auth_kind=excluded.ssh_auth_kind,ssh_secret_ref=excluded.ssh_secret_ref",
+        "ssh_auth_kind=excluded.ssh_auth_kind,ssh_secret_ref=excluded.ssh_secret_ref,ssh_host_key=excluded.ssh_host_key",
         (asset.id, asset.connection_type, asset.ssh_host, asset.ssh_port, asset.ssh_user,
-         asset.ssh_auth_kind, asset.ssh_secret_ref))
+         asset.ssh_auth_kind, asset.ssh_secret_ref, asset.ssh_host_key))
     db.execute("UPDATE assets SET connection_type=? WHERE id=?", (asset.connection_type, asset.id))
 
 
@@ -57,7 +61,8 @@ def connection_view(db, asset_id):
         legacy = db.execute("SELECT connection_type FROM assets WHERE id=?", (asset_id,)).fetchone()
         return {"connection_type": (legacy["connection_type"] if legacy else "agent")}
     return {"connection_type": row["connection_type"], "ssh_host": row["ssh_host"],
-            "ssh_port": row["ssh_port"], "ssh_user": row["ssh_user"], "ssh_auth_kind": row["ssh_auth_kind"]}
+            "ssh_port": row["ssh_port"], "ssh_user": row["ssh_user"], "ssh_auth_kind": row["ssh_auth_kind"],
+            "ssh_host_key_pinned": bool(row["ssh_host_key"])}
 
 
 def _load_secret(secret_ref):
@@ -70,12 +75,42 @@ def _shell_quote(value):
     return "'" + value.replace("'", "'\\''") + "'"
 
 
+def _load_pinned_key(host, line):
+    """Parse an OpenSSH public-key line into a Key so we can pin it.
+
+    paramiko dropped ``PKey.from_openssh_public_key`` in 5.x, so we round-trip
+    through ``HostKeys`` (known_hosts format), which is stable across majors.
+    """
+    import tempfile
+    text = '%s %s\n' % (host, line.strip())
+    handle, path = tempfile.mkstemp(prefix='aiops-hk-')
+    try:
+        os.write(handle, text.encode())
+        os.close(handle)
+        keys = paramiko.HostKeys(path)
+        entry = keys.lookup(host)
+        if entry is None:
+            raise paramiko.SSHException('pinned SSH host key is not a valid public key')
+        for key_type, key in entry.items():
+            return key_type, key
+        raise paramiko.SSHException('pinned SSH host key is not a valid public key')
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def _connect(info):
-    import paramiko
+    if not info.get('ssh_host_key'):
+        # Fail closed: without a pinned host key we would be trusting whatever
+        # answers, which is exactly the man-in-the-middle we refuse to accept.
+        raise paramiko.SSHException('SSH host key is not pinned for this asset')
     secret = _load_secret(info['ssh_secret_ref'])
+    key_type, pinned = _load_pinned_key(info['ssh_host'], info['ssh_host_key'])
     client = paramiko.SSHClient()
-    # The host key is pinned by the operator when provisioning; the connector
-    # does not silently trust an unknown key on first use.
+    # Pin the operator-provided public key and reject anything else.
+    client.get_host_keys().add(info['ssh_host'], key_type, pinned)
     client.set_missing_host_key_policy(paramiko.RejectPolicy())
     kwargs = {'hostname': info['ssh_host'], 'port': info['ssh_port'], 'username': info['ssh_user'],
               'timeout': CONNECT_TIMEOUT, 'banner_timeout': CONNECT_TIMEOUT,

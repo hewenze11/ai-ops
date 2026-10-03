@@ -201,6 +201,10 @@ class ConnectorExecutor:
         payload = task['payload']
         result = self._execute(info, payload['run_as'], payload['command'],
                                payload.get('timeout_seconds', 60), cancel_event)
+        # Scrub inline output before it becomes durable or model-visible. The raw
+        # archive streamed during execution remains byte-exact operator evidence.
+        from . import scrubbing
+        result = scrubbing.redact_result(result)
         with self.transaction() as db:
             close_lease(db, task['id'])
             db.execute("UPDATE tasks SET state=?,result=?,updated_at=? WHERE id=?",

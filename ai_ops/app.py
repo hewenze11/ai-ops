@@ -14,6 +14,7 @@ from typing import Literal
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import Field, model_validator
 
+from . import scrubbing
 from .models import Identifier, StrictModel, UserName
 
 PROTOCOL = "1.0"
@@ -156,8 +157,11 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
     def audit(db, event, entity_id, actor, details):
         # This insert is in the SAME transaction as the state change. Failure
         # blocks dispatch; it is not a best-effort logger or LLM-written memory.
+        # Details are scrubbed so a command or payload echoed into an audit event
+        # cannot persist a secret into the audit trail.
+        safe = scrubbing.redact_structure(details) if details else details
         db.execute("INSERT INTO audit(event,entity_id,actor,details,created_at) VALUES(?,?,?,?,?)",
-                   (event, entity_id, actor, json.dumps(details, ensure_ascii=False), time.time()))
+                   (event, entity_id, actor, json.dumps(safe, ensure_ascii=False), time.time()))
 
     def bearer(value):
         if not value or not value.startswith("Bearer "):
@@ -339,6 +343,12 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
                 raise HTTPException(404, "Task not found")
             if not row["claim_id"] or not hmac.compare_digest(row["claim_id"], body.claim_id):
                 raise HTTPException(403, "Claim does not match")
+            # Inline stdout/stderr is handed to the model as tool output and
+            # shown in audit views, so scrub it at the boundary; every downstream
+            # step (duplicate comparison, stored result, audit) then sees the
+            # same redacted value. The raw archive (digest-verified) is left
+            # byte-exact on purpose.
+            body = Result(**scrubbing.redact_result(body.model_dump()))
             result = body.model_dump_json()
             if row["result"] is not None:
                 if Result.model_validate_json(row['result']).model_dump() == body.model_dump():

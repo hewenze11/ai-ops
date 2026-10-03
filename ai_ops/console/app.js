@@ -254,7 +254,7 @@
   const TABS = [
     ["overview", "总览"], ["attention", "需人工处置"], ["alarms", "告警日志"],
     ["tasks", "任务"], ["turns", "角色轮次"], ["custom", "定制任务"],
-    ["turns-loop", "触发器事件"], ["documents", "文档"], ["assets", "资产"],
+    ["turns-loop", "触发器事件"], ["channels", "渠道"], ["documents", "文档"], ["assets", "资产"],
     ["memory", "记忆"], ["audit", "审计"], ["output", "输出"],
   ];
   function renderConsole() {
@@ -276,7 +276,7 @@
     const loaders = {
       overview: loadOverview, attention: loadAttention, alarms: loadAlarms, tasks: loadTasks,
       turns: loadTurns, custom: loadCustom, "turns-loop": loadEvents, documents: loadDocuments,
-      assets: loadAssets, memory: loadMemory, audit: loadAudit, output: loadOutput,
+      assets: loadAssets, channels: loadChannels, memory: loadMemory, audit: loadAudit, output: loadOutput,
     };
     loaders[state.tab](holder).catch((err) => holder.appendChild(el("div", "card error", "加载失败：" + err.message)));
   }
@@ -450,6 +450,47 @@
         const record = data.find((r) => r.id === row[0]);
         modal("文档 " + record.id, record);
       }));
+  }
+
+  async function loadChannels(host) {
+    const identities = await api("GET", "/api/v1/channels/identities");
+    const box = card("渠道身份（飞书/企业微信/微信，共享同一个角色的记忆与串行队列）");
+    box.appendChild(table(["渠道", "用户", "角色", "模式", "账号", "最近活动", "操作"],
+      identities.map((i) => [i.channel, i.user_id, i.role_id, i.mode, usersToText(i.execution_users), fmt(i.last_seen), "解绑"]),
+      (row) => {
+        const record = identities.find((i) => i.channel === row[0] && i.user_id === row[1]);
+        modal("渠道身份 " + record.channel + " / " + record.user_id, record);
+      }));
+    host.appendChild(box);
+
+    const note = card("边界说明");
+    note.appendChild(el("p", "muted small",
+      "新身份必须先由管理员签发一次性配对码才能使用；未配对来信只记录不执行。" +
+      "微信 / 企业微信的对外推送不在本仓库内置，出站消息以投递形式保存，由外部渠道桥接拉取；我们不会把“已存储”说成“已发送”。"));
+    host.appendChild(note);
+
+    const role = card("为某角色签发配对码");
+    const roleSelect = el("select");
+    const modeSelect = el("select");
+    ["confirm", "readonly", "direct"].forEach((m) => { const o = el("option", "", m); o.value = m; modeSelect.appendChild(o); });
+    const userInput = el("input"); userInput.placeholder = "执行账号，逗号分隔，如 reader";
+    const issue = el("button", "", "签发");
+    const out = el("pre", "pre-list", "");
+    api("GET", "/api/v1/roles").then((roles) => roles.forEach((r) => {
+      const o = el("option", "", r.name + " (" + r.id + ")"); o.value = r.id; roleSelect.appendChild(o);
+    }));
+    issue.onclick = async () => {
+      try {
+        const issued = await api("POST", "/api/v1/channels/pairings", {
+          role_id: roleSelect.value, mode: modeSelect.value, execution_users: textToUsers(userInput.value),
+        });
+        out.textContent = "配对码（仅此一次显示）：" + issued.pairing_code;
+      } catch (err) { out.textContent = "失败：" + err.message; }
+    };
+    const row = el("div", "fields");
+    row.appendChild(roleSelect); row.appendChild(modeSelect); row.appendChild(userInput); row.appendChild(issue);
+    role.appendChild(row); role.appendChild(out);
+    host.appendChild(role);
   }
 
   async function loadAssets(host) {

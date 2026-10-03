@@ -32,11 +32,16 @@ CREATE TABLE IF NOT EXISTS documents(
 """
 
 
-def enqueue_turn(db, role_id, source, source_id, users, mode, prompt, payload, created_at=None):
+def enqueue_turn(db, role_id, source, source_id, users, mode, prompt, payload, created_at=None, caller=None):
     now = time.time() if created_at is None else created_at
     turn_id = str(uuid.uuid4())
-    db.execute("INSERT INTO role_turns(id,role_id,source,source_id,execution_users,mode,prompt,payload,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-               (turn_id, role_id, source, source_id, json.dumps(users), mode, prompt, json.dumps(payload, ensure_ascii=False), "queued", now, now))
+    # ``source`` stays a coarse category (chat/trigger/scheduled/command). The
+    # optional ``caller`` records WHICH surface produced it (web, feishu, weixin,
+    # an alarm source, ...) so a channel can read back only its own turns' replies
+    # and never sees another channel's conversation. Defaults to the source so
+    # existing rows and callers keep their meaning.
+    db.execute("INSERT INTO role_turns(id,role_id,source,source_id,execution_users,mode,prompt,payload,state,created_at,updated_at,caller) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+               (turn_id, role_id, source, source_id, json.dumps(users), mode, prompt, json.dumps(payload, ensure_ascii=False), "queued", now, now, caller or source))
     return turn_id
 
 
@@ -45,6 +50,12 @@ def migrate(db):
         columns = {r[1] for r in db.execute("PRAGMA table_info(" + table + ")")}
         if "turn_id" not in columns:
             db.execute("ALTER TABLE " + table + " ADD COLUMN turn_id TEXT")
+    # Schema 8: record which calling surface produced each turn so channels can
+    # read back only their own conversation. Backfill old rows with the source.
+    columns = {r[1] for r in db.execute("PRAGMA table_info(role_turns)")}
+    if "caller" not in columns:
+        db.execute("ALTER TABLE role_turns ADD COLUMN caller TEXT")
+        db.execute("UPDATE role_turns SET caller=source WHERE caller IS NULL")
     # Merge legacy commands and inputs by creation time instead of putting one
     # old queue entirely ahead of the other. Stable ties are deterministic.
     rows = [(r["created_at"], "command", dict(r)) for r in db.execute("SELECT * FROM tasks WHERE turn_id IS NULL")]
@@ -306,7 +317,7 @@ def install_turns(app, transaction, audit, admin, default_model="", search_provi
             raise HTTPException(404, "Role not found")
 
     def view(row):
-        return {**dict(row), "execution_users": json.loads(row["execution_users"]), "payload": json.loads(row["payload"]), "messages": json.loads(row["messages"])}
+        return {**dict(row), "execution_users": json.loads(row["execution_users"]), "payload": json.loads(row["payload"]), "messages": json.loads(row["messages"]), "caller": row["caller"] or row["source"]}
 
     @app.put("/api/v1/roles/{role_id}/model", dependencies=[Depends(admin)])
     def configure_model(role_id: ID, body: RoleModel):
@@ -335,7 +346,7 @@ def install_turns(app, transaction, audit, admin, default_model="", search_provi
                 if old["prompt"] != body.text or json.loads(old["execution_users"]) != body.execution_users or old["mode"] != body.mode:
                     raise HTTPException(409, "Message idempotency key reused with different content")
                 return {"turn_id": old["id"], "state": old["state"], "duplicate": True}
-            turn_id = enqueue_turn(db, role_id, "chat", source_id, body.execution_users, body.mode, body.text, {})
+            turn_id = enqueue_turn(db, role_id, "chat", source_id, body.execution_users, body.mode, body.text, {}, caller="web")
             audit(db, "chat.received", turn_id, "admin", body.model_dump())
             return {"turn_id": turn_id, "state": "queued", "duplicate": False}
 

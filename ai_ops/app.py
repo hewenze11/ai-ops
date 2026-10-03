@@ -137,17 +137,18 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     with sqlite3.connect(path) as db:
         db.row_factory = sqlite3.Row
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4, 5, 6, 7):
+        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8):
             raise ValueError("Unsupported database schema; refusing to modify it")
         from .custom_tasks import SCHEMA as CUSTOM_SCHEMA
         from .turns import SCHEMA as TURN_SCHEMA, migrate, enqueue_turn, set_turn_state
         from .memory import SCHEMA as MEMORY_SCHEMA
         from .alarms import SCHEMA as ALARM_SCHEMA
+        from .channels import SCHEMA as CHANNEL_SCHEMA
         db.execute("PRAGMA journal_mode=WAL")
         from .execution import SCHEMA as EXEC_SCHEMA, migrate as migrate_execution
         from .leases import SCHEMA as LEASE_SCHEMA, migrate as migrate_leases
         from .connector_ssh import SCHEMA as CONNECTOR_SCHEMA, migrate as migrate_connector
-        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA + LEASE_SCHEMA + CONNECTOR_SCHEMA + MEMORY_SCHEMA + ALARM_SCHEMA)
+        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA + LEASE_SCHEMA + CONNECTOR_SCHEMA + MEMORY_SCHEMA + ALARM_SCHEMA + CHANNEL_SCHEMA)
         migrate(db)
         migrate_execution(db)
         migrate_leases(db)
@@ -158,7 +159,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         for name, kind in (("previous_token_hash", "TEXT"), ("previous_token_expires", "REAL")):
             if name not in asset_columns:
                 db.execute("ALTER TABLE assets ADD COLUMN " + name + " " + kind)
-        db.execute("PRAGMA user_version=7")
+        db.execute("PRAGMA user_version=8")
         # Do not repeat a provider call whose response was lost during a crash.
         interrupted = db.execute("SELECT id FROM role_turns WHERE state='calling'").fetchall()
         for row in interrupted:
@@ -251,6 +252,8 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     install_connector(app, transaction, audit, admin)
     from .console import install_console
     install_console(app, transaction, audit, admin)
+    from .channels import install_channels
+    install_channels(app, transaction, audit, admin, current_admin_token)
 
     @app.get("/healthz")
     def health():

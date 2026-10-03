@@ -146,6 +146,9 @@ PY
 rm -f /tmp/.aiops-pairing.json
 
 # Prefer the packaged installer (it owns the hardened unit); fall back if absent.
+# The installer uses `shutil.which('ai-ops-agent')`, so the venv bin MUST be on
+# PATH or it falls back to the bare interpreter and loses the entry point.
+export PATH="/opt/ai-ops-agent/venv/bin:$PATH"
 if command -v /opt/ai-ops-agent/venv/bin/ai-ops-agent-install >/dev/null 2>&1; then
   /opt/ai-ops-agent/venv/bin/ai-ops-agent-install \
     --server-url "$SERVER_URL" --asset-id "$ASSET_ID" --token "$AGENT_TOKEN" \

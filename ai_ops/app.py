@@ -2,6 +2,7 @@
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import sqlite3
 import time
@@ -194,7 +195,11 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
     install_custom_tasks(app, transaction, audit, admin, admin_token)
     install_turns(app, transaction, audit, admin, default_model)
     from .execution import install_execution, cancel_task, check_archives
-    install_execution(app, transaction, audit, admin, agent_auth)
+    from .retention import install_retention, policy_from_env
+    retention_policy = policy_from_env(os.environ)
+    install_execution(app, transaction, audit, admin, agent_auth, retention_policy)
+    install_retention(app, transaction, audit, admin, retention_policy)
+    app.state.retention_policy = retention_policy
     from .leases import install_leases
     install_leases(app, transaction, audit, admin)
     from .connector_ssh import install_connector, start_connector_workers

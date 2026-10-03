@@ -84,7 +84,7 @@ def check_archives(db, task_id, archives):
             raise HTTPException(409, 'Output archive is not finalized or does not match')
 
 
-def install_execution(app, transaction, audit, admin, agent_auth):
+def install_execution(app, transaction, audit, admin, agent_auth, policy=None):
     def owned(db, asset_id, task_id, authorization, claim_id):
         agent_auth(db, asset_id, authorization)
         task = db.execute('SELECT * FROM tasks WHERE id=? AND asset_id=?', (task_id, asset_id)).fetchone()
@@ -144,6 +144,11 @@ def install_execution(app, transaction, audit, admin, agent_auth):
             row = db.execute('SELECT * FROM output_archives WHERE task_id=? AND stream=?', (task_id, stream)).fetchone()
             if row['finalized'] or row['size'] != body.offset:
                 raise HTTPException(409, 'Archive finalized or offset is not contiguous')
+            if policy is not None:
+                from .retention import budget_guard
+                within, detail = budget_guard(db, policy, len(data), task_id)
+                if not within:
+                    raise HTTPException(413, 'Output store is at capacity; prune or raise the quota before uploading more')
             db.execute('INSERT INTO output_chunks VALUES(?,?,?,?)', (task_id, stream, body.offset, data))
             db.execute('UPDATE output_archives SET size=size+? WHERE task_id=? AND stream=?', (len(data), task_id, stream))
             audit(db, 'output.chunk', task_id, 'agent:' + asset_id, {'stream': stream, 'offset': body.offset, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()})

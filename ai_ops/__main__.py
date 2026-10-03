@@ -23,6 +23,10 @@ def main():
         from .connector_ssh import start_connector_workers
         stop, threads = start_connector_workers(app, app.state.transaction, app.state.audit)
         background.append((stop, threads[0] if threads else None))
+    if os.environ.get("AI_OPS_RETENTION_ENABLED", "1") == "1":
+        from .retention import start_retention_worker
+        stop, thread = start_retention_worker(app.state.transaction, app.state.audit, app.state.retention_policy)
+        background.append((stop, thread))
     try:
         uvicorn.run(app, host=os.environ.get("AI_OPS_HOST", "127.0.0.1"), port=port, access_log=False)
     finally:

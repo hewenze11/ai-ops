@@ -175,13 +175,12 @@ User=root
 ExecStart=/opt/ai-ops-agent/venv/bin/ai-ops-agent --config ${CFG}
 Restart=on-failure
 RestartSec=5
-NoNewPrivileges=yes
+# Runs as root to switch into the allowed accounts; it must retain the
+# privilege to setuid/setgid/setgroups (=NoNewPrivileges would forbid it).
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
 ReadWritePaths=${JOURNAL}
-AmbientCapabilities=
-CapabilityBoundingSet=
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 

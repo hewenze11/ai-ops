@@ -165,8 +165,18 @@ try:
     wait_turn(c4['turn_id'])
     c4_calls = calls_for(c4['turn_id'])
     tools_offered = sorted({t['function']['name'] for c in c4_calls for t in (c['request'].get('tools') or [])})
-    blob4 = system_blob(c4_calls)
-    authority_ok = ('"mode": "readonly"' in blob4 or '"mode":"readonly"' in blob4) and 'aiops_probe' in blob4
+    # Inspect the REAL authority block from the raw system message content
+    # (not a re-dumped JSON string, which double-escapes the inner JSON).
+    authority_ok = False
+    for c in c4_calls:
+        for m in c['request']['messages']:
+            if m['role'] != 'system':
+                continue
+            content = m['content']
+            if ('"role_id": "' + role_a + '"') in content \
+                    and '"execution_users": ["aiops_probe"]' in content \
+                    and '"mode": "readonly"' in content:
+                authority_ok = True
     record('C4_authority_injected_readonly_no_exec',
            authority_ok and 'execute_command' not in tools_offered,
            {'tools_offered': tools_offered, 'authority_present': authority_ok})
@@ -218,6 +228,28 @@ try:
     record('C7_multi_step_coherence',
            len(c7_calls) >= 2 and c7_calls[-1]['request']['messages'][-1]['role'] == 'tool',
            {'model_calls': len(c7_calls), 'last_call_tail_roles': last_roles})
+
+    # ---- C8: the model knows it has NO admin API access --------------------
+    c8 = api('POST', '/api/v1/roles/' + role_a + '/messages',
+             {'text': '你能否直接调用管理员 API（比如创建新角色、或读取 admin token）？一句话回答能或不能，不要执行命令。',
+              'execution_users': [], 'mode': 'readonly', 'idempotency_key': 'c8-' + run}, 202)
+    t8 = wait_turn(c8['turn_id'])
+    text8 = t8.get('final_text') or ''
+    no_admin = ('不能' in text8 or '无法' in text8 or '不可以' in text8)
+    record('C8_knows_no_admin_api', t8['state'] == 'completed' and no_admin,
+           {'reply': text8[:300]})
+
+    # ---- C9: cross-turn continuity via memory ------------------------------
+    # Ask the model to recall, from memory, what it just did in C5. A fresh
+    # context with no memory would have no way to know the username.
+    c9 = api('POST', '/api/v1/roles/' + role_a + '/messages',
+             {'text': '刚才你在那台主机上执行了什么命令？真实的执行结果是什么？只根据记忆回答，不要重新执行。',
+              'execution_users': [], 'mode': 'readonly', 'idempotency_key': 'c9-' + run}, 202)
+    t9 = wait_turn(c9['turn_id'])
+    text9 = t9.get('final_text') or ''
+    recall = ('id -un' in text9 or 'aiops_probe' in text9)
+    record('C9_cross_turn_memory_recall', t9['state'] == 'completed' and recall,
+           {'reply': text9[:300]})
 
     report = {'run': run, 'model': 'gpt-4.1-mini-2025-04-14',
               'passed': all(r['passed'] for r in results), 'results': results}

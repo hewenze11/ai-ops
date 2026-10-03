@@ -301,3 +301,29 @@ def test_normalizer_excludes_hidden_reasoning_and_rejects_truncation():
     body["choices"][0]["finish_reason"] = "length"
     with pytest.raises(ModelFailure):
         normalize_response(body)
+
+
+def test_same_day_prior_turn_is_replayed_for_continuity(env):
+    """A role must remember its earlier same-day turns.
+
+    The age-tiered daily memory intentionally excludes TODAY, so without an
+    explicit same-day replay a role would start every turn with amnesia about
+    what it just did — the exact "it doesn't hang together" failure. Here we run
+    one completed turn, then start a second and assert the first turn's prompt
+    and final text are replayed ahead of the new user message.
+    """
+    c, h, engine, _, _ = env
+    first = send(env, key="continuity-001").json()["turn_id"]
+    engine.advance(FakeModel([final("FIRST_ANSWER_MARKER")]))
+    assert get(env, first)["state"] == "completed"
+
+    second = send(env, key="continuity-002").json()["turn_id"]
+    model = FakeModel([final("second")])
+    engine.advance(model)
+    contents = [m["content"] for m in model.requests[0]["messages"]]
+    # The earlier same-day turn is replayed as a user/assistant pair.
+    assert "FIRST_ANSWER_MARKER" in contents
+    assert any(m["role"] == "assistant" and m["content"] == "FIRST_ANSWER_MARKER"
+               for m in model.requests[0]["messages"])
+    # The current turn's own prompt is still the last user message.
+    assert model.requests[0]["messages"][-1]["role"] == "user"

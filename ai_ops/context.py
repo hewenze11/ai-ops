@@ -80,6 +80,30 @@ def skill_view(db, role_id):
             for r in rows if role_id in json.loads(r["role_ids"])]
 
 
+def recent_turn_messages(db, turn):
+    """Prior completed turns of THIS role EARLIER TODAY, as conversation memory.
+
+    The age-tiered daily memory deliberately excludes today (the live turn
+    carries it), so without this a role would start every same-day turn with no
+    recollection of what it just did — the exact "it doesn't hang together"
+    failure. We replay today's earlier turns (oldest first, capped at
+    RECENT_TURNS) as user/assistant pairs. Only this role's turns, only earlier
+    seq, only completed non-command turns. The current turn is never included.
+    """
+    today = memory_module._day_of(time.time())
+    rows = db.execute(
+        "SELECT seq,prompt,final_text,created_at FROM role_turns "
+        "WHERE role_id=? AND state='completed' AND source!='command' AND seq<? "
+        "ORDER BY seq DESC LIMIT ?", (turn["role_id"], turn["seq"], RECENT_TURNS)).fetchall()
+    out = []
+    for row in reversed(rows):
+        if memory_module._day_of(row["created_at"]) != today:
+            continue
+        out.append({"role": "user", "content": row["prompt"] or ""})
+        out.append({"role": "assistant", "content": row["final_text"] or ""})
+    return out
+
+
 def build_messages(app, db, turn, recent_query=None):
     users = json.loads(turn["execution_users"])
     assets = asset_view(db.execute("SELECT * FROM assets ORDER BY id"), users)
@@ -97,6 +121,10 @@ def build_messages(app, db, turn, recent_query=None):
     # never grant this turn any permission.
     mem_messages, _ = memory_messages(db, turn)
     messages.extend(mem_messages)
+    # Same-day continuity: today's earlier turns of this role are replayed as
+    # conversation, so the role remembers what it just did. Placed after the
+    # age-tiered memory and before the current user message.
+    messages.extend(recent_turn_messages(db, turn))
     messages.append({"role": "user", "content": turn["prompt"] + "\nUNTRUSTED_EVENT_DATA\n" + turn["payload"]})
     messages += json.loads(turn["messages"])
     return messages

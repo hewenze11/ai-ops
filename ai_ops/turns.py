@@ -11,6 +11,24 @@ from .context import SYSTEM, build_body
 from .model_client import ModelFailure
 from .models import Identifier as ID, UserName as USER
 TERMINAL = ("completed", "failed", "cancelled")
+
+
+def refresh_day_memory(db, turn):
+    """Re-materialise this turn's day memory the moment the turn completes.
+
+    Without this, a day row is only rebuilt lazily at the NEXT model invocation,
+    so the just-finished turn is missing from memory until then. That lag is a
+    real coherence bug: a follow-up question asking "what did you just do?"
+    would not see the answer in memory. Rebuilding on completion keeps the
+    archived day equal to the turns actually completed so far. Best effort: a
+    memory failure must never fail the turn itself.
+    """
+    try:
+        from . import memory as memory_module
+        memory_module.build_day(db, turn["role_id"], memory_module._day_of(time.time()))
+    except Exception:
+        pass
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS role_models(
  role_id TEXT PRIMARY KEY REFERENCES roles(id), config TEXT NOT NULL);
@@ -240,6 +258,7 @@ class RoleEngine:
             if not calls:
                 set_turn_state(db, turn["id"], "completed", final=message.get("content") or "")
                 self.audit(db, "turn.completed", turn["id"], "service", {})
+                refresh_day_memory(db, turn)
                 return True
             try:
                 if len(calls) != 1:

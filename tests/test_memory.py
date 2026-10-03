@@ -138,6 +138,30 @@ def test_turn_context_includes_tiered_memory_but_not_today():
     assert "OLDER_MEMORY_SUMMARISED_DAYS" in system_blob
 
 
+def test_completed_turn_is_archived_to_today_memory_immediately():
+    """A finished turn must be in the day's memory at once, not only after the
+    NEXT model call. Otherwise a follow-up "what did you just do?" would not see
+    the answer, and a rebuilt-from-scratch day row would lag by one turn."""
+    client = make_client()
+    headers = {"Authorization": "Bearer " + ADMIN}
+    client.post("/api/v1/roles", headers=headers, json={"id": "ops", "name": "Ops"})
+    client.put("/api/v1/roles/ops/model", headers=headers, json={"enabled": True, "model": "", "max_model_steps": 4})
+    client.post("/api/v1/roles/ops/messages", headers=headers,
+                json={"text": "what is the disk state?", "execution_users": [], "mode": "readonly",
+                      "idempotency_key": "mem-archive-0001"})
+
+    class FakeModel:
+        def complete(self, body):
+            return {"message": {"role": "assistant", "content": "DISK_OK_MARKER"}, "usage": {}, "model": "test"}
+
+    client.app.state.role_engine.advance(FakeModel())
+    import time as _time
+    today = _time.strftime("%Y-%m-%d", _time.localtime())
+    row = client.get("/api/v1/roles/ops/memory/" + today, headers=headers).json()
+    assert "DISK_OK_MARKER" in row["full_text"], row
+    assert "what is the disk state?" in row["full_text"]
+
+
 def test_compress_keeps_head_and_tail():
     text = "A" * 5000 + "MIDDLE" + "B" * 5000
     out = memory.compress(text, limit=100)

@@ -2,6 +2,26 @@
 
 轻量运维工作台。**当前是 0.1.0.dev5 后端预览，不是已完成产品，也不建议暴露公网。**
 
+## 快速开始（一条命令装主服务）
+
+在一台装了 Docker 的 Linux 机器上（root / sudo）：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/hewenze11/ai-ops/main/deploy/install-control.sh | sudo bash
+```
+
+脚本会自己装 Docker（如缺）、生成 `admin_token`、用发布镜像起服务（默认 `ghcr.io/hewenze11/ai-ops:latest`，仅监听 `127.0.0.1:8765`），建好初始角色 `ops` 与资产 `agent-1`，并在最后打印**一条配对码**。
+
+拿到配对码后，在**你要让 AI 操作的机器**上（root / sudo）执行：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/hewenze11/ai-ops/main/deploy/install-agent.sh | sudo bash -s -- --pairing-code 'aiops1-...'
+```
+
+Agent 脚本会创建两个最小权限账号（`aiops_read` 只读、`aiops_ops` 可改且仅限服务重启类有限 sudo），把 agent 装进 `/opt/ai-ops-agent` 并注册为 systemd 服务；模型提出的命令在 confirm 模式下要你逐条批准才会执行。
+
+> 前置条件：两个 GHCR 容器包需为 **public** 才能匿名拉取镜像（见下方「CI 与发布」）。若包仍为私有，脚本会在本地已有镜像时回退使用本地副本，否则会明确报错。详细说明见 [deploy/README.md](deploy/README.md)。
+
 ## 本次实现
 
 - FastAPI + SQLite 的认证 API，独立资产凭据（数据库仅存其哈希）。
@@ -95,6 +115,12 @@ docker compose -p ai-ops-preview up -d --build
 
 ## CI 与发布
 
-push/PR 运行 Python 3.11/3.12 测试。测试通过后构建镜像；非 PR 推送 `ghcr.io/hewenze11/ai-ops`，以分支、提交 SHA、版本标签区分。使用 Actions 内置 GITHUB_TOKEN，不需把个人 PAT 存入工作流。没有自动 SSH 部署，避免每次提交直接改测试机。
+push/PR 运行 Python 3.11/3.12 测试。测试通过后构建镜像；非 PR 推送 `ghcr.io/hewenze11/ai-ops`，以提交 SHA (`sha-<commit>`)、默认分支 (`main`) 和 `latest` 标签区分。使用 Actions 内置 GITHUB_TOKEN，不需把个人 PAT 存入工作流。没有自动 SSH 部署，避免每次提交直接改测试机。
+
+> **一次性人工步骤（仅需做一次）**：GitHub 的**用户级容器包可见性无法用 API 修改**（REST 对所有变体都 404，GraphQL 无该字段），必须到网页把包改成 **Public**：
+> - github.com/users/hewenze11/packages/container/ai-ops/settings
+> - github.com/users/hewenze11/packages/container/ai-ops-agent/settings
+>
+> 否则陌生人无法匿名 `docker pull`，一键脚本拿不到镜像。
 
 许可证尚待项目所有者确定；暂不附加未经确认的开源许可证。

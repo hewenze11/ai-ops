@@ -2,6 +2,20 @@
 
 当前推荐的 Linux 执行端方式是独立 venv + systemd 常驻轮询：不把宿主机用户执行放进特权容器；容器仍可作为容器内隔离测试用途，不能借此管理宿主机账号。
 
+## 一键安装（推荐）
+
+主服务与 Agent 各提供一条 curl 脚本，见 [deploy/README.md](../deploy/README.md)：
+
+```sh
+# 主服务（跑控制服务的机器）
+curl -fsSL https://raw.githubusercontent.com/hewenze11/ai-ops/main/deploy/install-control.sh | sudo bash
+
+# 执行端（要被 AI 操作的机器，用主服务打印的配对码）
+curl -fsSL https://raw.githubusercontent.com/hewenze11/ai-ops/main/deploy/install-agent.sh | sudo bash -s -- --pairing-code 'aiops1-...'
+```
+
+脚本已在真机端到端验证（见下方“真机验证记录”）。
+
 ## 安装
 
 ```sh
@@ -56,3 +70,20 @@ journalctl -u ai-ops-agent -n 50
 ## 未知执行处置
 
 Agent 崩溃重启后，未确认的任务上报 `unknown`，主服务阻塞该角色后续任务。当前预览没有一键处置接口；应先人工核实机器实际状态，再决定是否通过数据库/后续管理接口解除。不要用取消来清除 unknown。
+
+## 真机验证记录（一键部署）
+
+在预览机（Docker 已装）上完整跑了一遍两条脚本：
+
+1. **主服务**：`install-control.sh` 建目录、生成 admin_token、起容器（镜像不可拉时回退本地副本并告警、无本地副本则明确报错）、建角色 `ops` 与资产 `agent-1`、打印配对码，退出码 0。
+2. **执行端**：`install-agent.sh` 解析配对码、建两个最小权限账号（只读 + 可改）、装 venv 与 systemd 单元、启动，退出码 0。
+3. **端到端执行**：以 `run_as=aiops_r2` 提交 `id; whoami; echo HELLO-E2E-OK`，任务 `state=succeeded`、`exit_code=0`，标准输出为 `uid=994(aiops_r2) ... aiops_r2 / HELLO-E2E-OK`，租约正常关闭（`lease.closed=true`）。
+
+### 关键修复：systemd 单元不能带 `NoNewPrivileges`
+
+Agent 以 root 运行才能切换到允许的普通账号时，单元**不能**带 `NoNewPrivileges=yes`，也不能带空 `CapabilityBoundingSet`：那会让子进程的 `setgroups/setgid` 报 `PermissionError: [Errno 1] Operation not permitted`（实测症状：任务直接失败、journal 出现 `DBG_OSERROR` 回溯）。
+
+- 单账号、非 root 运行：保留最严（`NoNewPrivileges=yes` + 空 capability）。
+- root 运行以切账号：改用有界 capability 集（`CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_KILL CAP_SETPCAP CAP_SYS_PTRACE`），最小权限由**账号白名单**保证，而非该标志。
+
+见 `ai_ops_agent/service.py` 的 `HARDEN_ROOT` / `HARDEN_SWITCH`，以及 `tests/test_service.py` 对应用例。

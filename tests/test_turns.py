@@ -215,6 +215,33 @@ def test_full_documents_and_api_rebuilt_after_tool(env):
         assert path in a and path in b
 
 
+def test_role_is_told_which_product_it_belongs_to_and_its_capabilities(env):
+    c, h, engine, _, _ = env
+    send(env)
+    model = FakeModel([final()])
+    engine.advance(model)
+    system = model.requests[0]["messages"][0]["content"]
+    # Product identity + capability map are a mandatory, always-present tier.
+    assert "SYSTEM_SELF_DESCRIPTION" in system
+    assert "AI Ops" in system
+    for capability in ("assets", "memory", "custom tasks", "alarms", "channels", "tasks & approval"):
+        assert capability.lower() in system.lower()
+    # And it must be told the API surface is the PRODUCT's, not its own tool.
+    assert "NOT your tool" in system
+
+
+def test_self_description_does_not_grant_anything_to_readonly(env):
+    c, h, engine, _, _ = env
+    # readonly: seeing the capability map must not hand the model any tool.
+    send(env, mode="readonly")
+    model = FakeModel([final()])
+    engine.advance(model)
+    tools = model.requests[0].get("tools") or []
+    names = [t["function"]["name"] for t in tools]
+    assert "execute_command" not in names
+    assert "SYSTEM_SELF_DESCRIPTION" in model.requests[0]["messages"][0]["content"]
+
+
 def test_role_history_isolated(env):
     send(env, text="PRIVATE_OPS_MARKER")
     env[2].advance(FakeModel([final("PRIVATE_OPS_REPLY")]))

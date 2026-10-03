@@ -21,6 +21,14 @@ Checks (each records raw evidence):
       day's content (archived correctly), and is re-injected on a later day view.
   C7. COHERENCE: within ONE turn, the model makes >1 model call (propose tool ->
       read result -> summarise) and the final text reflects the tool result.
+  C8. KNOWS NO ADMIN API: asked directly, the model says it cannot call the
+      admin API or read the admin token.
+  C9. SAME-DAY RECALL: a later same-day turn recalls what an earlier turn did.
+  C10. CROSS-DAY RECALL: an admin-pinned *previous day's* memory reaches the
+      model and the role can recall it.
+  C11. PRODUCT SELF-AWARENESS: the role knows which product it belongs to,
+      can describe that product's capability surface, and still knows the
+      product's abilities are not its own tools.
 
 Nothing secret is printed. The report lands on the host as JSON.
 """
@@ -251,6 +259,45 @@ try:
     record('C9_cross_turn_memory_recall', t9['state'] == 'completed' and recall,
            {'reply': text9[:300]})
 
+    # ---- C10: CROSS-DAY memory recall -------------------------------------
+    # Seed a *previous day's* memory row (admin-pinned) and ask the role to
+    # recall it. This proves the age-tiered memory path (not just same-day
+    # replay) actually reaches the model with past-day content.
+    yday = time.strftime('%Y-%m-%d', time.localtime(time.time() - 86400))
+    prior_marker = 'CONN_PRIOR_DAY_' + run
+    api('PUT', '/api/v1/roles/' + role_a + '/memory/' + yday,
+        {'day': yday, 'full_text': prior_marker + ' 昨天我在实验主机上排查过一次磁盘告警，发现 /var 使用率 91%。'})
+    c10 = api('POST', '/api/v1/roles/' + role_a + '/messages',
+              {'text': '昨天发生了什么？只根据你的记忆回答，一句话。不要执行命令。',
+               'execution_users': [], 'mode': 'readonly', 'idempotency_key': 'c10-' + run}, 202)
+    t10 = wait_turn(c10['turn_id'])
+    text10 = t10.get('final_text') or ''
+    recalled_prior = ('昨天' in text10 and ('磁盘' in text10 or 'var' in text10.lower() or '91' in text10))
+    blob10 = system_blob(calls_for(c10['turn_id']))
+    record('C10_cross_day_memory_recall',
+           t10['state'] == 'completed' and recalled_prior and prior_marker in blob10,
+           {'day': yday, 'reply': text10[:300], 'prior_injected': prior_marker in blob10})
+
+    # ---- C11: product self-awareness (which product, which capabilities) ---
+    # The role must know it belongs to the AI Ops product, be able to describe
+    # that product's capability surface, and still know those product abilities
+    # are NOT its own tools.
+    c11 = api('POST', '/api/v1/roles/' + role_a + '/messages',
+              {'text': '你隶属于哪个产品/系统？这个系统大概能提供哪些功能能力？你自己实际能调用哪些工具？用中文分点简答，不要执行命令。',
+               'execution_users': [], 'mode': 'readonly', 'idempotency_key': 'c11-' + run}, 202)
+    t11 = wait_turn(c11['turn_id'])
+    text11 = t11.get('final_text') or ''
+    knows_product = ('AI Ops' in text11 or 'AI运维' in text11 or '运维' in text11)
+    knows_surface = sum(1 for kw in ('资产', '记忆', '任务', '审批', '告警', '渠道', '文档', '定时')
+                        if kw in text11) >= 2
+    knows_own_tools = 'execute_command' in text11 or '命令' in text11
+    blob11 = system_blob(calls_for(c11['turn_id']))
+    record('C11_product_self_awareness',
+           t11['state'] == 'completed' and 'SYSTEM_SELF_DESCRIPTION' in blob11
+           and knows_product and knows_surface and knows_own_tools,
+           {'reply': text11[:400], 'self_doc_injected': 'SYSTEM_SELF_DESCRIPTION' in blob11,
+            'knows_product': knows_product, 'knows_surface': knows_surface})
+
     report = {'run': run, 'model': 'gpt-4.1-mini-2025-04-14',
               'passed': all(r['passed'] for r in results), 'results': results}
     (base / 'integration/connectivity-report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2))
@@ -267,3 +314,7 @@ finally:
             api('DELETE', path)
         except Exception:
             pass
+    try:
+        api('DELETE', '/api/v1/roles/' + role_a + '/memory/' + yday)
+    except Exception:
+        pass

@@ -58,7 +58,57 @@ curl -fsSL https://raw.githubusercontent.com/hewenze11/ai-ops/main/deploy/instal
 
 > 环回 HTTP 配对（`http://127.0.0.1` / `localhost`）脚本会自动放行并警告；非环回的明文 HTTP 会被**直接拒绝**，远程主机请用 HTTPS。
 
-## 3. 后续
+## 3. 从另一台机器访问（TLS 反向代理）
+
+默认服务只监听 `127.0.0.1`，这是刻意的。要让**别的机器**上的 Agent 连过来，不要直接 `--bind 0.0.0.0` 裸暴露——控制服务本身就是授权边界，请在前面加带 **TLS + 认证** 的反向代理。
+
+以 Caddy（自动申请证书）为例，在控制服务所在机器上：
+
+1. 控制服务仍只听本机（推荐）：
+   ```sh
+   curl -fsSL .../install-control.sh | sudo bash      # 默认 127.0.0.1:8765
+   ```
+2. 装 Caddy，写 `/etc/caddy/Caddyfile`（把 `ops.example.com` 换成你的域名）：
+   ```caddy
+   ops.example.com {
+       # 可选：额外一层 HTTP Basic，双保险
+       # basic_auth {
+       #     admin <bcrypt-hash>
+       # }
+       reverse_proxy 127.0.0.1:8765
+   }
+   ```
+3. `systemctl reload caddy`。之后控制台是 `https://ops.example.com`。
+
+用 nginx 的话：
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name ops.example.com;
+    ssl_certificate     /etc/letsencrypt/live/ops.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/ops.example.com/privkey.pem;
+    client_max_body_size 100m;   # 输出归档分块上传
+    location / {
+        proxy_pass http://127.0.0.1:8765;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300s; # 任务可能跑得久
+    }
+}
+```
+
+完成后，**执行端**的配对码应使用 `https://ops.example.com`（而不是 `http://`）；install-agent.sh 会**拒绝非环回的明文 HTTP**，这正是为了防误配。
+
+如果要就地打印局域网配对码（仅限可信内网、且你已接受风险）：
+
+```sh
+curl -fsSL .../install-control.sh | sudo bash -s -- --bind 0.0.0.0
+```
+
+此时服务在所有网卡上裸听，**没有 TLS**，请仅在隔离实验网内短期使用。
+
+## 4. 后续
 
 - 健康检查：`curl -fsS http://127.0.0.1:8765/healthz`
 - 看服务状态：`cd /opt/ai-ops && docker compose -p ai-ops logs -f`

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全问题（请勿公开）
+    url: https://github.com/hewenze11/ai-ops/security/advisories/new
+    about: 安全漏洞请走私密报告，不要开公开 issue。
+  - name: 部署与使用问题
+    url: https://github.com/hewenze11/ai-ops/blob/main/deploy/README.md
+    about: 一键部署、配对码、常见限制先看 deploy/README.md。

@@ -267,7 +267,8 @@ def install_custom_tasks(app, transaction, audit, admin, admin_token):
 
     @app.post("/api/v1/triggers/{custom_id}/invoke", status_code=202)
     async def invoke(custom_id: ID, request: Request, authorization: str | None = Header(default=None),
-                     x_event_id: str | None = Header(default=None), x_schedule_event_id: str | None = Header(default=None)):
+                     x_event_id: str | None = Header(default=None), x_schedule_event_id: str | None = Header(default=None),
+                     x_alarm_source: str | None = Header(default=None)):
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(401, "Bearer authentication required")
         supplied = authorization[7:]
@@ -279,6 +280,11 @@ def install_custom_tasks(app, transaction, audit, admin, admin_token):
                 raise HTTPException(403, "Invalid trigger credential")
         if x_schedule_event_id and not internal:
             raise HTTPException(403, "Schedule identity is reserved to the service")
+        # An optional source label lets one configuration carry alarms from many
+        # sources; it is untrusted metadata, only used for the alarm log, never as
+        # an instruction or authorization.
+        if x_alarm_source and (len(x_alarm_source) > 200 or any(ord(c) < 32 for c in x_alarm_source)):
+            raise HTTPException(422, "Invalid alarm source label")
         if x_event_id and (not 1 <= len(x_event_id) <= 128 or any(ord(c) < 32 for c in x_event_id)):
             raise HTTPException(422, "Invalid event ID")
         raw = bytearray()
@@ -297,6 +303,9 @@ def install_custom_tasks(app, transaction, audit, admin, admin_token):
         with transaction() as db:
             row = db.execute("SELECT * FROM custom_tasks WHERE id=?", (custom_id,)).fetchone()
             cfg = json.loads(row["config"])
+            from . import alarms
+            from .turns import enqueue_turn
+            entry = alarms.alarm_entry(payload, x_alarm_source)
             scheduled_for = None
             revision = row["revision"]
             snapshot = row["config"]
@@ -315,8 +324,20 @@ def install_custom_tasks(app, transaction, audit, admin, admin_token):
             if existing:
                 if json.loads(existing["payload"]) != payload:
                     raise HTTPException(409, "Event ID reused with a different payload")
+                # A duplicate is still logged, but marked as a duplicate rather
+                # than silently dropped: the alarm log is the default record of
+                # every alarm, including repeats.
+                alarms.record(db, audit, alarm_id=str(uuid.uuid4()), custom_task_id=custom_id,
+                              source=entry["source"], dedupe_key=key, payload=payload,
+                              event_id=existing["id"], turn_id=existing["turn_id"],
+                              state="duplicate", detail="duplicate_event", severity=entry["severity"],
+                              title=entry["title"], summary=entry["summary"])
                 answer = {"accepted": True, "event_id": existing["id"], "turn_id": existing["turn_id"], "state": existing["state"], "duplicate": True}
             elif row["deleted_at"] is not None or not cfg["enabled"] or (x_schedule_event_id and item["state"] == "cancelled"):
+                alarms.record(db, audit, alarm_id=str(uuid.uuid4()), custom_task_id=custom_id,
+                              source=entry["source"], dedupe_key=key, payload=payload,
+                              state="rejected", detail="disabled_or_deleted", severity=entry["severity"],
+                              title=entry["title"], summary=entry["summary"])
                 audit(db, "trigger.rejected", custom_id, "scheduler" if internal else "trigger", {"reason": "disabled_or_deleted", "payload": payload})
                 rejection = HTTPException(409, "Custom task disabled or deleted")
             else:
@@ -324,9 +345,12 @@ def install_custom_tasks(app, transaction, audit, admin, admin_token):
                 event_id = str(uuid.uuid4())
                 db.execute("INSERT INTO trigger_events(id,custom_task_id,dedupe_key,source,scheduled_for,payload,snapshot,revision,role_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                            (event_id, custom_id, key, source, scheduled_for, json.dumps(payload, ensure_ascii=False), snapshot, revision, template["role_id"], time.time()))
-                from .turns import enqueue_turn
                 turn_id = enqueue_turn(db, template['role_id'], source, event_id, template['execution_users'], template['mode'], template['prompt'], payload)
                 db.execute("UPDATE trigger_events SET turn_id=? WHERE id=?", (turn_id, event_id))
+                alarms.record(db, audit, alarm_id=str(uuid.uuid4()), custom_task_id=custom_id,
+                              source=entry["source"], dedupe_key=key, payload=payload,
+                              event_id=event_id, turn_id=turn_id, state="accepted", severity=entry["severity"],
+                              title=entry["title"], summary=entry["summary"])
                 audit(db, "trigger.accepted", event_id, source, {"custom_task_id": custom_id, "role_id": template["role_id"], "revision": revision, "source": source, "turn_id": turn_id})
                 answer = {"accepted": True, "event_id": event_id, "turn_id": turn_id, "state": "queued", "duplicate": False}
         if rejection:

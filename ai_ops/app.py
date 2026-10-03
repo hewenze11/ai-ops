@@ -142,11 +142,12 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         from .custom_tasks import SCHEMA as CUSTOM_SCHEMA
         from .turns import SCHEMA as TURN_SCHEMA, migrate, enqueue_turn, set_turn_state
         from .memory import SCHEMA as MEMORY_SCHEMA
+        from .alarms import SCHEMA as ALARM_SCHEMA
         db.execute("PRAGMA journal_mode=WAL")
         from .execution import SCHEMA as EXEC_SCHEMA, migrate as migrate_execution
         from .leases import SCHEMA as LEASE_SCHEMA, migrate as migrate_leases
         from .connector_ssh import SCHEMA as CONNECTOR_SCHEMA, migrate as migrate_connector
-        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA + LEASE_SCHEMA + CONNECTOR_SCHEMA + MEMORY_SCHEMA)
+        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA + LEASE_SCHEMA + CONNECTOR_SCHEMA + MEMORY_SCHEMA + ALARM_SCHEMA)
         migrate(db)
         migrate_execution(db)
         migrate_leases(db)
@@ -234,6 +235,8 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     install_turns(app, transaction, audit, admin, default_model, search_provider)
     from .memory import install_memory
     install_memory(app, transaction, audit, admin)
+    from .alarms import install_alarms
+    install_alarms(app, transaction, audit, admin)
     from .execution import install_execution, cancel_task, check_archives
     from .retention import install_retention, policy_from_env
     retention_policy = policy_from_env(os.environ)

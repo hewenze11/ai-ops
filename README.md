@@ -27,7 +27,7 @@
 
 ## 明确尚未实现
 
-OpenClaw 集成（已定：不自研 fork，见 docs/self-built-route.md）、模型生成的**高质量棗概**（按天分层记忆已实现，见 docs/memory.md）、Skills、成熟告警诊断策略、Web、微信/飞书仍需完成。原始输出归档与运行中取消已在协议 1.1 实现，但仅限声明 1.1 的 Agent；`POST /tasks` 仍是管理员单命令入口；模型聊天使用 `/api/v1/roles/{id}/messages`，模型只能通过受控工具创建该轮次的子任务。SSH Connector、输出保留配额、备份恢复、输出/审计的敏感信息脱敏、以及凭据轮换（资产 token 轮换 + admin token 热轮换）已实现（见 `docs/` 下对应文档）。
+OpenClaw 集成（已定：不自研 fork，见 docs/self-built-route.md）、模型生成的**高质量棗概**（按天分层记忆已实现，见 docs/memory.md）、**内置告警日志已实现（见 docs/alarms.md）**、Skills、成熟告警诊断策略、Web、微信/飞书仍需完成。原始输出归档与运行中取消已在协议 1.1 实现，但仅限声明 1.1 的 Agent；`POST /tasks` 仍是管理员单命令入口；模型聊天使用 `/api/v1/roles/{id}/messages`，模型只能通过受控工具创建该轮次的子任务。SSH Connector、输出保留配额、备份恢复、输出/审计的敏感信息脱敏、以及凭据轮换（资产 token 轮换 + admin token 热轮换）已实现（见 `docs/` 下对应文档）。
 
 模型配置与边界见 [docs/model-turns.md](docs/model-turns.md)，执行协议 1.1（心跳、取消、原始输出归档）见 [docs/protocol-v11.md](docs/protocol-v11.md)，Agent 安装与升级见 [docs/operations.md](docs/operations.md)，租约与未知执行处置见 [docs/leases.md](docs/leases.md)。不自动把提示词当命令；模型请求启用非流式响应，遇到不支持的响应或未知执行状态明确停止。
 

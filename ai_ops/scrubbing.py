@@ -77,13 +77,25 @@ def redact_text(text, literals=()):
     return _redact_pattern(text)
 
 
+_SECRET_KEY_RE = re.compile(r"(?i)(password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token)")
+
+
 def _redact_value(value, literals):
     if isinstance(value, str):
         return redact_text(value, literals)
     if isinstance(value, list):
         return [_redact_value(item, literals) for item in value]
     if isinstance(value, dict):
-        return {key: _redact_value(item, literals) for key, item in value.items()}
+        # A structured value is redacted by BOTH its key name and its content:
+        # {"password": "..."} holds no secret-shaped string on its own, so a
+        # key-name match is what protects nested payloads (alarm/audit details).
+        result = {}
+        for key, item in value.items():
+            if isinstance(key, str) and _SECRET_KEY_RE.search(key):
+                result[key] = MASK
+            else:
+                result[key] = _redact_value(item, literals)
+        return result
     return value
 
 

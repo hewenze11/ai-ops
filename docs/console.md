@@ -38,11 +38,14 @@
 | 控制台·需人工处置 | 未知执行/陈旧租约/离线资产；未知执行可**带核实说明**处置 | `/api/v1/operator/attention`、`/tasks/{id}/resolve` |
 | 控制台·告警日志 | 最近告警 + 按来源计数 | `/api/v1/alarms`、`/alarms/sources` |
 | 控制台·任务 | 最近任务（含命令、状态） | `/api/v1/console/tasks` |
+| 控制台·角色 | 角色列表 + **创建 / 改名** | `/api/v1/roles`、`/api/v1/console/roles`、`PUT /roles/{id}` |
 | 控制台·角色轮次 | 按角色查看轮次 | `/api/v1/roles/{id}/turns` |
-| 控制台·定制任务 | 触发/定时任务与投递箱 | `/api/v1/custom-tasks`、`/schedule-deliveries` |
+| 控制台·定制任务 | 触发/定时任务与投递箱 + **创建 / 编辑 / 删除** | `/api/v1/custom-tasks`、`/api/v1/console/custom-tasks*`、`/schedule-deliveries` |
 | 控制台·触发器事件 | 事件队列 | `/api/v1/custom-task-events` |
-| 控制台·文档 | 核心文档列表 | `/api/v1/documents` |
-| 控制台·资产 | 资产列表 + Agent 在线状态 | `/api/v1/assets`、`/agents/{id}/status` |
+| 控制台·渠道 | 渠道身份与一次性配对码签发 | `/api/v1/channels/identities`、`/channels/pairings` |
+| 控制台·文档 | 核心文档列表 + **编辑 / 删除** | `/api/v1/documents*` |
+| 控制台·资产 | 资产列表 + Agent 在线状态 + **注册 / 编辑** | `/api/v1/assets`、`/api/v1/console/assets`、`/agents/{id}/status` |
+| 控制台·Skills | 本地 Skills + **新建 / 编辑 / 删除** | `/api/v1/skills*` |
 | 控制台·记忆 | 按天分层记忆与策略 | `/roles/{id}/memory*` |
 | 控制台·审计 | 全量审计 | `/api/v1/audit` |
 | 控制台·输出 | 归档用量与保留策略 | `/api/v1/output/usage` |
@@ -64,11 +67,12 @@
 
 ## 尚未实现（明确边界）
 
-- **角色/资产/文档的新建与编辑**：当前控制台只读列出；注册仍走管理员 API/CLI。
-- **定制任务与触发器配置的编辑**：只读查看。
+- **在线编辑子集之外仍走管理员 API/CLI**：agent token 轮换、SSH 密钥、角色模型配置
+  不在浏览器里改（见 docs/management.md）。
+- **并发编辑冲突检测**未做（后写覆盖，有修订号可对比）。
 - 前后端分离、前端框架、TypeScript、组件库均未引入——这一版刻意不引入。
 - 登录/会话/多用户/权限分级均未做：控制台是**单管理员凭据**的运维面。
-- 渠道（飞书/微信共享角色记忆）属于 P3 后续，本次未做。
+- 飞书/微信的**真实出站发送与平台签名校验**属部署侧，本仓不内置也不宣称已验证。
 
 ## 测试
 

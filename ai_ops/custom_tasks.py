@@ -71,6 +71,11 @@ def next_fire(expression, timezone, after):
     raise ValueError("Could not determine a valid next occurrence")
 
 
+def trigger_path(custom_id):
+    """Single source for the trigger URL so the console and core agree."""
+    return "/api/v1/triggers/" + custom_id + "/invoke"
+
+
 class CustomTask(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: ID
@@ -124,7 +129,7 @@ class CustomTaskStore:
     @staticmethod
     def view(row):
         return {**json.loads(row["config"]), "revision": row["revision"], "next_fire_at": row["next_fire_at"],
-                "trigger_path": "/api/v1/triggers/" + row["id"] + "/invoke"}
+                "trigger_path": trigger_path(row["id"])}
 
     def materialize(self, now=None):
         now = time.time() if now is None else now

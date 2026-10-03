@@ -259,7 +259,7 @@
   /* ---------- console ---------- */
   const TABS = [
     ["overview", "总览"], ["attention", "需人工处置"], ["alarms", "告警日志"],
-    ["tasks", "任务"], ["turns", "角色轮次"], ["custom", "定制任务"],
+    ["tasks", "任务"], ["roles", "角色"], ["turns", "角色轮次"], ["custom", "定制任务"],
     ["turns-loop", "触发器事件"], ["channels", "渠道"], ["documents", "文档"], ["assets", "资产"],
     ["skills", "Skills"], ["memory", "记忆"], ["audit", "审计"], ["output", "输出"],
   ];
@@ -283,6 +283,7 @@
       overview: loadOverview, attention: loadAttention, alarms: loadAlarms, tasks: loadTasks,
       turns: loadTurns, custom: loadCustom, "turns-loop": loadEvents, documents: loadDocuments,
       assets: loadAssets, channels: loadChannels, skills: loadSkills, memory: loadMemory, audit: loadAudit, output: loadOutput,
+      roles: loadRoles,
     };
     loaders[state.tab](holder).catch((err) => holder.appendChild(el("div", "card error", "加载失败：" + err.message)));
   }
@@ -404,6 +405,52 @@
       }));
   }
 
+  async function loadRoles(host) {
+    const data = await api("GET", "/api/v1/roles");
+    const box = card("角色（创建 / 改名；模型与记忆另行配置）");
+    const add = el("button", "small", "新建角色");
+    add.onclick = () => roleCreator();
+    box.appendChild(add);
+    box.appendChild(table(["ID", "名称", "操作"], data.map((r) => [r.id, r.name, "改名"]), (row) => {
+      roleRenamer(data.find((r) => r.id === row[0]));
+    }));
+    host.appendChild(box);
+  }
+
+  function roleCreator() {
+    const box = el("div", "");
+    const fields = el("div", "fields");
+    const idInput = el("input"); idInput.placeholder = "id（如 ops）";
+    const nameInput = el("input"); nameInput.placeholder = "名称";
+    fields.appendChild(idInput); fields.appendChild(nameInput);
+    const feedback = el("p", "error small", "");
+    const save = el("button", "", "创建");
+    save.onclick = async () => {
+      const body = { id: idInput.value.trim(), name: nameInput.value.trim() };
+      try { await api("POST", "/api/v1/console/roles", body); $("modal").hidden = true; say("角色已创建"); renderConsole(); }
+      catch (err) { feedback.textContent = err.message; }
+    };
+    box.appendChild(el("p", "muted small", "创建只建名称；模型、记忆、文档需分别配置。"));
+    box.appendChild(fields); box.appendChild(save); box.appendChild(feedback);
+    modalContent("新建角色", box);
+  }
+
+  function roleRenamer(record) {
+    if (!record) return;
+    const box = el("div", "");
+    const fields = el("div", "fields");
+    const nameInput = el("input"); nameInput.value = record.name; nameInput.placeholder = "名称";
+    fields.appendChild(nameInput);
+    const feedback = el("p", "error small", "");
+    const save = el("button", "", "保存");
+    save.onclick = async () => {
+      try { await api("PUT", "/api/v1/roles/" + record.id, { name: nameInput.value.trim() }); $("modal").hidden = true; say("角色已改名"); renderConsole(); }
+      catch (err) { feedback.textContent = err.message; }
+    };
+    box.appendChild(fields); box.appendChild(save); box.appendChild(feedback);
+    modalContent("角色 " + record.id, box);
+  }
+
   async function loadTurns(host) {
     const roles = await api("GET", "/api/v1/roles");
     if (!roles.length) { host.appendChild(el("div", "card muted", "尚无角色")); return; }
@@ -429,9 +476,12 @@
   async function loadCustom(host) {
     const data = await api("GET", "/api/v1/custom-tasks");
     const box = card("定制任务（触发任务 / 定时任务）");
-    box.appendChild(table(["ID", "名称", "类型", "角色", "模式", "启用", "下次触发", "触发路径"], data.map((r) => [r.id, r.name, r.kind, r.role_id, r.mode, r.enabled ? "是" : "否", fmt(r.next_fire_at), r.trigger_path]), (row) => {
-      const record = data.find((r) => r.id === row[0]);
-      modal("定制任务 " + record.id, record);
+    const add = el("button", "small", "新建定制任务");
+    add.onclick = () => customTaskEditor(null);
+    box.appendChild(add);
+    box.appendChild(table(["ID", "名称", "类型", "角色", "模式", "启用", "下次触发", "触发路径", "操作"],
+      data.map((r) => [r.id, r.name, r.kind, r.role_id, r.mode, r.enabled ? "是" : "否", fmt(r.next_fire_at), r.trigger_path, "编辑"]), (row) => {
+      customTaskEditor(data.find((r) => r.id === row[0]));
     }));
     host.appendChild(box);
     const outbox = await api("GET", "/api/v1/schedule-deliveries?limit=50");
@@ -440,8 +490,76 @@
     host.appendChild(card("最近事件")).appendChild(table(["时间", "来源", "角色", "状态", "轮次"], events.map((e) => [fmt(e.created_at), e.source, e.role_id, e.state, shortId(e.turn_id)])));
   }
 
-  async function loadEvents(host) {
-    const data = await api("GET", "/api/v1/custom-task-events?limit=100");
+  function customTaskEditor(record) {
+    const box = el("div", "");
+    const fields = el("div", "fields");
+    const idInput = el("input"); idInput.placeholder = "id";
+    const nameInput = el("input"); nameInput.placeholder = "名称";
+    const kindSelect = el("select");
+    [["trigger", "trigger（被调用触发）"], ["scheduled", "scheduled（定时）"]].forEach(([v, l]) => { const o = el("option", "", l); o.value = v; kindSelect.appendChild(o); });
+    const roleSelect = el("select");
+    const modeSelect = el("select");
+    ["confirm", "readonly", "direct"].forEach((m) => { const o = el("option", "", m); o.value = m; modeSelect.appendChild(o); });
+    const usersInput = el("input"); usersInput.placeholder = "执行账号，逗号分隔";
+    fields.appendChild(idInput); fields.appendChild(nameInput); fields.appendChild(kindSelect); fields.appendChild(roleSelect); fields.appendChild(modeSelect); fields.appendChild(usersInput);
+    const prompt = el("textarea"); prompt.rows = 5; prompt.style.width = "100%"; prompt.placeholder = "提示词";
+    const schedFields = el("div", "fields");
+    const cronInput = el("input"); cronInput.placeholder = "cron（如 0 3 * * *）";
+    const tzInput = el("input"); tzInput.placeholder = "时区（默认 Asia/Shanghai）"; tzInput.value = "Asia/Shanghai";
+    const enabledInput = el("input"); enabledInput.type = "checkbox"; enabledInput.checked = true;
+    const enabledWrap = el("label", "inline"); enabledWrap.appendChild(enabledInput); enabledWrap.appendChild(el("span", "", "启用"));
+    schedFields.appendChild(cronInput); schedFields.appendChild(tzInput); schedFields.appendChild(enabledWrap);
+    if (record) {
+      idInput.value = record.id; idInput.disabled = true;
+      nameInput.value = record.name; kindSelect.value = record.kind;
+      modeSelect.value = record.mode; usersInput.value = usersToText(record.execution_users);
+      prompt.value = record.prompt; cronInput.value = record.cron || ""; tzInput.value = record.timezone;
+      enabledInput.checked = !!record.enabled;
+    }
+    const schedWrap = el("div", "");
+    schedWrap.appendChild(schedFields);
+    api("GET", "/api/v1/roles").then((roles) => {
+      roles.forEach((r) => { const o = el("option", "", r.name + " (" + r.id + ")"); o.value = r.id; roleSelect.appendChild(o); });
+      if (record) roleSelect.value = record.role_id;
+    });
+    const toggle = () => { schedWrap.hidden = kindSelect.value !== "scheduled"; };
+    kindSelect.onchange = toggle; toggle();
+    const feedback = el("p", "error small", "");
+    const out = el("pre", "pre-list", "");
+    const save = el("button", "", record ? "保存" : "创建");
+    const del = el("button", "ghost danger", "删除");
+    if (record) {
+      del.onclick = async () => {
+        try { await api("DELETE", "/api/v1/custom-tasks/" + record.id); $("modal").hidden = true; say("定制任务已删除（历史保留）"); renderConsole(); }
+        catch (err) { feedback.textContent = err.message; }
+      };
+    }
+    save.onclick = async () => {
+      const body = { id: idInput.value.trim(), name: nameInput.value.trim(), kind: kindSelect.value,
+        role_id: roleSelect.value, prompt: prompt.value, execution_users: textToUsers(usersInput.value),
+        mode: modeSelect.value, enabled: enabledInput.checked };
+      if (kindSelect.value === "scheduled") { body.cron = cronInput.value.trim(); body.timezone = tzInput.value.trim() || "Asia/Shanghai"; }
+      try {
+        if (record) {
+          await api("PUT", "/api/v1/console/custom-tasks/" + record.id, body);
+          feedback.textContent = ""; out.textContent = "已保存（触发令牌不变）。";
+          say("定制任务已保存"); renderConsole();
+        } else {
+          const created = await api("POST", "/api/v1/console/custom-tasks", body);
+          feedback.textContent = "";
+          out.textContent = "触发令牌（仅此一次显示，请立即保存）：" + created.trigger_token + "\n触发路径：" + created.trigger_path;
+          say("定制任务已创建"); renderConsole();
+        }
+      } catch (err) { feedback.textContent = err.message; }
+    };
+    const actions = el("div", "row"); actions.appendChild(save);
+    if (record) actions.appendChild(del);
+    box.appendChild(fields); box.appendChild(prompt); box.appendChild(schedWrap);
+    box.appendChild(actions); box.appendChild(feedback); box.appendChild(out);
+    modalContent(record ? "编辑定制任务 " + record.id : "新建定制任务", box);
+  }
+
+  async function loadEvents(host) {    const data = await api("GET", "/api/v1/custom-task-events?limit=100");
     host.appendChild(card("触发器事件")).appendChild(
       table(["时间", "任务", "来源", "角色", "状态", "轮次"], data.map((e) => [fmt(e.created_at), e.custom_task_id, e.source, e.role_id, e.state, shortId(e.turn_id)]), (row) => {
         const record = data.find((e) => fmt(e.created_at) === row[0] && e.custom_task_id === row[1]);
@@ -580,7 +698,10 @@
 
   async function loadAssets(host) {
     const data = await api("GET", "/api/v1/assets");
-    const box = card("资产（注册为管理员操作；此处可改名/备注/允许账号）");
+    const box = card("资产（可注册 / 改名 / 备注 / 允许账号）");
+    const add = el("button", "small", "注册资产");
+    add.onclick = () => assetCreator();
+    box.appendChild(add);
     box.appendChild(table(["ID", "名称", "接入方式", "允许账号", "操作"], data.map((r) => [r.id, r.name, r.connection_type, usersToText(r.allowed_users), "编辑"]), (row) => {
       assetEditor(data.find((r) => r.id === row[0]));
     }));
@@ -592,6 +713,55 @@
           table(["在线", "最近心跳", "未完成任务"], [[status.online ? "在线" : "离线", status.presence ? fmt(status.presence.last_seen) : "-", status.unfinished_tasks.length]]));
       } catch (err) { /* ssh assets have no agent presence */ }
     }
+  }
+
+  function assetCreator() {
+    const box = el("div", "");
+    const fields = el("div", "fields");
+    const idInput = el("input"); idInput.placeholder = "id";
+    const nameInput = el("input"); nameInput.placeholder = "名称";
+    const usersInput = el("input"); usersInput.placeholder = "允许账号，逗号分隔（至少一个）";
+    const typeSelect = el("select");
+    [["agent", "agent（安装 Agent）"], ["ssh", "ssh（直连）"]].forEach(([v, label]) => { const o = el("option", "", label); o.value = v; typeSelect.appendChild(o); });
+    fields.appendChild(idInput); fields.appendChild(nameInput); fields.appendChild(usersInput); fields.appendChild(typeSelect);
+    const sshFields = el("div", "fields");
+    const hostInput = el("input"); hostInput.placeholder = "ssh_host";
+    const portInput = el("input"); portInput.placeholder = "ssh_port（默认 22）";
+    const userInput = el("input"); userInput.placeholder = "ssh_user";
+    const authSelect = el("select");
+    [["key", "key"], ["password", "password"]].forEach(([v, label]) => { const o = el("option", "", label); o.value = v; authSelect.appendChild(o); });
+    const refInput = el("input"); refInput.placeholder = "ssh_secret_ref（服务器上的秘密文件路径）";
+    const keyInput = el("input"); keyInput.placeholder = "ssh_host_key（预置的主机公钥）";
+    sshFields.appendChild(hostInput); sshFields.appendChild(portInput); sshFields.appendChild(userInput);
+    sshFields.appendChild(authSelect); sshFields.appendChild(refInput); sshFields.appendChild(keyInput);
+    const notes = el("textarea"); notes.rows = 4; notes.style.width = "100%"; notes.placeholder = "备注（会注入模型上下文）";
+    const feedback = el("p", "error small", "");
+    const out = el("pre", "pre-list", "");
+    const sshWrap = el("div", "");
+    sshWrap.appendChild(el("p", "muted small", "SSH 需预先在服务器上放置密钥文件；此表单只提交指向路径，不传密钥内容。主机公钥必须预置，不匹配即拒连。"));
+    sshWrap.appendChild(sshFields);
+    const toggle = () => { sshWrap.hidden = typeSelect.value !== "ssh"; };
+    typeSelect.onchange = toggle; toggle();
+    const save = el("button", "", "注册");
+    save.onclick = async () => {
+      const body = { id: idInput.value.trim(), name: nameInput.value.trim(), allowed_users: textToUsers(usersInput.value),
+        connection_type: typeSelect.value, notes: notes.value };
+      if (typeSelect.value === "ssh") {
+        Object.assign(body, { ssh_host: hostInput.value.trim() || null, ssh_port: Number(portInput.value) || 22,
+          ssh_user: userInput.value.trim() || null, ssh_auth_kind: authSelect.value,
+          ssh_secret_ref: refInput.value.trim() || null, ssh_host_key: keyInput.value.trim() || null });
+      }
+      try {
+        const result = await api("POST", "/api/v1/console/assets", body);
+        out.textContent = result.agent_token
+          ? "Agent token（仅此一次显示，请立即保存）：" + result.agent_token
+          : "资产已注册。";
+        feedback.textContent = "";
+        say("资产已注册");
+      } catch (err) { feedback.textContent = err.message; }
+    };
+    box.appendChild(fields); box.appendChild(sshWrap); box.appendChild(notes); box.appendChild(save); box.appendChild(feedback); box.appendChild(out);
+    modalContent("注册资产", box);
   }
 
   function assetEditor(record) {

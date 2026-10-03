@@ -6,6 +6,7 @@ The properties under test are the ones that keep this surface safe:
 * a Skill is injected into the role's context but NEVER grants authority,
 * a Skill for another role is not injected at all.
 """
+import json
 import tempfile
 from pathlib import Path
 
@@ -114,6 +115,75 @@ def test_disabled_skill_not_injected_and_delete_hides_it():
 
     assert client.delete("/api/v1/skills/off", headers=headers).json()["deleted"] is True
     assert client.get("/api/v1/skills", headers=headers).json() == []
+
+
+def test_console_role_creation_and_conflict():
+    client = make_client()
+    headers = {"Authorization": "Bearer " + ADMIN}
+    created = client.post("/api/v1/console/roles", headers=headers, json={"id": "ops", "name": "Operations"})
+    assert created.status_code == 201 and created.json()["id"] == "ops"
+    # No credential is minted for a role: the response carries id and name only.
+    assert set(created.json()) == {"id", "name"}
+    assert client.post("/api/v1/console/roles", headers=headers,
+                       json={"id": "ops", "name": "Dup"}).status_code == 409
+
+
+def test_console_asset_registration_returns_agent_token_once():
+    client = make_client()
+    headers = {"Authorization": "Bearer " + ADMIN}
+    created = client.post("/api/v1/console/assets", headers=headers, json={
+        "id": "host", "name": "Host", "connection_type": "agent", "allowed_users": ["reader"]})
+    assert created.status_code == 201
+    token = created.json()["agent_token"]
+    assert token
+    # The token must never appear on any GET route.
+    assets = client.get("/api/v1/assets", headers=headers).json()
+    assert "agent_token" not in assets[0] and json.dumps(assets) .find(token) == -1
+    assert client.post("/api/v1/console/assets", headers=headers, json={
+        "id": "host", "name": "Host", "connection_type": "agent", "allowed_users": ["reader"]}).status_code == 409
+
+
+def test_console_ssh_asset_requires_pinned_host_key():
+    client = make_client()
+    headers = {"Authorization": "Bearer " + ADMIN}
+    incomplete = client.post("/api/v1/console/assets", headers=headers, json={
+        "id": "srv", "name": "Srv", "connection_type": "ssh", "allowed_users": ["reader"],
+        "ssh_host": "10.0.0.9", "ssh_user": "root", "ssh_auth_kind": "key",
+        "ssh_secret_ref": "secret://srv"})
+    assert incomplete.status_code == 422  # missing ssh_host_key
+    ok = client.post("/api/v1/console/assets", headers=headers, json={
+        "id": "srv", "name": "Srv", "connection_type": "ssh", "allowed_users": ["reader"],
+        "ssh_host": "10.0.0.9", "ssh_user": "root", "ssh_auth_kind": "key",
+        "ssh_secret_ref": "secret://srv", "ssh_host_key": "ssh-ed25519 AAAA"})
+    assert ok.status_code == 201 and "agent_token" not in ok.json()
+
+
+def test_console_custom_task_create_returns_token_edit_does_not():
+    client = make_client()
+    headers = {"Authorization": "Bearer " + ADMIN}
+    setup(client, headers)
+    created = client.post("/api/v1/console/custom-tasks", headers=headers, json={
+        "id": "nightly", "name": "Nightly", "kind": "scheduled", "role_id": "ops",
+        "prompt": "check disk", "execution_users": ["reader"], "mode": "readonly",
+        "cron": "0 3 * * *"})
+    assert created.status_code == 201
+    assert created.json()["trigger_token"] and created.json()["next_fire_at"]
+
+    edited = client.put("/api/v1/console/custom-tasks/nightly", headers=headers, json={
+        "id": "nightly", "name": "Nightly v2", "kind": "scheduled", "role_id": "ops",
+        "prompt": "check disk and memory", "execution_users": ["reader"], "mode": "readonly",
+        "cron": "0 4 * * *"})
+    assert edited.status_code == 200
+    assert "trigger_token" not in edited.json() and edited.json()["token_unchanged"] is True
+    listed = client.get("/api/v1/custom-tasks", headers=headers).json()
+    assert listed[0]["name"] == "Nightly v2" and listed[0]["revision"] == 2
+
+
+def test_console_routes_require_admin():
+    client = make_client()
+    for path, body in [("/api/v1/console/roles", {"id": "x", "name": "x"}),
+                       ("/api/v1/console/assets", {"id": "x", "name": "x", "allowed_users": ["r"]})]:
+        assert client.post(path, json=body).status_code in (401, 403), path
 
 
 def test_document_save_and_delete():

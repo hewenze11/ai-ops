@@ -22,6 +22,7 @@
 - **Web 控制台第一版**：后端内嵌的零依赖静态页（`ai_ops/console/`），只读优先。凭据只存标签页内存、不落浏览器存储；访问 `/` 即可打开。见 [docs/console.md](docs/console.md)。
 - **消息渠道第一层**：飞书/企业微信/微信共用同一角色的记忆与串行队列；一次性配对码绑定身份，按身份隔离出站。见 [docs/channels.md](docs/channels.md)。
 - **管理写入面**：控制台可改名/备注资产/允许账号、编辑文档、创建角色、注册资产、创建/编辑定制任务，以及管理并注入本地 Skills（Skill 是数据不是代码）。一次性凭据只在创建时出示。见 [docs/management.md](docs/management.md)。
+- **P3 真机验收已完成**：12 项端到端检查全部通过（含控制台真机截图）。见 [docs/p3-acceptance-report.md](docs/p3-acceptance-report.md)。
 - OpenAI兼容模型适配器、角色模型覆盖、独立账号/确认校验、模型调用与回复审计。
 - 核心/角色文档编辑API，每次模型调用重新全文注入核心文档与完整服务OpenAPI。
 - 可选模型工作线程，角色默认不启用付费调用，必须显式配置。

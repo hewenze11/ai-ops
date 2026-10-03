@@ -26,11 +26,14 @@ P1 完整后端执行可靠性已基本收口：多步骤轮次、心跳、取�
 - 协议冻结、跨版本兼容测试、安装/升级流程。
 
 ## P2：模型与角色后端
-- 优先完成OpenClaw源码、许可证和裁剪验证，再决定集成边界；不要把Python执行底座误称为整个编排选型。
-  - 已完成第一轮评估（2026-10-03）：许可证 MIT；运行时为 Node Gateway（WebSocket，默认 127.0.0.1:18789），提供渠道 / 多 Agent 会话隔离 / 可插拔 context engine / Markdown 记忆 / SecretRef 凭据管理；不提供资产注册与受控命令执行底座。当前推荐「插件式复用」而非深度 fork。仍待实测：context engine 插件能否满足全量接口文档与分层记忆注入、渠道插件能否跨入口共享同一角色记忆。见 docs/openclaw-assessment.md。
+- 路线已定（2026-10-03）：**自研主体 + 借鉴 OpenClaw 设计**，不 fork OpenClaw 网关。见 docs/self-built-route.md。
+- 已完成上下文组装抽离：`ai_ops/context.py`（可插拔，行为不变，强制注入部分每次重建）；新增 conftest.py 使测试脱离安装可跑。
+- 已完成联网搜索（2026-10-03）：`ai_ops/search.py` 自研 provider 抽象，默认自建 SearXNG（免费无 key）、可选 Brave（Key 走秘密文件）；新增只读工具 web_search/fetch_page 内联解析。见 docs/search.md。
+- 已完成OpenClaw源码/许可证评估：MIT；运行时为 Node Gateway；推荐插件式复用而非 fork；详见 docs/openclaw-assessment.md。
 - 聚合站基础地址/模型/工具调用验证；低成本受控调用，不从模型上下文读取Key。
 - 角色串行多步骤工具循环，本轮授权固定且服务端持有，确认/取消控制通路。
-- 全量接口文档/核心文档注入、上下文预算可视、文档写入规则。
+- 服务自身接口文档强制注入LLM，让模型明确所在系统和可用接口；完整注入的Token/规模边界及管理接口如何呈现仍需讨论。
+- 全量接口文档/核心文档注入（已完成，见 docs/model-turns.md）、上下文预算可视、文档写入规则。
 - 日记忆全文/压缩/梗概、旧记忆查询，原始审计独立保存。
 - 本地Skills管理与准确注入位置；告警提示词/账号/角色配置与日志。
 

@@ -27,11 +27,11 @@
 
 ## 明确尚未实现
 
-OpenClaw 集成、按天分层记忆、Skills、成熟告警诊断策略、Web、微信/飞书仍需完成。原始输出归档与运行中取消已在协议 1.1 实现，但仅限声明 1.1 的 Agent；`POST /tasks` 仍是管理员单命令入口；模型聊天使用 `/api/v1/roles/{id}/messages`，模型只能通过受控工具创建该轮次的子任务。SSH Connector、输出保留配额、备份恢复、输出/审计的敏感信息脱敏、以及凭据轮换（资产 token 轮换 + admin token 热轮换）已实现（见 `docs/` 下对应文档）。
+OpenClaw 集成（已定：不自研 fork，见 docs/self-built-route.md）、按天分层记忆、Skills、成熟告警诊断策略、Web、微信/飞书仍需完成。原始输出归档与运行中取消已在协议 1.1 实现，但仅限声明 1.1 的 Agent；`POST /tasks` 仍是管理员单命令入口；模型聊天使用 `/api/v1/roles/{id}/messages`，模型只能通过受控工具创建该轮次的子任务。SSH Connector、输出保留配额、备份恢复、输出/审计的敏感信息脱敏、以及凭据轮换（资产 token 轮换 + admin token 热轮换）已实现（见 `docs/` 下对应文档）。
 
 模型配置与边界见 [docs/model-turns.md](docs/model-turns.md)，执行协议 1.1（心跳、取消、原始输出归档）见 [docs/protocol-v11.md](docs/protocol-v11.md)，Agent 安装与升级见 [docs/operations.md](docs/operations.md)，租约与未知执行处置见 [docs/leases.md](docs/leases.md)。不自动把提示词当命令；模型请求启用非流式响应，遇到不支持的响应或未知执行状态明确停止。
 
-主服务与 Agent 暂以 Python 实现以尽快验证执行契约；这不代表已经完成 OpenClaw 选型，执行协议不依赖未来模型编排实现。商城本期不开发，后续保留服务边界。
+主服务与 Agent 暂以 Python 实现以尽快验证执行契约；**产品主体自研，不 fork OpenClaw**，但借鉴其渠道抽象/上下文引擎/凭据边界/可插拔 provider 的设计（见 [docs/openclaw-assessment.md](docs/openclaw-assessment.md) 与 [docs/self-built-route.md](docs/self-built-route.md)），执行协议不依赖未来模型编排实现。联网搜索的 provider 取舍、SearXNG 默认与合规边界见 [docs/search.md](docs/search.md)。商城本期不开发，后续保留服务边界。
 
 ## 仓库边界
 

@@ -1,0 +1,39 @@
+{
+  "passed": true,
+  "run": "5d68d6faee",
+  "host": "172.236.254.94 (preview, image sha-5377a38)",
+  "model": "gpt-4.1-mini-2025-04-14",
+  "scope": "P2 backend end-to-end acceptance",
+  "results": [
+    {
+      "case": "chat_to_confirmed_native_execution_to_summary",
+      "passed": true,
+      "model_calls": 2,
+      "note": "confirm mode gated the command at awaiting_approval; approved then executed as aiops_probe; secret scan of model records clean",
+      "summary": "在注册资产 p2-host-5d68d6faee 上实际执行的用户名是 aiops_probe。"
+    },
+    {
+      "case": "readonly_mode_withholds_execution_tool",
+      "passed": true,
+      "tools_offered": [],
+      "state": "completed",
+      "note": "readonly turn offered no tools and created no task"
+    },
+    {
+      "case": "daily_memory_injected_by_tier",
+      "passed": true,
+      "day": "2025-01-01",
+      "note": "old day injected as an age-tier system message (form=summary) with ROLE_MEMORY header + on-demand hint; today not duplicated"
+    },
+    {
+      "case": "trigger_writes_alarm_log_and_sources_separable",
+      "passed": true,
+      "count": 2,
+      "note": "two sources (web1, db1) through one trigger path logged as two accepted rows; filterable per source"
+    },
+    {
+      "case": "three_modes_accepted_unknown_rejected",
+      "passed": true
+    }
+  ]
+}

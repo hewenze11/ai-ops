@@ -174,6 +174,13 @@ def restore_backup(backup_path, db_path):
 
     safety = None
     if live.exists():
+        # Fold the live database's WAL back into the main file first: in WAL mode
+        # recent commits live in the -wal file, so a raw rename of just the main
+        # file would silently drop them and leave an unusable safety copy.
+        try:
+            _checkpoint(live)
+        except sqlite3.Error as error:
+            raise BackupError("Cannot checkpoint the live database before restore: %s" % type(error).__name__)
         safety = live.with_name(live.name + ".pre-restore-%d" % int(time.time()))
         os.replace(live, safety)
     # Remove old WAL/SHM so the restored file is not shadowed by stale journal.
@@ -184,6 +191,16 @@ def restore_backup(backup_path, db_path):
     os.replace(staged, live)
     return {"restored_from": str(backup_path), "database": str(live),
             "previous_kept_at": str(safety) if safety else None}
+
+
+def _checkpoint(path):
+    """Flush a WAL-mode database fully into its main file."""
+    db = sqlite3.connect(str(path), timeout=30)
+    try:
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        db.commit()
+    finally:
+        db.close()
 
 
 def install_backup(app, transaction, audit, admin, db_path):

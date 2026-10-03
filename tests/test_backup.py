@@ -107,17 +107,24 @@ def test_restore_refuses_corrupt_backup_without_touching_live(tmp_path, env):
         assert db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
 
 
-def test_restore_removes_stale_wal(tmp_path, env):
+def test_restore_leaves_no_partial_or_stale_artifacts(tmp_path, env):
     c, h, _, path = env
     submit(env, key="request-001")
     out = tmp_path / "snap.db"
     backup.create_backup(str(path), str(out))
-    # Simulate a leftover WAL from the old database.
-    stale = str(path) + "-wal"
-    with open(stale, "wb") as handle:
-        handle.write(b"stale-wal-bytes")
-    backup.restore_backup(str(out), str(path))
-    assert not os.path.exists(stale)
+    # A second write moves data into the WAL; restore must fold it into the
+    # safety copy rather than orphan it.
+    submit(env, key="request-002")
+    result = backup.restore_backup(str(out), str(path))
+    # No half-written staging file survives a successful restore.
+    assert not os.path.exists(str(path) + ".restore-incoming")
+    # The safety copy is a complete, readable database with both tasks.
+    with sqlite3.connect(result["previous_kept_at"]) as db:
+        assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2
+    # The restored live database matches the snapshot.
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
 
 
 def test_backup_api_creates_and_lists_snapshots(tmp_path, monkeypatch):

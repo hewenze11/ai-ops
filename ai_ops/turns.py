@@ -80,7 +80,7 @@ class Message(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: str = Field(min_length=1, max_length=32000)
     execution_users: list[USER] = Field(default_factory=list, max_length=100)
-    mode: Literal["direct", "confirm"] = "confirm"
+    mode: Literal["readonly", "confirm", "direct"] = "confirm"
     idempotency_key: str = Field(min_length=8, max_length=128)
 
 
@@ -103,10 +103,20 @@ class ExecuteCommand(BaseModel):
 
 SYSTEM_TEXT = SYSTEM
 
+# Three operation modes, distinct in real tool authority (not just prompt text):
+#   readonly - the model gets NO execute_command tool at all; it can only analyze
+#              and use read-only search tools. It cannot run anything on a host.
+#   confirm  - every command the model proposes enters awaiting_approval; a human
+#              approves it before it is queued. Default.
+#   direct   - commands are queued for execution immediately.
+MODES = ("readonly", "confirm", "direct")
 
-def tool_spec(users, search_provider=None):
+
+def tool_spec(users, search_provider=None, mode="confirm"):
     specs = []
-    if users:
+    # readonly turns deliberately withhold the execution tool entirely. This is a
+    # real capability boundary: a jailbroken prompt still has nothing to call.
+    if users and mode != "readonly":
         specs.append({"type": "function", "function": {"name": "execute_command", "description": "Execute one command on a registered asset using a selected native account. The service owns authorization and confirmation; never change them.",
             "parameters": {"type": "object", "additionalProperties": False, "properties": {
                 "asset_id": {"type": "string"}, "run_as": {"type": "string", "enum": users},
@@ -119,6 +129,17 @@ def tool_spec(users, search_provider=None):
     return specs
 
 
+def tools_for_turn(turn, settings, search_provider):
+    """Expose tools according to the turn's immutable mode + selected accounts."""
+    users = json.loads(turn["execution_users"])
+    mode = turn["mode"]
+    # Defense in depth: modes are validated on entry, but never trust a stored
+    # value blindly. An unknown mode must not silently become "direct".
+    if mode not in MODES:
+        mode = "confirm"
+    return tool_spec(users, search_provider, mode) or None
+
+
 class RoleEngine:
     def __init__(self, app, transaction, audit, default_model="", search_provider=None):
         self.app, self.transaction, self.audit = app, transaction, audit
@@ -126,8 +147,7 @@ class RoleEngine:
         self.search_provider = search_provider
 
     def request_body(self, db, turn, settings):
-        users = json.loads(turn["execution_users"])
-        tools = tool_spec(users, self.search_provider) or None
+        tools = tools_for_turn(turn, settings, self.search_provider)
         return build_body(self.app, db, turn, settings, self.default_model, tools)
 
     def advance(self, client):
@@ -248,6 +268,11 @@ class RoleEngine:
                 self.audit(db, "model.search", turn["id"], "service", {"call_id": call_id, "tool": name})
                 return True
             try:
+                # A readonly turn must never execute. If the model emits the tool
+                # anyway (it should not have it), reject rather than run. Reject
+                # the turn: silently ignoring could let the model keep "trying".
+                if current["mode"] == "readonly":
+                    raise ValueError("Execution tool is not available in readonly mode")
                 command = ExecuteCommand.model_validate(arguments)
                 users = json.loads(current["execution_users"])
                 if command.run_as not in users:
@@ -260,6 +285,8 @@ class RoleEngine:
                 self.audit(db, "model.tool_rejected", turn["id"], "service", {"call_id": call_id})
                 return True
             task_id = str(uuid.uuid4())
+            # Only the immutable turn mode decides gating. confirm -> human must
+            # approve; direct -> queued now. (readonly was rejected above.)
             state = "awaiting_approval" if current["mode"] == "confirm" else "queued"
             payload = {**command.model_dump(), "role_id": current["role_id"], "execution_users": users, "mode": current["mode"], "idempotency_key": "model:" + call_id}
             db.execute("INSERT INTO tasks(id,role_id,asset_id,payload,state,idempotency_key,created_at,updated_at,turn_id) VALUES(?,?,?,?,?,?,?,?,?)",

@@ -79,7 +79,7 @@ class CustomTask(BaseModel):
     role_id: ID
     prompt: str = Field(min_length=1, max_length=32000)
     execution_users: list[USER] = Field(min_length=1, max_length=100)
-    mode: Literal["direct", "confirm"] = "confirm"
+    mode: Literal["readonly", "confirm", "direct"] = "confirm"
     enabled: bool = True
     cron: str | None = Field(default=None, max_length=200)
     timezone: str = Field(default="Asia/Shanghai", max_length=100)

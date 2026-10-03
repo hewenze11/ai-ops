@@ -15,7 +15,8 @@
 - 完整输出文件归档：已完成（分块、摘要、字节下载、超限标记不完整）。
 - systemd 安装/升级/卸载：已完成。
 - 任务租约与未知执行人工处置：已完成（租约仅观测，不自动重派）。
-- 仍待完成：磁盘/流量配额与保留策略（输出保留已实现，见 docs/retention.md）、备份恢复工具、通用敏感信息清理、凭据轮换。
+- 备份/恢复工具：已完成（SQLite 在线备份API做事务一致快照，integrity_check + schema 版本 + sha256 边车校验；恢复前先完整校验、保留 .pre-restore 回退并清理陈旧 WAL；CLI ai-ops-backup/verify-backup/restore；admin 只提供建快照与列表，恢复刻意只走 CLI。见 docs/backup.md）。
+- 仍待完成：通用敏感信息清理、凭据轮换。
 - 输出保留与磁盘配额：已完成（时间窗 + 字节预算 + 保留下限 + 上传时分流保护；只清理已终结任务的 finalized 归档，in-flight/unknown 不删；清理写入审计；管理员 usage/prune 接口 + 后台定期清理线程）。
 - cgroup 级后代清理：已完成（Agent cgroup v2 任务组 + cgroup.kill，真机验证 setsid 逃逸进程也能回收；不可写时降级进程组终止）。
 - SSH Connector，资产接入方式二选一：已完成直连执行、租约、取消、可达性检查；主机公钥强制预置并以 RejectPolicy 严格校验，未预置/密钥不匹配即拒绝连接（fail closed，不做 TOFU），真机 smoke 验证错钥 reachable=false。

@@ -200,6 +200,8 @@ def create_app(db_path: str, admin_token: str, default_model: str = "") -> FastA
     install_execution(app, transaction, audit, admin, agent_auth, retention_policy)
     install_retention(app, transaction, audit, admin, retention_policy)
     app.state.retention_policy = retention_policy
+    from .backup import install_backup
+    install_backup(app, transaction, audit, admin, str(path))
     from .leases import install_leases
     install_leases(app, transaction, audit, admin)
     from .connector_ssh import install_connector, start_connector_workers

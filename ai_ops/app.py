@@ -77,6 +77,10 @@ class Task(StrictModel):
 
 class Claim(StrictModel):
     protocol_version: str
+    # Protocol 1.2 multi-controller: identifies which control plane is asking.
+    # When another live controller is executing on this asset, the claim is
+    # declined (empty) so each control plane queues its own work.
+    controller: str | None = Field(default=None, max_length=64)
 
 
 class RotateToken(StrictModel):
@@ -394,8 +398,18 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     def claim(asset_id: Identifier, body: Claim, authorization: str | None = Header(default=None)):
         with transaction() as db:
             asset = agent_auth(db, asset_id, authorization)
-            if body.protocol_version not in ('1.0', '1.1'):
+            if body.protocol_version not in ('1.0', '1.1', '1.2'):
                 raise HTTPException(409, "Unsupported protocol version")
+            # Protocol 1.2 multi-controller: if a DIFFERENT live controller is
+            # executing on this asset, decline so each control plane queues its
+            # own work. A controller never blocks itself (its own earlier task
+            # is already 'claimed', so the query below would not return it).
+            if body.controller is not None:
+                presence = db.execute('SELECT * FROM agent_presence WHERE asset_id=?', (asset_id,)).fetchone()
+                if presence is not None and presence['busy'] and time.time() - presence['last_seen'] <= 30 \
+                        and presence['busy_by'] not in (None, body.controller):
+                    return {"task": None, "protocol_version": body.protocol_version,
+                            "busy_by": presence['busy_by']}
             # FIFO is now by parent ROLE TURN, not command insertion order.
             # A multi-step model turn may add a child after a later manual turn.
             row = db.execute("""SELECT t.* FROM tasks t JOIN role_turns rt ON rt.id=t.turn_id
@@ -415,7 +429,6 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
             open_lease(db, row['id'], asset_id, claim_id)
             audit(db, "task.claimed", row["id"], "agent:" + asset_id, {"claim_id": claim_id})
             return {"protocol_version": body.protocol_version, "task": {"id": row["id"], "claim_id": claim_id, **payload}}
-
     @app.post("/api/v1/agents/{asset_id}/tasks/{task_id}/result")
     def report_result(asset_id: Identifier, task_id: str, body: Result, authorization: str | None = Header(default=None)):
         with transaction() as db:
@@ -438,7 +451,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
                 raise HTTPException(409, "A different result is already recorded")
             if row["state"] != "claimed":
                 raise HTTPException(409, "Task is not claimed")
-            if body.status == 'cancelled' and (row['claimed_protocol'] != '1.1' or row['cancel_requested_at'] is None):
+            if body.status == 'cancelled' and (row['claimed_protocol'] not in ('1.1', '1.2') or row['cancel_requested_at'] is None):
                 raise HTTPException(409, 'Cancelled outcome requires an acknowledged cancellation request')
             check_archives(db, task_id, body.output_archives)
             close_lease(db, task_id)

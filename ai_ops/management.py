@@ -16,6 +16,8 @@ import hashlib
 import json
 import secrets
 import time
+import urllib.error
+import urllib.request
 
 from fastapi import Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
@@ -24,6 +26,15 @@ from .custom_tasks import CustomTask, trigger_path
 from .models import Identifier as ID, UserName as USER
 
 MAX_SKILL_CHARS = 100000
+
+# A subscriber pulls Skills from the website's hub. The hub is the authority on
+# WHICH skills a subscriber may see (it checks the pull key and the subscription
+# upstream); the control service only decides WHICH local roles to bind them to.
+# A pulled skill can therefore never widen authority here: even a malicious hub
+# response only becomes inert reference text for roles the operator already has.
+SKILL_SYNC_TIMEOUT_SECONDS = 20
+MAX_SKILL_SYNC_BYTES = 4 * 1024 * 1024
+DEFAULT_SKILL_HUB_URL = "https://example.invalid/api/v1/skills/repo"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS skills(
@@ -85,6 +96,81 @@ class AssetUpdate(BaseModel):
     name: str | None = Field(default=None, max_length=200)
     allowed_users: list[USER] | None = Field(default=None, max_length=100)
     notes: str | None = Field(default=None, max_length=16000)
+
+
+class SkillSyncIn(BaseModel):
+    """Pull Skills from the website's hub and import them locally.
+
+    ``source_url`` is the hub endpoint (defaults to the documented path). The
+    pull key travels in the Authorization header, never in the URL or audit log.
+    ``role_ids`` optionally overrides every pulled skill's role binding; when
+    omitted, each skill keeps the roles the hub sent, minus any role this
+    instance does not define (unknown roles are reported, not auto-created).
+    """
+    model_config = ConfigDict(extra="forbid")
+    source_url: str = Field(default="", max_length=500)
+    pull_key: str = Field(min_length=8, max_length=300)
+    role_ids: list[ID] | None = Field(default=None, max_length=100)
+    dry_run: bool = False
+
+
+# The fields the control service stores for a skill. Anything else the hub
+# sends (a `revision`, a `tier`, a future field) is dropped at the boundary.
+_SKILL_FIELDS = ("id", "name", "content", "role_ids", "enabled")
+
+
+def _project_skill(raw) -> dict:
+    """Keep only the fields this service understands; leave the rest behind."""
+    if not isinstance(raw, dict):
+        return {"_invalid": True}
+    projected = {k: raw[k] for k in _SKILL_FIELDS if k in raw}
+    # `enabled` is hub-optional; default to on when absent.
+    projected.setdefault("enabled", True)
+    return projected
+
+
+def fetch_skill_bundle(source_url: str, pull_key: str, *, timeout: int = SKILL_SYNC_TIMEOUT_SECONDS,
+                       opener=None) -> dict:
+    """Fetch the hub's skill bundle. Isolated so tests can inject a fake opener.
+
+    Raises HTTPException with a precise status so the operator can tell apart
+    "your subscription lapsed" (402) from "your key is wrong" (403). The response
+    body is size-capped: a hostile or broken hub cannot exhaust our memory.
+    """
+    if not source_url:
+        raise HTTPException(422, "source_url is required (the website's /api/v1/skills/repo)")
+    req = urllib.request.Request(source_url, headers={
+        "Authorization": "Bearer " + pull_key,
+        "Accept": "application/json",
+        "User-Agent": "ai-ops-control/skill-sync",
+    })
+    try:
+        if opener is None:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read(MAX_SKILL_SYNC_BYTES + 1)
+        else:
+            with opener(req, timeout=timeout) as resp:
+                raw = resp.read(MAX_SKILL_SYNC_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        # 401 missing key, 402 subscription expired, 403 bad key — surface as-is.
+        detail = "skill hub rejected the pull key"
+        if e.code == 402:
+            detail = "Skills subscription is expired or inactive"
+        elif e.code == 403:
+            detail = "pull key is invalid or revoked"
+        raise HTTPException(e.code if 400 <= e.code < 500 else 502, detail)
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise HTTPException(502, f"could not reach the skill hub: {e}")
+    if len(raw) > MAX_SKILL_SYNC_BYTES:
+        raise HTTPException(502, "skill hub response too large")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(502, "skill hub returned invalid JSON")
+    skills = payload.get("skills")
+    if not isinstance(skills, list):
+        raise HTTPException(502, "skill hub response missing a skills list")
+    return payload
 
 
 def install_management(app, transaction, audit, admin):
@@ -242,5 +328,66 @@ def install_management(app, transaction, audit, admin):
                 raise HTTPException(404, "Skill not found")
             audit(db, "skill.deleted", skill_id, "admin", {})
         return {"deleted": True, "audit_retained": True}
+
+    # ---- skills: pull from the website hub ----------------------
+    @app.post("/api/v1/skills/sync", dependencies=[Depends(admin)])
+    def sync_skills(body: SkillSyncIn):
+        """Import the subscriber's Skills from the website hub.
+
+        The pull key is used only to authenticate the outbound request; it is
+        never logged or echoed. A pulled skill may only be bound to roles this
+        instance already defines; any role the hub sent that we do not have is
+        reported and dropped (we never auto-create roles from remote input).
+        """
+        bundle = fetch_skill_bundle(body.source_url, body.pull_key)
+        imported: list[dict] = []
+        skipped: list[dict] = []
+        with transaction() as db:
+            known_roles = {r["id"] for r in db.execute("SELECT id FROM roles")}
+            if body.role_ids is not None:
+                for role in body.role_ids:
+                    require_role(db, role)
+            for raw in bundle["skills"]:
+                try:
+                    # The hub may carry fields that only mean something upstream
+                    # (e.g. `revision`). Project onto the fields the control
+                    # service actually stores, so a hub-side addition never
+                    # breaks the sync. We keep Skill's extra="forbid" so a
+                    # genuinely malformed payload is still rejected loudly.
+                    skill = Skill.model_validate(_project_skill(raw))
+                except Exception as e:
+                    skipped.append({"id": raw.get("id") if isinstance(raw, dict) else None,
+                                    "reason": f"invalid skill payload: {e}"})
+                    continue
+                requested = body.role_ids if body.role_ids is not None else skill.role_ids
+                bound = [r for r in requested if r in known_roles]
+                dropped = [r for r in requested if r not in known_roles]
+                if not bound:
+                    skipped.append({"id": skill.id,
+                                    "reason": "no known role to bind (unknown: " +
+                                              ",".join(dropped) + ")" if dropped
+                                              else "no role bound and none given"})
+                    continue
+                if body.dry_run:
+                    imported.append({"id": skill.id, "name": skill.name, "role_ids": bound,
+                                     "would_apply": True})
+                    continue
+                db.execute(
+                    "INSERT INTO skills(id,name,content,role_ids,enabled,revision,deleted_at) "
+                    "VALUES(?,?,?,?,?,1,NULL) "
+                    "ON CONFLICT(id) DO UPDATE SET name=excluded.name,content=excluded.content,"
+                    "role_ids=excluded.role_ids,enabled=excluded.enabled,"
+                    "revision=skills.revision+1,deleted_at=NULL",
+                    (skill.id, skill.name, skill.content, json.dumps(bound), int(skill.enabled)))
+                imported.append({"id": skill.id, "name": skill.name, "role_ids": bound,
+                                 "dropped_roles": dropped})
+            if not body.dry_run:
+                audit(db, "skill.synced", body.source_url or DEFAULT_SKILL_HUB_URL, "admin",
+                      {"imported": [s["id"] for s in imported],
+                       "skipped": [s.get("id") for s in skipped],
+                       "roles_override": body.role_ids})
+        return {"dry_run": body.dry_run, "bundle_revision": bundle.get("bundle_revision"),
+                "imported": imported, "skipped": skipped,
+                "counts": {"imported": len(imported), "skipped": len(skipped)}}
 
     return {"view_skill": lambda row: dict(row)}

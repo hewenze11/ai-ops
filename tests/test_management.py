@@ -186,6 +186,84 @@ def test_console_routes_require_admin():
         assert client.post(path, json=body).status_code in (401, 403), path
 
 
+# ---- pull skills from the website hub ------------------------------------
+
+class _FakeResp:
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def read(self, n=-1):
+        return self._payload if n is None or n < 0 else self._payload[:n]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _hub_opener(payload: dict):
+    def _open(req, timeout=None):
+        return _FakeResp(json.dumps(payload).encode("utf-8"))
+    return _open
+
+
+def test_skills_sync_imports_and_binds_known_roles():
+    import ai_ops.management as mgmt
+    client = make_client()
+    headers = {"Authorization": "Bearer " + ADMIN}
+    setup(client, headers)  # defines role "ops"
+
+    payload = {"bundle_revision": 7, "count": 2, "skills": [
+        {"id": "linux-triage", "name": "Linux triage", "content": "check dmesg", "role_ids": ["ops"], "enabled": True, "revision": 3, "tier": "premium"},
+        {"id": "ghost", "name": "Ghost role", "content": "x", "role_ids": ["does-not-exist"], "enabled": True},
+    ]}
+    original = mgmt.urllib.request.urlopen
+    import urllib.request as u
+    saved = u.urlopen
+    u.urlopen = _hub_opener(payload)
+    try:
+        resp = client.post("/api/v1/skills/sync", headers=headers, json={
+            "source_url": "https://hub.example/api/v1/skills/repo", "pull_key": "aiops-sk-abcdefgh"})
+    finally:
+        u.urlopen = saved
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["bundle_revision"] == 7
+    assert [s["id"] for s in body["imported"]] == ["linux-triage"]
+    assert body["skipped"][0]["id"] == "ghost"
+    # The imported skill really landed and is bound to the known role only.
+    listed = client.get("/api/v1/skills", headers=headers).json()
+    row = next(s for s in listed if s["id"] == "linux-triage")
+    assert row["role_ids"] == ["ops"] and row["enabled"] is True
+
+
+def test_skills_sync_role_override_and_dry_run():
+    import urllib.request as u
+    client = make_client()
+    headers = {"Authorization": "Bearer " + ADMIN}
+    setup(client, headers, roles=("ops", "other"))
+    payload = {"skills": [{"id": "s1", "name": "S", "content": "c", "role_ids": ["ops"], "enabled": True}]}
+    saved = u.urlopen
+    u.urlopen = _hub_opener(payload)
+    try:
+        resp = client.post("/api/v1/skills/sync", headers=headers, json={
+            "source_url": "https://hub.example/api/v1/skills/repo", "pull_key": "aiops-sk-abcdefgh",
+            "role_ids": ["other"], "dry_run": True})
+    finally:
+        u.urlopen = saved
+    body = resp.json()
+    assert body["dry_run"] is True and body["imported"][0]["role_ids"] == ["other"]
+    # dry_run must not have written anything.
+    assert client.get("/api/v1/skills", headers=headers).json() == []
+
+
+def test_skills_sync_requires_admin():
+    client = make_client()
+    resp = client.post("/api/v1/skills/sync", json={"source_url": "https://h/x", "pull_key": "aiops-sk-abcdefgh"})
+    assert resp.status_code in (401, 403)
+
+
 def test_document_save_and_delete():
     client = make_client()
     headers = {"Authorization": "Bearer " + ADMIN}

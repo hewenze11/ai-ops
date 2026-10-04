@@ -173,10 +173,16 @@ if [ -z "$AGENT_TOKEN" ]; then
 else
   # A pairing code is a single opaque token that bundles everything the agent
   # needs to reach this control service. Safe to copy; treat like a password.
-  HOST_FOR_AGENT="$BIND"
-  [ "$BIND" = "127.0.0.1" ] && HOST_FOR_AGENT="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  [ -n "$HOST_FOR_AGENT" ] || HOST_FOR_AGENT="127.0.0.1"
-  PAIRING="$(PAIRING_SERVER="http://${HOST_FOR_AGENT}:${PORT}" PAIRING_ASSET="agent-1" PAIRING_TOKEN="$AGENT_TOKEN" python3 - <<'PY'
+  #
+  # The agent only accepts plain HTTP over loopback, so the pairing code must
+  # point at 127.0.0.1 for the common same-host install. A listen-only bind
+  # such as 0.0.0.0 is NEVER a valid destination. For a REMOTE agent, put TLS
+  # in front and re-issue a code with the https:// origin (see the note below).
+  PAIRING_SERVER="http://127.0.0.1:${PORT}"
+  case "$BIND" in
+    https://*|http://*) PAIRING_SERVER="${BIND}:${PORT}" ;;
+  esac
+  PAIRING="$(PAIRING_SERVER="$PAIRING_SERVER" PAIRING_ASSET="agent-1" PAIRING_TOKEN="$AGENT_TOKEN" python3 - <<'PY'
 import base64, json, os
 blob = {"server_url": os.environ["PAIRING_SERVER"], "asset_id": os.environ["PAIRING_ASSET"],
         "agent_token": os.environ["PAIRING_TOKEN"]}
@@ -199,7 +205,8 @@ cat <<EOF
 
    curl -fsSL https://raw.githubusercontent.com/hewenze11/ai-ops/main/deploy/install-agent.sh | sudo bash -s -- --pairing-code '$PAIRING'
 
- (If the agent is on another host, make sure this host's $PORT is reachable —
-  re-run with --bind 0.0.0.0 and put TLS in front for anything non-local.)
+ (This pairing code uses 127.0.0.1 and only works when the agent runs on THIS
+  host. For an agent on another host, put TLS in front and re-issue a code whose
+  server_url is the https:// origin. Plain HTTP off-host is refused.)
 ============================================================================
 EOF

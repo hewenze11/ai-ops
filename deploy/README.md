@@ -26,6 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/hewenze11/ai-ops/main/deploy/instal
 | `--port <n>` | 宿主端口 | `8765` |
 | `--dir <path>` | 安装目录 | `/opt/ai-ops` |
 | `--image <ref>` | 覆盖镜像（或环境变量 `AI_OPS_IMAGE`） | `ghcr.io/hewenze11/ai-ops:latest` |
+| `--public-url <url>` | 用这个 **https origin** 生成配对码（供**另一台机器**上的 Agent 使用） | 空 |
 | `--no-docker-install` | 缺 Docker 时直接失败，不自动安装 | 关 |
 
 想从别的机器访问：`--bind 0.0.0.0`，并在前面加 TLS 反向代理。
@@ -99,6 +100,23 @@ server {
 ```
 
 完成后，**执行端**的配对码应使用 `https://ops.example.com`（而不是 `http://`）；install-agent.sh 会**拒绝非环回的明文 HTTP**，这正是为了防误配。
+
+### 一步生成跨机配对码（推荐）
+
+反代就绪后，不用手拼配对码，直接让脚本按 https origin 重新签发一条：
+
+```sh
+curl -fsSL .../install-control.sh | sudo bash -s -- --public-url https://ops.example.com
+```
+
+它会在同一台机器上重新生成一条配对码，其 `server_url` 为 `https://ops.example.com`。
+把这条码贴到**另一台机器**上装 Agent：
+
+```sh
+curl -fsSL .../install-agent.sh | sudo bash -s -- --pairing-code 'aiops1-...'
+```
+
+`--public-url` 只接受 `https://`：因为 Agent 会拒绝非环回的明文 HTTP，写 `http://` 会被脚本直接拒绝。
 
 如果要就地打印局域网配对码（仅限可信内网、且你已接受风险）：
 

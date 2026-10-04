@@ -64,6 +64,39 @@ def test_connect_refuses_without_pinned_host_key():
                                 "ssh_host_key": None})
 
 
+def test_load_secret_distinguishes_missing_file(tmp_path):
+    with pytest.raises(connector_ssh.paramiko.SSHException) as exc:
+        connector_ssh._load_secret(str(tmp_path / "does-not-exist"))
+    assert "SECRET_NOT_FOUND" in str(exc.value)
+    assert connector_ssh._classify_connect_error(exc.value) == "SECRET_NOT_FOUND"
+
+
+def test_load_secret_distinguishes_unreadable_file(monkeypatch, tmp_path):
+    # An unreadable secret (e.g. wrong ownership) must be a distinct, actionable
+    # error, not a phantom network failure. Simulate PermissionError directly so
+    # the test is meaningful even when running as root/Administrator.
+    secret = tmp_path / "locked"
+    secret.write_text("x")
+    real_open = open
+
+    def fake_open(path, *args, **kwargs):
+        if str(path) == str(secret):
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    with pytest.raises(connector_ssh.paramiko.SSHException) as exc:
+        connector_ssh._load_secret(str(secret))
+    assert "SECRET_NOT_READABLE" in str(exc.value)
+    assert connector_ssh._classify_connect_error(exc.value) == "SECRET_NOT_READABLE"
+
+
+def test_classify_connect_error_covers_host_key_cases():
+    assert connector_ssh._classify_connect_error(Exception("SSH host key is not pinned for this asset")) == "HOST_KEY_NOT_PINNED"
+    assert connector_ssh._classify_connect_error(Exception("pinned SSH host key is not a valid public key")) == "HOST_KEY_INVALID"
+    assert connector_ssh._classify_connect_error(Exception("boom")) == "CONNECTION_FAILED"
+
+
 def test_connect_pins_operator_provided_key(monkeypatch, tmp_path):
     # The exact pinned key must be the only host key the client trusts, and the
     # client must reject anything not pinned in advance.

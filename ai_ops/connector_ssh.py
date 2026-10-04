@@ -66,9 +66,24 @@ def connection_view(db, asset_id):
 
 
 def _load_secret(secret_ref):
-    """Read the SSH secret from a server-side file. Never return it upward."""
-    with open(secret_ref, "rb") as handle:
-        return handle.read()
+    """Read the SSH secret from a server-side file. Never return it upward.
+
+    The file AND every parent directory must be traversable by the service user
+    (uid 10001); otherwise this raises PermissionError, which we surface as a
+    distinct error code so operators do not chase a phantom network problem.
+    """
+    try:
+        with open(secret_ref, "rb") as handle:
+            return handle.read()
+    except PermissionError as error:
+        raise paramiko.SSHException(
+            "SECRET_NOT_READABLE: %s is not readable by the service user; "
+            "the file and all its parent directories must be readable/traversable "
+            "(e.g. dir 755, file 600 owned by the container user 10001)" % secret_ref) from error
+    except FileNotFoundError as error:
+        raise paramiko.SSHException(
+            "SECRET_NOT_FOUND: %s does not exist; check ssh_secret_ref and the "
+            "connector mount" % secret_ref) from error
 
 
 def _shell_quote(value):
@@ -99,6 +114,20 @@ def _load_pinned_key(host, line):
             os.unlink(path)
         except OSError:
             pass
+
+
+def _classify_connect_error(error):
+    """Map a connect-time failure to an operator-actionable error code."""
+    text = str(error)
+    if text.startswith('SECRET_NOT_READABLE'):
+        return 'SECRET_NOT_READABLE'
+    if text.startswith('SECRET_NOT_FOUND'):
+        return 'SECRET_NOT_FOUND'
+    if 'SSH host key is not pinned' in text:
+        return 'HOST_KEY_NOT_PINNED'
+    if 'pinned SSH host key is not a valid public key' in text:
+        return 'HOST_KEY_INVALID'
+    return 'CONNECTION_FAILED'
 
 
 def _connect(info):
@@ -151,7 +180,7 @@ def install_connector(app, transaction, audit, admin):
         except Exception as error:
             with transaction() as db:
                 audit(db, 'ssh.check_failed', asset_id, 'admin', {'error_type': type(error).__name__})
-            return {'reachable': False, 'error_type': type(error).__name__}
+            return {'reachable': False, 'error_type': type(error).__name__, 'error': str(error)[:300]}
         with transaction() as db:
             audit(db, 'ssh.checked', asset_id, 'admin', {'reachable': True})
         return {'reachable': True}
@@ -230,8 +259,8 @@ class ConnectorExecutor:
             client = _connect(info)
         except Exception as error:
             # Cannot even start: nothing ran, so this is a definite failure.
-            result['error_code'] = 'CONNECTION_FAILED'
-            result['stderr'] = type(error).__name__
+            result['error_code'] = _classify_connect_error(error)
+            result['stderr'] = str(error)[:300] or type(error).__name__
             return result
         remote = "sudo -n -u %s -- /bin/sh -c %s" % (run_as, _shell_quote(command))
         channel = None

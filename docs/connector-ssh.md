@@ -23,6 +23,19 @@
 - 主机公钥必须预置：`ssh_host_key` 存一行 OpenSSH 公钥（`ssh-ed25519 AAAA... comment`）。连接器把它作为**唯一**可信主机密钥，`RejectPolicy` 拒绝其他任何密钥；未预置则直接拒绝连接（fail closed），不做 TOFU。
 - 私钥/密码**不落明文**：存 `secret_ref`（指向服务器上的密钥文件路径）或加密后的密文。凭证只在连接器进程内解密使用，绝不进入模型上下文、审计、日志或 GET 响应。公钥本身不是秘密，但 GET 响应只回 `ssh_host_key_pinned` 布尔值，不回密钥内容。
 
+### secret 文件权限（常见坑）
+
+连接器运行在主服务容器内（uid 10001）。`secret_ref` 指向的文件**及其每一层父目录**都必须对该用户**可读/可进入**，否则 `_load_secret` 抛 `PermissionError`，任务报 `SECRET_NOT_READABLE`、`ssh/check` 返回同码与提示：
+
+```sh
+# 目录 755、文件 600 且属主为容器用户
+chmod 755 /opt/ai-ops/connector
+chmod 600 /opt/ai-ops/connector/id_ed25519
+chown 10001:10001 /opt/ai-ops/connector/id_ed25519
+```
+
+注意：文件本身 0600 而**父目录 0700 root** 是最隐蔽的错配——容器能“看到路径”却进不去。错误码映射：`SECRET_NOT_FOUND`（不存在）、`HOST_KEY_NOT_PINNED`（未预置主机公钥）、`HOST_KEY_INVALID`（预置公钥格式非法）、`CONNECTION_FAILED`（其余网络/认证失败）。
+
 ## 派发流程（SSH 资产）
 
 1. 任务进入 `queued`（与 Agent 一致，`mode=direct`）。

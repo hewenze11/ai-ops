@@ -19,6 +19,8 @@ Agent协议仍为1.0；Agent不调用模型、不需要模型Key。新增逻辑�
 ```sh
 # 凭据应通过受控方式写入secrets/model_key，而不是贴到命令参数。
 # 文件需让容器UID10001可读，权限0600，Git忽略。
+# 注意：该文件**必须先作为文件存在**再启动 compose；若路径缺失，Docker 会把
+# bind-mount 目标建成**目录**，容器随即启动失败（exit 127）。
 export AI_OPS_MODEL_BASE_URL=https://your-provider.example/v1
 export AI_OPS_MODEL=your-verified-model-id
 docker compose -f compose.yaml -f compose.model.yaml -p ai-ops-preview up -d

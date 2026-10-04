@@ -21,6 +21,9 @@
 #   --port 8765        host port (default 8765)
 #   --dir /opt/ai-ops  install directory (default /opt/ai-ops)
 #   --image <ref>      override the image (default ghcr.io/hewenze11/ai-ops:latest)
+#   --public-url <url> mint the pairing code against this https:// origin, for an
+#                      agent on ANOTHER host reached through a TLS reverse proxy
+#                      (the agent refuses non-loopback plain HTTP)
 #   --no-docker-install   refuse to install Docker; fail instead if missing
 set -euo pipefail
 
@@ -29,6 +32,7 @@ PORT="8765"
 DIR="/opt/ai-ops"
 IMAGE="${AI_OPS_IMAGE:-ghcr.io/hewenze11/ai-ops:latest}"
 ALLOW_DOCKER_INSTALL=1
+PUBLIC_URL=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -36,6 +40,7 @@ while [ $# -gt 0 ]; do
     --port) PORT="$2"; shift 2;;
     --dir) DIR="$2"; shift 2;;
     --image) IMAGE="$2"; shift 2;;
+    --public-url) PUBLIC_URL="$2"; shift 2;;
     --no-docker-install) ALLOW_DOCKER_INSTALL=0; shift;;
     *) echo "unknown option: $1" >&2; exit 2;;
   esac
@@ -182,6 +187,15 @@ else
   case "$BIND" in
     https://*|http://*) PAIRING_SERVER="${BIND}:${PORT}" ;;
   esac
+  # --public-url wins: it is the canonical way to mint a pairing code for a
+  # REMOTE agent (the control service reached through a TLS reverse proxy).
+  # The agent refuses non-loopback plain HTTP, so this MUST be https://.
+  if [ -n "$PUBLIC_URL" ]; then
+    case "$PUBLIC_URL" in
+      https://*) PAIRING_SERVER="${PUBLIC_URL%/}" ;;
+      *) die "--public-url must be an https:// origin (the agent refuses non-loopback plain HTTP)" ;;
+    esac
+  fi
   PAIRING="$(PAIRING_SERVER="$PAIRING_SERVER" PAIRING_ASSET="agent-1" PAIRING_TOKEN="$AGENT_TOKEN" python3 - <<'PY'
 import base64, json, os
 blob = {"server_url": os.environ["PAIRING_SERVER"], "asset_id": os.environ["PAIRING_ASSET"],
@@ -205,8 +219,11 @@ cat <<EOF
 
    curl -fsSL https://raw.githubusercontent.com/hewenze11/ai-ops/main/deploy/install-agent.sh | sudo bash -s -- --pairing-code '$PAIRING'
 
- (This pairing code uses 127.0.0.1 and only works when the agent runs on THIS
-  host. For an agent on another host, put TLS in front and re-issue a code whose
-  server_url is the https:// origin. Plain HTTP off-host is refused.)
+ (This pairing code targets '$PAIRING_SERVER'.
+  - If it is 127.0.0.1, the agent must run on THIS host.
+  - For an agent on ANOTHER host, put TLS in front and re-mint with:
+      $0 --public-url https://your.domain          # same machine, re-run
+    which produces a pairing code whose server_url is the https:// origin.
+  Plain HTTP off-host is refused by the agent, by design.)
 ============================================================================
 EOF

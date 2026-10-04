@@ -1,4 +1,11 @@
 # Optional overlay. Keep the real key in a restricted, gitignored secret file.
+#
+# IMPORTANT: ./secrets/model_key MUST be created as a FILE *before* you start
+# compose. If the path does not exist, Docker creates it as a DIRECTORY for the
+# bind mount, and the container then fails to start (exit 127). Create it first:
+#   install -m 600 /dev/null secrets/model_key
+#   printf '%s' "$YOUR_KEY" > secrets/model_key
+# and ensure the container UID (10001) can read it.
 services:
   control:
     environment:

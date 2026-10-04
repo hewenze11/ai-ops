@@ -37,6 +37,7 @@ P1 完整后端执行可靠性已基本收口：多步骤轮次、心跳、取�
 - 已完成按天分层记忆（2026-10-03）：`ai_ops/memory.py`。按日历日归档，策略窗口严格递增且不重叠、末层开放；compressed 为确定性模型无关压缩，上下文路径不触发模型调用；当天不重复注入；运维编辑钉住不被重建覆盖；删除保留审计；角色隔离。见 docs/memory.md。
 - 日记忆全文/压缩/梗概、旧记忆查询，原始审计独立保存。
 - 已完成告警日志（2026-10-03）：`ai_ops/alarms.py` 内置告警日志 alarm_log，在触发同事务写入，accepted/duplicate/rejected 均落盘；多源经 X-Alarm-Source 共用一条 trigger 并可按源分离；payload 递归脱敏（含按字段名）；三个查询接口。见 docs/alarms.md。
+- 已完成告警结果外推（2026-10-04）：`ai_ops/alert_notify.py`。定位上 Alertmanager 是第一棒（原始告警），AI Ops 是第二棒（AI 排查后的**结论**）；轮次完成后生成持久化外推行，后台 worker 有界重试；按 URL 主机自动识别飞书/钉钉/企微/Slack/Discord/通用并适配 payload；**SSRF 防护**（拒绝内网/回环/云元数据/非 http(s)/重定向）为安全底线；控制台新增“告警外推”配置页。见 docs/alert-webhook.md。
 - 本地Skills管理与准确注入位置；告警提示词/账号/角色配置与日志（日志已实现）。
 
 ## P3：后端联调达标后开发Web和渠道

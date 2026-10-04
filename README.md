@@ -41,6 +41,7 @@ Agent 脚本会创建两个最小权限账号（`aiops_read` 只读、`aiops_ops
 - 统一角色轮次队列：聊天、触发/定时输入及手工命令共享角色顺序；一轮支持多次模型/工具交互。
 - **Web 控制台第一版**：后端内嵌的零依赖静态页（`ai_ops/console/`），只读优先。凭据只存标签页内存、不落浏览器存储；访问 `/` 即可打开。见 [docs/console.md](docs/console.md)。
 - **消息渠道第一层**：飞书/企业微信/微信共用同一角色的记忆与串行队列；一次性配对码绑定身份，按身份隔离出站。见 [docs/channels.md](docs/channels.md)。
+- **告警结果外推**：Alertmanager 是第一棒（原始告警），AI Ops 是第二棒（AI 排查后的结论）——推的是“结论”不是“原始告警”。一个 Webhook 覆盖飞书/钉钉/企微/Slack/Discord（按 URL 主机自动识别）；持久化 outbox + 有界重试；**SSRF 防护**为安全底线。见 [docs/alert-webhook.md](docs/alert-webhook.md)。
 - **管理写入面**：控制台可改名/备注资产/允许账号、编辑文档、创建角色、注册资产、创建/编辑定制任务，以及管理并注入本地 Skills（Skill 是数据不是代码）。一次性凭据只在创建时出示。见 [docs/management.md](docs/management.md)。
 - **P3 真机验收已完成**：12 项端到端检查全部通过（含控制台真机截图）。见 [docs/p3-acceptance-report.md](docs/p3-acceptance-report.md)。
 - **真机连贯性联调已完成**：用真实付费模型在预览机跑 11 项检查全通过（自我认知/Skill 与文档角色隔离注入/权限注入/confirm 真机执行/同日与跨日记忆回忆/多步连贯/产品自我认知）。模型知识自己属于「AI Ops」产品、产品提供哪些能力面、以及哪些才是它自己的工具。见 [docs/system-self-doc.md](docs/system-self-doc.md) 与 [docs/model-turns.md](docs/model-turns.md)。

@@ -281,7 +281,7 @@
       ["overview", "总览"], ["attention", "需人工处置"], ["tasks", "任务"], ["alarms", "告警日志"],
     ]],
     ["调度与触发", [
-      ["custom", "定制任务"], ["turns-loop", "触发器事件"], ["turns", "角色轮次"],
+      ["custom", "定制任务"], ["turns-loop", "触发器事件"], ["turns", "角色轮次"], ["alert-notify", "告警外推"],
     ]],
     ["资产与知识", [
       ["assets", "资产"], ["skills", "Skills"], ["documents", "文档"], ["memory", "记忆"],
@@ -317,6 +317,7 @@
     const loaders = {
       overview: loadOverview, attention: loadAttention, alarms: loadAlarms, tasks: loadTasks,
       turns: loadTurns, custom: loadCustom, "turns-loop": loadEvents, documents: loadDocuments,
+      "alert-notify": loadAlertNotify,
       assets: loadAssets, channels: loadChannels, skills: loadSkills, memory: loadMemory, audit: loadAudit, output: loadOutput,
       roles: loadRoles,
     };
@@ -460,6 +461,59 @@
         const record = data.find((r) => fmt(r.received_at) === row[0] && r.title === row[4]);
         modal("告警 " + shortId(record.id), record);
       }));
+  }
+
+  async function loadAlertNotify(host) {
+    let config = { configured: false };
+    try { config = await api("GET", "/api/v1/alert-notify/config"); } catch (err) { /* show form anyway */ }
+
+    const intro = card("告警结果外推（Alertmanager 的第二棒）");
+    intro.appendChild(el("p", "muted small",
+      "Alertmanager 负责第一时间的原始告警，我们负责第二棒：AI 排查完成后，把“结论”回推到你的 Webhook。" +
+      "支持飞书 / 钉钉 / 企业微信 / Slack / Discord，其它地址按通用 JSON 发送（按 URL 主机自动识别）。" +
+      "出于安全，内网 / 回环 / 云元数据地址会被拒绝。"));
+    intro.appendChild(table(["状态", "渠道", "地址（已脱敏）", "更新时间"], [[
+      config.configured ? (config.enabled ? "已启用" : "已停用") : "未配置",
+      config.channel || "-", config.url || "-", fmt(config.updated_at)]]));
+    host.appendChild(intro);
+
+    const form = card("配置 / 更新 Webhook");
+    const urlInput = el("input"); urlInput.placeholder = "https://oapi.dingtalk.com/robot/send?access_token=...";
+    urlInput.value = config.configured ? (config.url || "") : ""; urlInput.style.minWidth = "320px";
+    const channelSelect = el("select");
+    ["auto", "feishu", "dingtalk", "wecom", "slack", "discord", "generic"].forEach((c) => {
+      const o = el("option", "", c); o.value = c; channelSelect.appendChild(o);
+    });
+    const save = el("button", "", "保存");
+    const test = el("button", "", "发送测试");
+    const clear = el("button", "small", "停用并清除");
+    const out = el("pre", "pre-list", "");
+    save.onclick = async () => {
+      try {
+        const res = await api("PUT", "/api/v1/alert-notify/config",
+          { url: urlInput.value.trim(), channel: channelSelect.value, enabled: true });
+        out.textContent = "已保存：渠道=" + res.channel + "，地址=" + res.url;
+      } catch (err) { out.textContent = "失败：" + err.message; }
+    };
+    test.onclick = async () => {
+      try { const res = await api("POST", "/api/v1/alert-notify/test", {});
+        out.textContent = "测试推送已发送（渠道=" + res.channel + "）。请到你的群里确认。";
+      } catch (err) { out.textContent = "测试失败：" + err.message; }
+    };
+    clear.onclick = async () => {
+      try { await api("DELETE", "/api/v1/alert-notify/config"); out.textContent = "已停用。"; }
+      catch (err) { out.textContent = "失败：" + err.message; }
+    };
+    const row = el("div", "fields");
+    row.appendChild(channelSelect); row.appendChild(urlInput); row.appendChild(save); row.appendChild(test); row.appendChild(clear);
+    form.appendChild(row); form.appendChild(out);
+    host.appendChild(form);
+
+    let deliveries = [];
+    try { deliveries = await api("GET", "/api/v1/alert-notify/deliveries?limit=100"); } catch (err) { deliveries = []; }
+    host.appendChild(card("外推投递记录（最近 100 条，URL 已脱敏）")).appendChild(
+      table(["时间", "标题", "渠道", "告警状态", "状态", "尝试", "最近错误"],
+        deliveries.map((d) => [fmt(d.created_at), d.title, d.channel, d.alarm_state || "-", d.status, d.attempts, d.last_error || "-"])));
   }
 
   async function loadTasks(host) {

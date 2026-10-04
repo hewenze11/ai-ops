@@ -148,12 +148,13 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         from .memory import SCHEMA as MEMORY_SCHEMA
         from .alarms import SCHEMA as ALARM_SCHEMA
         from .channels import SCHEMA as CHANNEL_SCHEMA
+        from .alert_notify import SCHEMA as ALERT_NOTIFY_SCHEMA
         from .management import SCHEMA as MANAGEMENT_SCHEMA
         db.execute("PRAGMA journal_mode=WAL")
         from .execution import SCHEMA as EXEC_SCHEMA, migrate as migrate_execution
         from .leases import SCHEMA as LEASE_SCHEMA, migrate as migrate_leases
         from .connector_ssh import SCHEMA as CONNECTOR_SCHEMA, migrate as migrate_connector
-        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA + LEASE_SCHEMA + CONNECTOR_SCHEMA + MEMORY_SCHEMA + ALARM_SCHEMA + CHANNEL_SCHEMA + MANAGEMENT_SCHEMA)
+        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA + LEASE_SCHEMA + CONNECTOR_SCHEMA + MEMORY_SCHEMA + ALARM_SCHEMA + CHANNEL_SCHEMA + ALERT_NOTIFY_SCHEMA + MANAGEMENT_SCHEMA)
         migrate(db)
         migrate_execution(db)
         migrate_leases(db)
@@ -259,6 +260,9 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     install_console(app, transaction, audit, admin)
     from .channels import install_channels
     install_channels(app, transaction, audit, admin, current_admin_token)
+    from .alert_notify import install_alert_notify
+    install_alert_notify(app, transaction, audit, admin)
+    app.state.alert_notify = {"transaction": transaction, "audit": audit}
     from .management import install_management
     install_management(app, transaction, audit, admin)
 

@@ -36,6 +36,10 @@ def main():
         from .retention import start_retention_worker
         stop, thread = start_retention_worker(app.state.transaction, app.state.audit, app.state.retention_policy)
         background.append((stop, thread))
+    if os.environ.get("AI_OPS_ALERT_NOTIFY_ENABLED", "1") == "1":
+        from .alert_notify import start_alert_notify_worker
+        stop, thread = start_alert_notify_worker(app.state.transaction, app.state.audit)
+        background.append((stop, thread))
     try:
         uvicorn.run(app, host=os.environ.get("AI_OPS_HOST", "127.0.0.1"), port=port, access_log=False)
     finally:

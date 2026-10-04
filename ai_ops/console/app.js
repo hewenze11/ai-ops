@@ -125,9 +125,9 @@
       list.textContent = "";
       if (!roles.length) list.appendChild(el("li", "muted", "尚无角色，请先在控制台创建（当前后端未提供角色创建接口）。"));
       roles.forEach((role) => {
-        const item = el("li", state.roleId === role.id ? "active" : "");
+        const item = el("li", "role-item" + (state.roleId === role.id ? " active" : ""));
         item.appendChild(el("span", "", role.name));
-        item.appendChild(el("span", "muted small", role.id));
+        item.appendChild(el("span", "sub", role.id));
         item.onclick = () => { state.roleId = role.id; loadChat(); };
         list.appendChild(item);
       });
@@ -220,6 +220,23 @@
   }
 
   $("chat-refresh").onclick = () => loadChat();
+
+  // Advanced options stay collapsed until needed: the default path is just
+  // "type what you want and send". Defaults (confirm mode) are the safe ones.
+  $("opts-toggle").onclick = () => {
+    const body = $("opts-body");
+    const open = body.hidden;
+    body.hidden = !open;
+    $("opts-toggle").textContent = open ? "选项 ▴" : "选项 ▾";
+    $("opts-toggle").setAttribute("aria-expanded", String(open));
+  };
+  $("chat-text").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      $("chat-form").requestSubmit();
+    }
+  });
+
   $("chat-form").onsubmit = async (e) => {
     e.preventDefault();
     if (!state.roleId) { say("请先选择角色", "error"); return; }
@@ -257,19 +274,37 @@
   }
 
   /* ---------- console ---------- */
-  const TABS = [
-    ["overview", "总览"], ["attention", "需人工处置"], ["alarms", "告警日志"],
-    ["tasks", "任务"], ["roles", "角色"], ["turns", "角色轮次"], ["custom", "定制任务"],
-    ["turns-loop", "触发器事件"], ["channels", "渠道"], ["documents", "文档"], ["assets", "资产"],
-    ["skills", "Skills"], ["memory", "记忆"], ["audit", "审计"], ["output", "输出"],
+  // Grouped navigation: fewer things visibly competing for attention; the
+  // long tail of panels is one click away, not a wall of 15 equal entries.
+  const TAB_GROUPS = [
+    ["运行", [
+      ["overview", "总览"], ["attention", "需人工处置"], ["tasks", "任务"], ["alarms", "告警日志"],
+    ]],
+    ["调度与触发", [
+      ["custom", "定制任务"], ["turns-loop", "触发器事件"], ["turns", "角色轮次"],
+    ]],
+    ["资产与知识", [
+      ["assets", "资产"], ["skills", "Skills"], ["documents", "文档"], ["memory", "记忆"],
+    ]],
+    ["系统", [
+      ["roles", "角色"], ["channels", "渠道"], ["audit", "审计"], ["output", "输出"],
+    ]],
   ];
+  const TABS = TAB_GROUPS.flatMap(([, items]) => items);
   function renderConsole() {
     const tabs = $("console-tabs");
     tabs.textContent = "";
-    TABS.forEach(([id, label]) => {
-      const item = el("li", state.tab === id ? "active" : "", label);
-      item.onclick = () => { state.tab = id; renderConsole(); };
-      tabs.appendChild(item);
+    TAB_GROUPS.forEach(([groupLabel, items]) => {
+      const group = el("div", "side-group");
+      group.appendChild(el("div", "side-label", groupLabel));
+      const list = el("ul", "list");
+      items.forEach(([id, label]) => {
+        const item = el("li", state.tab === id ? "active" : "", label);
+        item.onclick = () => { state.tab = id; renderConsole(); };
+        list.appendChild(item);
+      });
+      group.appendChild(list);
+      tabs.appendChild(group);
     });
     const body = $("console-body");
     body.textContent = "";
@@ -287,6 +322,13 @@
     };
     loaders[state.tab](holder).catch((err) => holder.appendChild(el("div", "card error", "加载失败：" + err.message)));
   }
+
+  // Friendly labels so the dashboard reads in plain language, not raw keys.
+  const COUNT_LABELS = {
+    roles: "角色", assets: "资产", agent_assets: "Agent 资产", ssh_assets: "SSH 资产",
+    documents: "文档", custom_tasks: "定制任务", role_turns: "角色轮次", tasks: "任务",
+    alarms: "告警", audit_events: "审计事件", unknown_tasks: "未知任务", pending_alarms: "待处理告警",
+  };
 
   function card(title) {
     const box = el("div", "card");
@@ -317,28 +359,52 @@
   }
 
   async function loadOverview(host) {
-    const box = card("服务概况");
-    const grid = el("div", "grid");
     const health = await api("GET", "/healthz");
-    grid.appendChild(kv("状态", health.status));
-    grid.appendChild(kv("执行协议", health.protocol_version));
     const output = await api("GET", "/api/v1/console/overview");
-    Object.keys(output.counts).forEach((key) => grid.appendChild(kv(key, output.counts[key])));
+    const attention = await api("GET", "/api/v1/operator/attention");
+
+    // Health strip: one glance tells you whether the control plane is alive.
+    const strip = card("服务状态");
+    const sgrid = el("div", "grid");
+    const healthKv = kv("健康", health.status);
+    if (String(health.status).toLowerCase() !== "ok") healthKv.classList.add("warn");
+    sgrid.appendChild(healthKv);
+    sgrid.appendChild(kv("执行协议", health.protocol_version));
+    strip.appendChild(sgrid);
+    host.appendChild(strip);
+
+    const box = card("资源计数");
+    const grid = el("div", "grid");
+    Object.keys(output.counts).forEach((key) => grid.appendChild(kv(COUNT_LABELS[key] || key, output.counts[key])));
     box.appendChild(grid);
     host.appendChild(box);
 
-    const notice = card("当前缺口（如实呈现，不假装完成）");
-    notice.appendChild(el("p", "muted small", output.notices.join("；")));
-    host.appendChild(notice);
-
-    const attention = await api("GET", "/api/v1/operator/attention");
+    const needs = (attention.unknown_executions.length + attention.stale_leases.length + attention.offline_assets.length);
     const box2 = card("需人工处置");
     const grid2 = el("div", "grid");
-    grid2.appendChild(kv("未知执行", attention.unknown_executions.length));
-    grid2.appendChild(kv("陈旧租约", attention.stale_leases.length));
-    grid2.appendChild(kv("离线资产", attention.offline_assets.length));
+    const unknownKv = kv("未知执行", attention.unknown_executions.length);
+    const leaseKv = kv("陈旧租约", attention.stale_leases.length);
+    const offlineKv = kv("离线资产", attention.offline_assets.length);
+    if (attention.unknown_executions.length) unknownKv.classList.add("warn");
+    if (attention.stale_leases.length) leaseKv.classList.add("warn");
+    if (attention.offline_assets.length) offlineKv.classList.add("warn");
+    grid2.appendChild(unknownKv); grid2.appendChild(leaseKv); grid2.appendChild(offlineKv);
     box2.appendChild(grid2);
+    if (needs) {
+      const go = el("button", "ghost small", "前往处置 →");
+      go.style.marginTop = "14px";
+      go.onclick = () => { state.tab = "attention"; renderConsole(); };
+      box2.appendChild(go);
+    } else {
+      box2.appendChild(el("p", "muted small", "当前无需人工处置。"));
+    }
     host.appendChild(box2);
+
+    if (output.notices && output.notices.length) {
+      const notice = card("说明");
+      notice.appendChild(el("p", "muted small", output.notices.join("；")));
+      host.appendChild(notice);
+    }
   }
 
   async function loadAttention(host) {

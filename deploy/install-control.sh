@@ -119,11 +119,21 @@ services:
 EOF
 
 say "Pulling and starting the control service"
-( cd "$DIR" && { $COMPOSE -p ai-ops pull control || {
-    # A private/offline registry must not block a local image that already exists.
-    docker image inspect "$IMAGE" >/dev/null 2>&1 || die "cannot pull $IMAGE and it is not present locally"
-    warn "could not pull $IMAGE; using the local copy";
-  }; } && $COMPOSE -p ai-ops up -d )
+# Pull first so a registry/auth problem fails loudly and early; a private registry
+# must not block a local image that already exists.
+if ! ( cd "$DIR" && $COMPOSE -p ai-ops pull control ); then
+  if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    warn "could not pull $IMAGE; using the local copy"
+  else
+    warn "cannot pull $IMAGE and it is not present locally."
+    warn "If the image lives in a private registry (e.g. GHCR while the package is not public),"
+    warn "authenticate first, then re-run:"
+    warn "    echo <YOUR_GITHUB_TOKEN> | docker login ghcr.io -u <your-github-user> --password-stdin"
+    warn "Or point at another image with: $0 --image <ref>"
+    die "no runnable image"
+  fi
+fi
+( cd "$DIR" && $COMPOSE -p ai-ops up -d ) || die "failed to start the control service"
 
 BASE="http://127.0.0.1:${PORT}"
 say "Waiting for $BASE/healthz"

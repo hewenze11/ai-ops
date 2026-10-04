@@ -615,7 +615,10 @@
     const box = card("本地 Skills（作为参考文本注入本角色，不授予任何权限）");
     const add = el("button", "small", "新建 Skill");
     add.onclick = () => skillEditor(null);
+    const pull = el("button", "small", "从官网 Skills 库同步");
+    pull.onclick = () => skillSyncDialog();
     box.appendChild(add);
+    box.appendChild(pull);
     box.appendChild(table(["ID", "名称", "启用", "角色", "修订", "字符", "操作"],
       data.map((r) => [r.id, r.name, r.enabled ? "是" : "否", usersToText(r.role_ids), r.revision, (r.content || "").length, "编辑"]),
       (row) => skillEditor(data.find((r) => r.id === row[0]))));
@@ -623,6 +626,58 @@
     const note = card("边界");
     note.appendChild(el("p", "muted small", "Skill 是数据不是代码：不能增加账号、改模式或授予工具，只作为参考材料注入模型上下文。"));
     host.appendChild(note);
+  }
+
+  // Pull Skills from the website hub. The pull key is sent once to our own
+  // /api/v1/skills/sync endpoint and never stored in the browser beyond this
+  // dialog's inputs; it is not written to localStorage or the URL.
+  function skillSyncDialog() {
+    const box = el("div", "");
+    const fields = el("div", "fields");
+    const hubInput = el("input"); hubInput.placeholder = "官网 Skills 库地址，如 https://你的官网/api/v1/skills/repo";
+    hubInput.value = "https://";
+    const keyInput = el("input"); keyInput.type = "password"; keyInput.placeholder = "拉取 Key（aiops-sk-…）";
+    keyInput.autocomplete = "off";
+    const roleInput = el("input"); roleInput.placeholder = "绑定到本地角色 id（可空；逗号分隔，留空则用 Skill 自带的角色）";
+    const dryWrap = el("label", "inline");
+    const dryInput = el("input"); dryInput.type = "checkbox";
+    dryWrap.appendChild(dryInput); dryWrap.appendChild(el("span", "", "仅预览（dry-run，不写入）"));
+    fields.appendChild(hubInput); fields.appendChild(keyInput); fields.appendChild(roleInput); fields.appendChild(dryWrap);
+    const feedback = el("p", "error small", "");
+    const out = el("div", "");
+    const run = el("button", "", "开始同步");
+    run.onclick = async () => {
+      feedback.textContent = "";
+      out.innerHTML = "";
+      const body = { source_url: hubInput.value.trim(), pull_key: keyInput.value.trim(), dry_run: dryInput.checked };
+      const roles = roleInput.value.trim();
+      if (roles) body.role_ids = roles.split(",").map((s) => s.trim()).filter(Boolean);
+      if (!body.source_url || !body.pull_key) { feedback.textContent = "请填写官网地址与拉取 Key"; return; }
+      run.disabled = true;
+      try {
+        const res = await api("POST", "/api/v1/skills/sync", body);
+        const imported = (res.imported || []);
+        const skipped = (res.skipped || []);
+        out.appendChild(el("p", "small", (res.dry_run ? "预览" : "已导入") + " " + imported.length + " 个，跳过 " + skipped.length + " 个（bundle 修订 " + (res.bundle_revision ?? "-") + "）"));
+        if (imported.length) {
+          out.appendChild(table(["ID", "名称", "绑定角色"],
+            imported.map((s) => [s.id, s.name, usersToText(s.role_ids)]), () => {}));
+        }
+        if (skipped.length) {
+          out.appendChild(el("p", "muted small", "跳过原因：" + skipped.map((s) => (s.id || "?") + "（" + s.reason + "）").join("；")));
+        }
+        if (!res.dry_run && imported.length) renderConsole();
+      } catch (err) {
+        feedback.textContent = err.message;
+      } finally {
+        run.disabled = false;
+      }
+    };
+    const actions = el("div", "row"); actions.appendChild(run);
+    box.appendChild(fields);
+    box.appendChild(el("p", "muted small", "拉取 Key 由官网在订阅后生成；只用于这次对官网的出站请求，不会存到浏览器。"));
+    box.appendChild(actions); box.appendChild(feedback); box.appendChild(out);
+    modalContent("从官网 Skills 库同步", box);
   }
 
   function skillEditor(record) {

@@ -168,6 +168,9 @@
     if (turn.state === "awaiting_approval" || (turn.pending_task_id && turn.state === "waiting_tool")) {
       card.appendChild(actionsForTurn(turn));
     }
+    if (turn.steps && turn.steps.length) {
+      card.appendChild(stepsPanel(turn));
+    }
     const details = el("button", "ghost small", "查看完整轮次 / 模型调用");
     details.style.marginTop = "8px";
     details.onclick = async () => {
@@ -183,6 +186,69 @@
       card.appendChild(final);
     }
     return card;
+  }
+
+  // "分析步骤": the model's own intent line before each tool call, plus the
+  // command it proposed and the result excerpt. Derived from the transcript, so
+  // it is exactly what the model saw and did. Collapsed by default: a user who
+  // wants the process can open it; a user who trusts the result can ignore it,
+  // and either way it is visible proof of whether the turn is stuck or moving.
+  function stepsPanel(turn) {
+    const box = el("div", "steps");
+    box.style.marginTop = "8px";
+    let open = false;
+    const head = el("button", "ghost small", "分析步骤（" + turn.steps.length + "）");
+    const body = el("div", "steps-body");
+    body.hidden = true;
+    turn.steps.forEach((step, index) => body.appendChild(stepRow(step, index + 1)));
+    head.onclick = () => { open = !open; body.hidden = !open; head.textContent = (open ? "收起分析步骤（" : "分析步骤（") + turn.steps.length + "）"; };
+    box.appendChild(head);
+    box.appendChild(body);
+    return box;
+  }
+
+  function stepRow(step, n) {
+    const row = el("div", "step step-" + step.kind);
+    const head = el("div", "step-head");
+    head.appendChild(el("span", "step-no", String(n)));
+    if (step.kind === "thought") {
+      head.appendChild(el("span", "step-label", "思考"));
+      row.appendChild(head);
+      row.appendChild(el("div", "step-text", step.text));
+      return row;
+    }
+    if (step.kind === "command") {
+      head.appendChild(el("span", "step-label", "执行"));
+      head.appendChild(el("span", "pill " + stepPill(step.status), step.status));
+      if (step.run_as) head.appendChild(el("span", "muted small", "账号 " + step.run_as));
+      if (step.exit_code !== null && step.exit_code !== undefined) {
+        head.appendChild(el("span", "muted small", "exit " + step.exit_code));
+      }
+      if (step.truncated) head.appendChild(el("span", "muted small", "输出已截断"));
+      row.appendChild(head);
+      row.appendChild(el("pre", "step-cmd", "$ " + (step.command || "")));
+      if (step.output_excerpt) row.appendChild(el("pre", "step-out", step.output_excerpt));
+      if (step.error) row.appendChild(el("div", "error small", "失败：" + step.error));
+      return row;
+    }
+    if (step.kind === "search") {
+      head.appendChild(el("span", "step-label", "检索"));
+      head.appendChild(el("span", "pill " + stepPill(step.status), step.status));
+      row.appendChild(head);
+      row.appendChild(el("div", "step-text", step.query ? ("搜索：" + step.query) : ("抓取：" + (step.url || ""))));
+      if (step.output_excerpt) row.appendChild(el("pre", "step-out", step.output_excerpt));
+      return row;
+    }
+    head.appendChild(el("span", "step-label", "工具"));
+    row.appendChild(head);
+    if (step.preview) row.appendChild(el("pre", "step-out", step.preview));
+    return row;
+  }
+
+  function stepPill(status) {
+    if (status === "done" || status === "succeeded") return "ok";
+    if (status === "failed" || status === "unknown") return "bad";
+    return "warn";
   }
 
   function pillClass(value) {

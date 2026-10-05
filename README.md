@@ -48,6 +48,7 @@ Agent 脚本会创建两个最小权限账号（`aiops_read` 只读、`aiops_ops
 - **本机 Connector（控制主机纳管）**：控制服务所在的机器默认纳入管理，接入方式为 `local`——无需 Agent、无需 SSH 凭据，与其它资产共用同一套任务、租约、权限白名单与审计通道。本机凭据不可用（fail-closed），停用仅隐藏资产、保留历史。见 [docs/connector-local.md](docs/connector-local.md)。
 - **资产生命周期与失联事件**：资产删除拆成“注销（保留历史、可恢复）”与“彻底删除（需回显 ID、未决执行拒删）”；失联检测带防抖（90s）与限频（1800s），事件复用同一告警 Webhook 出站，平台不自行探测、不重派任务。见 [docs/asset-lifecycle.md](docs/asset-lifecycle.md)。
 - **P3 真机验收已完成**：12 项端到端检查全部通过（含控制台真机截图）。见 [docs/p3-acceptance-report.md](docs/p3-acceptance-report.md)。
+- **分析步骤与证据化回复**：轮次返回新增派生字段 `steps`（思考 / 执行 / 检索 / 工具，含状态与输出摘录），控制台可展开查看“它到底做了什么、卡没卡”；并约束模型**直接贴出错行与改动前后 diff**，不用翻日志。不新增表、无 schema 变更。见 [docs/analysis-steps.md](docs/analysis-steps.md)。
 - **真机连贯性联调已完成**：用真实付费模型在预览机跑 11 项检查全通过（自我认知/Skill 与文档角色隔离注入/权限注入/confirm 真机执行/同日与跨日记忆回忆/多步连贯/产品自我认知）。模型知识自己属于「AI Ops」产品、产品提供哪些能力面、以及哪些才是它自己的工具。见 [docs/system-self-doc.md](docs/system-self-doc.md) 与 [docs/model-turns.md](docs/model-turns.md)。
 - OpenAI兼容模型适配器、角色模型覆盖、独立账号/确认校验、模型调用与回复审计。
 - 核心/角色文档编辑API，每次模型调用重新全文注入核心文档与完整服务OpenAPI。

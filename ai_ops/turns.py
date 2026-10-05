@@ -13,6 +13,98 @@ from .models import Identifier as ID, UserName as USER
 TERMINAL = ("completed", "failed", "cancelled")
 
 
+def derive_steps(messages):
+    """Turn the raw model/tool transcript into a user-facing "分析步骤" list.
+
+    This is DERIVED, not stored separately: the authoritative transcript stays in
+    ``role_turns.messages`` (and the full request/response in ``model_calls``).
+    Deriving keeps one source of truth, so a step can never drift from what the
+    model actually did.
+
+    Each returned step is one of:
+    * ``{kind: "thought", text}``  — the model's own words before it acts. This is
+      the "碎碎念": an intent line. We only ever surface the model's *ordinary
+      assistant content*; we never request or fabricate hidden reasoning.
+    * ``{kind: "command", command, run_as, asset_id, status, output_excerpt,
+      exit_code, truncated}`` — an ``execute_command`` tool call, joined with the
+      task result when the tool message is present in the transcript.
+    * ``{kind: "search", query|url, status, preview}`` — a read-only tool call.
+    * ``{kind: "tool_result", tool, status}`` — a tool result whose matching call
+      was earlier in the list (kept so ordering stays honest).
+
+    A step with no text and no tool call (an empty assistant turn) is skipped.
+    """
+    steps = []
+    pending = {}  # tool_call_id -> index into steps, to attach the result
+    for message in messages or []:
+        role = message.get("role")
+        if role == "assistant":
+            calls = message.get("tool_calls") or []
+            text = (message.get("content") or "").strip()
+            if text:
+                steps.append({"kind": "thought", "text": text})
+            for call in calls:
+                fn = (call.get("function") or {})
+                name = fn.get("name")
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except (ValueError, TypeError):
+                    args = {}
+                if name == "execute_command":
+                    step = {"kind": "command", "status": "proposed",
+                            "command": args.get("command"), "run_as": args.get("run_as"),
+                            "asset_id": args.get("asset_id"), "output_excerpt": None,
+                            "exit_code": None, "truncated": False}
+                elif name == "web_search":
+                    step = {"kind": "search", "status": "proposed", "query": args.get("query")}
+                elif name == "fetch_page":
+                    step = {"kind": "search", "status": "proposed", "url": args.get("url")}
+                else:
+                    step = {"kind": "tool_result", "status": "proposed", "tool": name}
+                pending[call.get("id")] = len(steps)
+                steps.append(step)
+        elif role == "tool":
+            idx = pending.pop(message.get("tool_call_id"), None)
+            content = message.get("content") or ""
+            if idx is None:
+                # Result without a matching call in this transcript slice.
+                steps.append({"kind": "tool_result", "status": "done", "tool": "tool",
+                              "preview": _excerpt(content)})
+                continue
+            steps[idx]["status"] = "done"
+            steps[idx]["output_excerpt"] = _excerpt(content)
+            outcome = _parse_tool_result(content)
+            if outcome is not None:
+                if "exit_code" in outcome:
+                    steps[idx]["exit_code"] = outcome.get("exit_code")
+                if outcome.get("output_truncated"):
+                    steps[idx]["truncated"] = True
+                if outcome.get("status"):
+                    steps[idx]["status"] = outcome["status"]
+                if outcome.get("error"):
+                    steps[idx]["error"] = outcome["error"]
+    return steps
+
+
+def _excerpt(text, limit=2000):
+    if not text:
+        return None
+    return text if len(text) <= limit else text[:limit] + "…（已截断）"
+
+
+def _parse_tool_result(content):
+    """Best-effort parse of a task result string; never raises on odd content."""
+    if not isinstance(content, str):
+        return None
+    try:
+        data = json.loads(content)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(data, dict):
+        return data
+    return None
+
+
 def refresh_day_memory(db, turn):
     """Re-materialise this turn's day memory the moment the turn completes.
 
@@ -336,7 +428,9 @@ def install_turns(app, transaction, audit, admin, default_model="", search_provi
             raise HTTPException(404, "Role not found")
 
     def view(row):
-        return {**dict(row), "execution_users": json.loads(row["execution_users"]), "payload": json.loads(row["payload"]), "messages": json.loads(row["messages"]), "caller": row["caller"] or row["source"]}
+        data = {**dict(row), "execution_users": json.loads(row["execution_users"]), "payload": json.loads(row["payload"]), "messages": json.loads(row["messages"]), "caller": row["caller"] or row["source"]}
+        data["steps"] = derive_steps(data["messages"])
+        return data
 
     @app.put("/api/v1/roles/{role_id}/model", dependencies=[Depends(admin)])
     def configure_model(role_id: ID, body: RoleModel):

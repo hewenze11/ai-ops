@@ -472,14 +472,16 @@
       "Alertmanager 负责第一时间的原始告警，我们负责第二棒：AI 排查完成后，把“结论”回推到你的 Webhook。" +
       "支持飞书 / 钉钉 / 企业微信 / Slack / Discord，其它地址按通用 JSON 发送（按 URL 主机自动识别）。" +
       "出于安全，内网 / 回环 / 云元数据地址会被拒绝。"));
-    intro.appendChild(table(["状态", "渠道", "地址（已脱敏）", "更新时间"], [[
+    intro.appendChild(table(["状态", "渠道", "地址（已脱敏）", "控制台链接", "更新时间"], [[
       config.configured ? (config.enabled ? "已启用" : "已停用") : "未配置",
-      config.channel || "-", config.url || "-", fmt(config.updated_at)]]));
+      config.channel || "-", config.url || "-", config.console_url || "（未设）", fmt(config.updated_at)]]));
     host.appendChild(intro);
 
     const form = card("配置 / 更新 Webhook");
     const urlInput = el("input"); urlInput.placeholder = "https://oapi.dingtalk.com/robot/send?access_token=...";
     urlInput.value = config.configured ? (config.url || "") : ""; urlInput.style.minWidth = "320px";
+    const consoleInput = el("input"); consoleInput.placeholder = "https://你的控制台地址（可选，用于“查看/继续对话”链接）";
+    consoleInput.value = config.configured ? (config.console_url || "") : ""; consoleInput.style.minWidth = "320px";
     const channelSelect = el("select");
     ["auto", "feishu", "dingtalk", "wecom", "slack", "discord", "generic"].forEach((c) => {
       const o = el("option", "", c); o.value = c; channelSelect.appendChild(o);
@@ -491,8 +493,10 @@
     save.onclick = async () => {
       try {
         const res = await api("PUT", "/api/v1/alert-notify/config",
-          { url: urlInput.value.trim(), channel: channelSelect.value, enabled: true });
-        out.textContent = "已保存：渠道=" + res.channel + "，地址=" + res.url;
+          { url: urlInput.value.trim(), channel: channelSelect.value, enabled: true,
+            console_url: consoleInput.value.trim() || null });
+        out.textContent = "已保存：渠道=" + res.channel + "，地址=" + res.url
+          + (res.console_url ? "，控制台链接=" + res.console_url : "（未设控制台链接）");
       } catch (err) { out.textContent = "失败：" + err.message; }
     };
     test.onclick = async () => {
@@ -506,7 +510,9 @@
     };
     const row = el("div", "fields");
     row.appendChild(channelSelect); row.appendChild(urlInput); row.appendChild(save); row.appendChild(test); row.appendChild(clear);
-    form.appendChild(row); form.appendChild(out);
+    const row2 = el("div", "fields");
+    row2.appendChild(consoleInput);
+    form.appendChild(row); form.appendChild(row2); form.appendChild(out);
     host.appendChild(form);
 
     let deliveries = [];
@@ -1094,11 +1100,49 @@
   }
 
   /* ---------- boot ---------- */
+  // A pushed alert conclusion deep-links here as ``#turn=<id>``. Tapping it on a
+  // phone should land the operator on the chat view with that turn highlighted,
+  // so the notification is a doorway, not a dead end.
+  function focusTurnFromHash() {
+    const hash = (location.hash || "").replace(/^#/, "");
+    if (!hash) return null;
+    const params = new URLSearchParams(hash);
+    const turnId = params.get("turn");
+    return turnId ? turnId : null;
+  }
+  function highlightTurn(turnId) {
+    const cards = document.querySelectorAll("#chat-log .msg");
+    let found = null;
+    cards.forEach((card) => {
+      const meta = card.querySelector(".meta");
+      if (meta && meta.textContent.includes(turnId)) { found = card; }
+    });
+    if (found) {
+      found.classList.add("turn-focus");
+      found.scrollIntoView({ block: "center" });
+    }
+    return found;
+  }
   function boot() {
     const remembered = sessionStorage.getItem("aiops.view");
-    if (remembered === "console" || remembered === "chat") state.view = remembered;
+    const deepTurn = focusTurnFromHash();
+    if (deepTurn) {
+      // A deep link is an explicit intent: show chat, then highlight the turn.
+      state.view = "chat";
+    } else if (remembered === "console" || remembered === "chat") {
+      state.view = remembered;
+    }
     renderNav();
     renderView();
+    if (deepTurn) {
+      // renderView() kicks off async chat loading; retry briefly until the card
+      // exists, then stop. Never busy-loops if the turn is not in the last 100.
+      let tries = 0;
+      const timer = setInterval(() => {
+        tries += 1;
+        if (highlightTurn(deepTurn) || tries >= 20) clearInterval(timer);
+      }, 250);
+    }
   }
   window.addEventListener("beforeunload", () => { token = ""; });
 })();

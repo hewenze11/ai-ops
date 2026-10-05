@@ -39,7 +39,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS alert_notify_config(
  id INTEGER PRIMARY KEY CHECK(id=1),
  url TEXT NOT NULL, channel TEXT NOT NULL, enabled INTEGER NOT NULL,
- created_at REAL NOT NULL, updated_at REAL NOT NULL);
+ console_url TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS alert_notifications(
  seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
  turn_id TEXT, dedupe_key TEXT NOT NULL, url TEXT NOT NULL, channel TEXT NOT NULL,
@@ -88,11 +88,21 @@ CHANNEL_HOSTS = (
 CHANNELS = ("auto", "feishu", "dingtalk", "wecom", "slack", "discord", "generic")
 
 
+MAX_CONSOLE_URL = 2000
+
+
 class NotifyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     url: str = Field(min_length=1, max_length=MAX_URL)
     channel: str = Field(default="auto", max_length=32)
     enabled: bool = True
+    # Optional deep link back to the operator console. When set, every pushed
+    # conclusion carries a "view / continue the conversation" link, so a user
+    # reading it on a phone can tap through to the full turn instead of being
+    # left at a dead-end notification. This is a *display* link the user types
+    # for their own reachable console, so we deliberately do NOT SSRF-block it
+    # (the console is often on a private address); we only require http(s).
+    console_url: str | None = Field(default=None, max_length=MAX_CONSOLE_URL)
 
 
 def classify_channel(url):
@@ -150,6 +160,44 @@ def validate_url(url):
     if _host_is_blocked(parts.hostname):
         raise ValueError("SSRF_BLOCKED_ADDRESS")
     return parts
+
+
+def validate_console_url(url):
+    """A console link is shown to humans, not fetched by us: only require http(s).
+
+    We deliberately do not run the SSRF address check here — the console is
+    frequently on a private/VPN address (that is the whole point of a self-hosted
+    tool), and we never fetch this URL server-side. We only reject non-http(s)
+    schemes and embedded credentials (a userinfo would leak into a chat message).
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        raise ValueError("CONSOLE_URL_UNSUPPORTED_SCHEME")
+    if parts.username or parts.password:
+        raise ValueError("CONSOLE_URL_EMBEDDED_CREDENTIALS")
+    if not parts.hostname:
+        raise ValueError("CONSOLE_URL_MISSING_HOST")
+    return parts
+
+
+def build_console_link(console_url, turn_id):
+    """Compose a deep link the console understands: ``<base>/#turn=<id>``.
+
+    If the base already carries a fragment we keep it and append the anchor with
+    ``&`` instead, so an operator who set ``https://host/#panel=alarms`` is not
+    silently truncated. Returns None when no console_url is configured.
+    """
+    if not console_url:
+        return None
+    base = console_url.strip()
+    if not base:
+        return None
+    anchor = "turn=" + urllib.parse.quote(str(turn_id), safe="")
+    if "#" in base:
+        head, _, frag = base.partition("#")
+        frag = (frag + "&" + anchor) if frag else anchor
+        return head + "#" + frag
+    return base + "#" + anchor
 
 
 def redact_url(url):
@@ -219,16 +267,25 @@ def install_alert_notify(app, transaction, audit, admin):
             validate_url(body.url)
         except ValueError as e:
             raise HTTPException(422, str(e))
+        console_url = (body.console_url or "").strip() or None
+        if console_url is not None:
+            try:
+                validate_console_url(console_url)
+            except ValueError as e:
+                raise HTTPException(422, str(e))
         channel = classify_channel(body.url) if body.channel == "auto" else body.channel
         now = time.time()
         with transaction() as db:
-            db.execute("INSERT INTO alert_notify_config(id,url,channel,enabled,created_at,updated_at) "
-                       "VALUES(1,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET url=excluded.url,"
-                       "channel=excluded.channel,enabled=excluded.enabled,updated_at=excluded.updated_at",
-                       (body.url, channel, 1 if body.enabled else 0, now, now))
+            db.execute("INSERT INTO alert_notify_config(id,url,channel,enabled,console_url,created_at,updated_at) "
+                       "VALUES(1,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET url=excluded.url,"
+                       "channel=excluded.channel,enabled=excluded.enabled,"
+                       "console_url=excluded.console_url,updated_at=excluded.updated_at",
+                       (body.url, channel, 1 if body.enabled else 0, console_url, now, now))
             audit(db, "alert_notify.configured", "alert-notify", "admin",
-                  {"channel": channel, "enabled": body.enabled, "url": redact_url(body.url)})
-        return {"channel": channel, "enabled": body.enabled, "url": redact_url(body.url)}
+                  {"channel": channel, "enabled": body.enabled, "url": redact_url(body.url),
+                   "console_url": console_url})
+        return {"channel": channel, "enabled": body.enabled, "url": redact_url(body.url),
+                "console_url": console_url}
 
     @app.get("/api/v1/alert-notify/config", dependencies=[Depends(admin)])
     def get_config():
@@ -237,7 +294,8 @@ def install_alert_notify(app, transaction, audit, admin):
             if row is None:
                 return {"configured": False}
             return {"configured": True, "channel": row["channel"], "enabled": bool(row["enabled"]),
-                    "url": redact_url(row["url"]), "updated_at": row["updated_at"]}
+                    "url": redact_url(row["url"]), "console_url": row["console_url"],
+                    "updated_at": row["updated_at"]}
 
     @app.delete("/api/v1/alert-notify/config", dependencies=[Depends(admin)])
     def clear_config():
@@ -256,9 +314,12 @@ def install_alert_notify(app, transaction, audit, admin):
             row = db.execute("SELECT * FROM alert_notify_config WHERE id=1").fetchone()
         if row is None:
             raise HTTPException(409, "No alert-notify configuration")
+        console_link = build_console_link(row["console_url"], "test-turn")
+        body = "这是一条测试推送。若你看到它，说明 Webhook 配置正确。"
+        if console_link:
+            body += "\n\n查看 / 继续对话：" + console_link
         try:
-            post_once(row["url"], row["channel"], "[测试] AI Ops 告警外推",
-                      "这是一条测试推送。若你看到它，说明 Webhook 配置正确。")
+            post_once(row["url"], row["channel"], "[测试] AI Ops 告警外推", body)
         except ValueError as e:
             raise HTTPException(422, str(e))
         except Exception as e:
@@ -308,7 +369,7 @@ def _first_alarm_state(payload):
     return None
 
 
-def _conclusion_body(role_id, state, final_text, source, alarm_state):
+def _conclusion_body(role_id, state, final_text, source, alarm_state, console_link=None):
     """Compose the push body. This is a CONCLUSION, not the raw alarm."""
     lines = []
     if alarm_state == "resolved":
@@ -326,6 +387,9 @@ def _conclusion_body(role_id, state, final_text, source, alarm_state):
         lines.append("AI 排查被取消，未产生结论。")
     else:
         lines.append("AI 排查失败，未产生结论（请以 Alertmanager 原始告警为准）。")
+    if console_link:
+        lines.append("")
+        lines.append("查看 / 继续对话：%s" % console_link)
     return "\n".join(lines)
 
 
@@ -350,8 +414,9 @@ def collect_conclusions(transaction, audit, now=None):
                 payload = {}
             alarm_state = _first_alarm_state(payload)
             title = "[已分析] " + (row["title"] or "告警")
+            console_link = build_console_link(cfg["console_url"], row["turn_id"])
             body = _conclusion_body(row["role_id"], row["turn_state"], row["final_text"],
-                                    row["source"], alarm_state)
+                                    row["source"], alarm_state, console_link)
             notify_id = enqueue_notification(
                 db, turn_id=row["turn_id"], dedupe_key="turn:" + row["turn_id"],
                 url=cfg["url"], channel=cfg["channel"], title=title, body=body,

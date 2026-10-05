@@ -146,8 +146,9 @@ Alertmanager 会推 `firing`，也会推 `resolved`。我们**必须处理 `stat
 （均需管理员，除注入端点用触发 token / 内部鉴权）
 
 - `PUT /api/v1/alert-notify/config`：设置外推目标
-  `{"url": "...", "enabled": true, "channel": "auto|feishu|dingtalk|wecom|slack|discord|generic"}`
-  返回时 **URL 中的敏感 query 参数打码**。
+  `{"url": "...", "enabled": true, "channel": "auto|feishu|dingtalk|wecom|slack|discord|generic",
+  "console_url": "https://<你的控制台地址>"}`
+  返回时 **URL 中的敏感 query 参数打码**。`console_url` 可选，见第十一节。
 - `GET /api/v1/alert-notify/config`：读取当前配置（URL 打码）。
 - `DELETE /api/v1/alert-notify/config`：停用并清除。
 - `POST /api/v1/alert-notify/test`：发一条测试推送（验证 URL 通不通）。
@@ -155,8 +156,34 @@ Alertmanager 会推 `firing`，也会推 `resolved`。我们**必须处理 `stat
 - 外推内容来自**角色轮次完成后的 `final_text`**；告警上下文由
   `custom_task_id` / `X-Event-ID` 关联。
 
-## 十一、与既有模块的关系
+## 十一、回指控制台（“查看 / 继续对话”深链）
 
+告警结论推到手机上时，用户往往想“接着看 / 接着聊”，而不是对着一张死通知发呆。
+因此外推配置里多了一个可选字段 **`console_url`**：填好后，每条结论尾部会多一行
+
+```
+查看 / 继续对话：https://<你的控制台>/#turn=<轮次 ID>
+```
+
+在 IM 里点这个链接，浏览器会打开控制台并**自动切到聊天视图、高亮对应轮次**
+（前端读取 `#turn=<id>` 锚点）。这就是“在告警卡片里接着聊”的实现方式——
+**不造 App，用现成 IM 加一个跳转链接**，成本极低。
+
+边界（为什么这样算安全）：
+
+1. **只展示、不抓取**。这是给“人”点的链接，服务端**从不**去 fetch 它，
+   所以**不跑 SSRF 地址黑名单**——自建控制台本来就在私网/VPN 上，这正是它的用法。
+   仅校验必须为 http(s) 且**不得内嵌用户名密码**（避免凭证被带进聊天记录）。
+2. 未配置 `console_url` 时，结论体**完全不出链接行**，行为与之前一致。
+3. 若你填的地址**已带锚点**（如 `https://h/#panel=alarms`），我们保留它并用 `&` 追加，
+   不会把原有锚点截掉。
+4. `#turn=` 里的轮次 ID 会做百分号编码，保证锚点可解析。
+
+> 设计同一原则：**渠道只对接协议，不对接 SDK**；链接只是一个字符串字段，
+> 各 IM 都能显示。真正“能聊”的能力在控制台网页里，不在 IM 里——我们不在
+> ＩＭ 里重造一个对话框。
+
+## 十二、与既有模块的关系
 - **alarms.py**：内置告警日志（已存在）。本功能在其上增加"**结果外推**"，
   不改其默认落日志语义。
 - **custom_tasks.py**：告警入口与 AI 行为（mode）。本功能复用其触发端点。
@@ -165,14 +192,14 @@ Alertmanager 会推 `firing`，也会推 `resolved`。我们**必须处理 `stat
 - **turns.py**：轮次完成后 `final_text` 是外推内容来源；在外推 worker 里
   按 `turn_id` 取，不侵入模型主循环。
 
-## 十二、边界与不做的事
+## 十三、边界与不做的事
 
 - **不做**：替换 Alertmanager 的去噪/分组/静默；不做告警优先级/抢占仲裁。
 - **不做**：渠道 OAuth / 应用注册 / 消息回执。
 - **不做**：保证"必达"——这是尽力外推，失败可见即可；第一棒已由 Alertmanager 兜底。
 - 零基础用户不会配 webhook？→ 由**课程**教会他们配（产品边界之外）。
 
-## 十三、测试计划
+## 十四、测试计划
 
 `tests/test_alert_webhook.py`：
 
@@ -184,3 +211,6 @@ Alertmanager 会推 `firing`，也会推 `resolved`。我们**必须处理 `stat
 6. 外推失败：有界重试后置 `failed`，错误类型可读，**不含密钥**。
 7. URL 含 token 的 query 在 GET 返回里被**打码**。
 8. 测试推送端点工作。
+9. **控制台深链**：`console_url` 校验（允许私网、拒非 http(s) 与内嵌凭证）；
+   配置回读；结论体带“查看 / 继续对话”链接且含 `#turn=<id>`；未配置时**不出**链接；
+   已有锚点用 `&` 追加不被截断。

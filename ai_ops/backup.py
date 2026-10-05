@@ -20,7 +20,7 @@ from pathlib import Path
 
 # Highest schema version this build understands. Restoring a backup written by a
 # newer build is refused: an older binary cannot know what a newer schema means.
-SUPPORTED_SCHEMA = 8
+SUPPORTED_SCHEMA = 9
 # A backup is a plain SQLite file plus a sibling ".meta.json" sidecar.
 META_SUFFIX = ".meta.json"
 

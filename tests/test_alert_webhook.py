@@ -260,3 +260,71 @@ def test_ssrf_failure_is_permanent_not_retried():
     with app.state.transaction() as db:
         row = db.execute("SELECT status,last_error FROM alert_notifications WHERE turn_id='t3'").fetchone()
     assert row["status"] == "failed" and row["last_error"].startswith("SSRF_")
+
+
+# ---- console deep link in the pushed conclusion ----------------------------
+
+def test_console_link_builder_appends_anchor_and_keeps_fragment():
+    assert alert_notify.build_console_link(None, "t1") is None
+    assert alert_notify.build_console_link("", "t1") is None
+    assert alert_notify.build_console_link("https://ops.example.com/", "abc") == \
+        "https://ops.example.com/#turn=abc"
+    # An existing fragment is preserved, not truncated.
+    assert alert_notify.build_console_link("https://ops.example.com/#panel=alarms", "abc") == \
+        "https://ops.example.com/#panel=alarms&turn=abc"
+    # A turn id with a space/plus is percent-encoded so the anchor stays parseable.
+    assert alert_notify.build_console_link("https://h", "a b") == "https://h#turn=a%20b"
+
+
+def test_console_url_validation_allows_private_but_rejects_bad_scheme_and_userinfo():
+    # A private/VPN console address is the normal self-hosted case; allowed.
+    assert alert_notify.validate_console_url("http://10.0.0.5:8765/")
+    import pytest
+    with pytest.raises(ValueError):
+        alert_notify.validate_console_url("file:///etc/passwd")
+    with pytest.raises(ValueError):
+        alert_notify.validate_console_url("https://user:pw@ops.example.com/")
+
+
+def test_config_roundtrip_console_url_and_rejects_bad_one():
+    client = make_client()
+    h = headers()
+    r = client.put("/api/v1/alert-notify/config", headers=h, json={
+        "url": "https://open.feishu.cn/open-apis/bot/v2/hook/x", "channel": "auto",
+        "console_url": "https://ops.example.com"})
+    assert r.status_code == 200 and r.json()["console_url"] == "https://ops.example.com"
+    got = client.get("/api/v1/alert-notify/config", headers=h).json()
+    assert got["console_url"] == "https://ops.example.com"
+    bad = client.put("/api/v1/alert-notify/config", headers=h, json={
+        "url": "https://open.feishu.cn/open-apis/bot/v2/hook/x", "channel": "auto",
+        "console_url": "ftp://ops.example.com"})
+    assert bad.status_code == 422
+
+
+def test_pushed_conclusion_carries_console_link_when_configured():
+    client = make_client()
+    h = headers()
+    client.put("/api/v1/alert-notify/config", headers=h, json={
+        "url": "https://open.feishu.cn/open-apis/bot/v2/hook/x", "channel": "auto",
+        "console_url": "https://ops.example.com"})
+    turn_id = _setup_alarm(client, h)
+    _complete_turn(client, turn_id, "根因：磁盘写满。")
+    app = client.app
+    assert alert_notify.collect_conclusions(app.state.transaction, app.state.audit) == 1
+    row = client.get("/api/v1/alert-notify/deliveries", headers=h).json()[0]
+    assert "查看 / 继续对话" in row["body"]
+    assert "#turn=" + turn_id in row["body"]
+    assert "https://ops.example.com" in row["body"]
+
+
+def test_pushed_conclusion_has_no_link_when_console_url_unset():
+    client = make_client()
+    h = headers()
+    client.put("/api/v1/alert-notify/config", headers=h,
+               json={"url": "https://open.feishu.cn/open-apis/bot/v2/hook/x", "channel": "auto"})
+    turn_id = _setup_alarm(client, h)
+    _complete_turn(client, turn_id, "结论。")
+    app = client.app
+    assert alert_notify.collect_conclusions(app.state.transaction, app.state.audit) == 1
+    row = client.get("/api/v1/alert-notify/deliveries", headers=h).json()[0]
+    assert "查看 / 继续对话" not in row["body"]

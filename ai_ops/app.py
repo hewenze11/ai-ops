@@ -141,7 +141,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     with sqlite3.connect(path) as db:
         db.row_factory = sqlite3.Row
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8):
+        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9):
             raise ValueError("Unsupported database schema; refusing to modify it")
         from .custom_tasks import SCHEMA as CUSTOM_SCHEMA
         from .turns import SCHEMA as TURN_SCHEMA, migrate, enqueue_turn, set_turn_state
@@ -170,6 +170,13 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
             if name not in asset_columns:
                 db.execute("ALTER TABLE assets ADD COLUMN " + name + " " + kind)
         db.execute("PRAGMA user_version=8")
+        # Schema 9: the alert-notify config gains an optional console_url so a
+        # pushed conclusion can carry a tap-through link back to the console.
+        # Existing installs created the table without the column.
+        notify_columns = {r[1] for r in db.execute("PRAGMA table_info(alert_notify_config)")}
+        if "console_url" not in notify_columns:
+            db.execute("ALTER TABLE alert_notify_config ADD COLUMN console_url TEXT")
+        db.execute("PRAGMA user_version=9")
         # Register the control host itself once. It is a normal asset with a
         # 'local' transport: no credential, no agent, but the same task, lease
         # and audit path as everything else. Disable with

@@ -41,7 +41,7 @@ Agent 脚本会创建两个最小权限账号（`aiops_read` 只读、`aiops_ops
 - 统一角色轮次队列：聊天、触发/定时输入及手工命令共享角色顺序；一轮支持多次模型/工具交互。
 - **Web 控制台第一版**：后端内嵌的零依赖静态页（`ai_ops/console/`），只读优先。凭据只存标签页内存、不落浏览器存储；访问 `/` 即可打开。见 [docs/console.md](docs/console.md)。
 - **消息渠道第一层**：飞书/企业微信/微信共用同一角色的记忆与串行队列；一次性配对码绑定身份，按身份隔离出站。见 [docs/channels.md](docs/channels.md)。
-- **告警结果外推**：Alertmanager 是第一棒（原始告警），AI Ops 是第二棒（AI 排查后的结论）——推的是“结论”不是“原始告警”。一个 Webhook 覆盖飞书/钉钉/企微/Slack/Discord（按 URL 主机自动识别）；持久化 outbox + 有界重试；**SSRF 防护**为安全底线。见 [docs/alert-webhook.md](docs/alert-webhook.md)。
+- **告警结果外推**：Alertmanager 是第一棒（原始告警），AI Ops 是第二棒（AI 排查后的结论）——推的是“结论”不是“原始告警”。一个 Webhook 覆盖飞书/钉钉/企微/Slack/Discord（按 URL 主机自动识别）；持久化 outbox + 有界重试；**SSRF 防护**为安全底线。可配置**控制台深链**（`console_url`）：结论尾部带“查看 / 继续对话”链接（`#turn=<id>`），在 IM 里点开就回到对应轮次——不造 App，用现成 IM 加一个跳转。见 [docs/alert-webhook.md](docs/alert-webhook.md)。
 - **管理写入面**：控制台可改名/备注资产/允许账号、编辑文档、创建角色、注册资产、创建/编辑定制任务，以及管理并注入本地 Skills（Skill 是数据不是代码）。一次性凭据只在创建时出示。见 [docs/management.md](docs/management.md)。
 - **本机 Connector（控制主机纳管）**：控制服务所在的机器默认纳入管理，接入方式为 `local`——无需 Agent、无需 SSH 凭据，与其它资产共用同一套任务、租约、权限白名单与审计通道。本机凭据不可用（fail-closed），停用仅隐藏资产、保留历史。见 [docs/connector-local.md](docs/connector-local.md)。
 - **资产生命周期与失联事件**：资产删除拆成“注销（保留历史、可恢复）”与“彻底删除（需回显 ID、未决执行拒删）”；失联检测带防抖（90s）与限频（1800s），事件复用同一告警 Webhook 出站，平台不自行探测、不重派任务。见 [docs/asset-lifecycle.md](docs/asset-lifecycle.md)。

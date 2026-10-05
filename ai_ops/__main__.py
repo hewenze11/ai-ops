@@ -44,6 +44,10 @@ def main():
         from .alert_notify import start_alert_notify_worker
         stop, thread = start_alert_notify_worker(app.state.transaction, app.state.audit)
         background.append((stop, thread))
+    if os.environ.get("AI_OPS_OFFLINE_WATCH_ENABLED", "1") == "1":
+        from .asset_lifecycle import start_offline_worker
+        stop, thread = start_offline_worker(app.state.transaction, app.state.audit)
+        background.append((stop, thread))
     try:
         uvicorn.run(app, host=os.environ.get("AI_OPS_HOST", "127.0.0.1"), port=port, access_log=False)
     finally:

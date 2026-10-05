@@ -155,12 +155,14 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         from .leases import SCHEMA as LEASE_SCHEMA, migrate as migrate_leases
         from .connector_ssh import SCHEMA as CONNECTOR_SCHEMA, migrate as migrate_connector
         from .connector_local import SCHEMA as LOCAL_SCHEMA, migrate as migrate_local
-        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA + LEASE_SCHEMA + CONNECTOR_SCHEMA + LOCAL_SCHEMA + MEMORY_SCHEMA + ALARM_SCHEMA + CHANNEL_SCHEMA + ALERT_NOTIFY_SCHEMA + MANAGEMENT_SCHEMA)
+        from .asset_lifecycle import SCHEMA as LIFECYCLE_SCHEMA, migrate as migrate_lifecycle
+        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA + LEASE_SCHEMA + CONNECTOR_SCHEMA + LOCAL_SCHEMA + LIFECYCLE_SCHEMA + MEMORY_SCHEMA + ALARM_SCHEMA + CHANNEL_SCHEMA + ALERT_NOTIFY_SCHEMA + MANAGEMENT_SCHEMA)
         migrate(db)
         migrate_execution(db)
         migrate_leases(db)
         migrate_connector(db)
         migrate_local(db)
+        migrate_lifecycle(db)
         # Schema 7: asset credential rotation keeps a previous token hash for an
         # optional grace window so a rollout can overlap token switches.
         asset_columns = {r[1] for r in db.execute("PRAGMA table_info(assets)")}
@@ -266,6 +268,8 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     install_connector(app, transaction, audit, admin)
     from .connector_local import install_local_connector, start_local_connector_workers
     install_local_connector(app, transaction, audit, admin)
+    from .asset_lifecycle import install_asset_lifecycle
+    install_asset_lifecycle(app, transaction, audit, admin)
     from .console import install_console
     install_console(app, transaction, audit, admin)
     from .channels import install_channels
@@ -320,6 +324,9 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
             # so it never displaces the operator's own inventory at the top.
             local_id = local['asset_id'] if local is not None else None
             rows = [r for r in db.execute("SELECT * FROM assets ORDER BY id") if r["id"] != hidden]
+            # Retired assets are kept (history is evidence) but hidden from the
+            # default inventory; they remain reachable by id and via lifecycle.
+            rows = [r for r in rows if r["retired_at"] is None]
             rows.sort(key=lambda r: (r["id"] == local_id, r["id"]))
             return [{"id": r["id"], "name": r["name"], "allowed_users": json.loads(r["allowed_users"]), "notes": r["notes"],
                      "connection_type": connection_view(db, r["id"])["connection_type"]}

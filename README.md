@@ -44,6 +44,7 @@ Agent 脚本会创建两个最小权限账号（`aiops_read` 只读、`aiops_ops
 - **告警结果外推**：Alertmanager 是第一棒（原始告警），AI Ops 是第二棒（AI 排查后的结论）——推的是“结论”不是“原始告警”。一个 Webhook 覆盖飞书/钉钉/企微/Slack/Discord（按 URL 主机自动识别）；持久化 outbox + 有界重试；**SSRF 防护**为安全底线。见 [docs/alert-webhook.md](docs/alert-webhook.md)。
 - **管理写入面**：控制台可改名/备注资产/允许账号、编辑文档、创建角色、注册资产、创建/编辑定制任务，以及管理并注入本地 Skills（Skill 是数据不是代码）。一次性凭据只在创建时出示。见 [docs/management.md](docs/management.md)。
 - **本机 Connector（控制主机纳管）**：控制服务所在的机器默认纳入管理，接入方式为 `local`——无需 Agent、无需 SSH 凭据，与其它资产共用同一套任务、租约、权限白名单与审计通道。本机凭据不可用（fail-closed），停用仅隐藏资产、保留历史。见 [docs/connector-local.md](docs/connector-local.md)。
+- **资产生命周期与失联事件**：资产删除拆成“注销（保留历史、可恢复）”与“彻底删除（需回显 ID、未决执行拒删）”；失联检测带防抖（90s）与限频（1800s），事件复用同一告警 Webhook 出站，平台不自行探测、不重派任务。见 [docs/asset-lifecycle.md](docs/asset-lifecycle.md)。
 - **P3 真机验收已完成**：12 项端到端检查全部通过（含控制台真机截图）。见 [docs/p3-acceptance-report.md](docs/p3-acceptance-report.md)。
 - **真机连贯性联调已完成**：用真实付费模型在预览机跑 11 项检查全通过（自我认知/Skill 与文档角色隔离注入/权限注入/confirm 真机执行/同日与跨日记忆回忆/多步连贯/产品自我认知）。模型知识自己属于「AI Ops」产品、产品提供哪些能力面、以及哪些才是它自己的工具。见 [docs/system-self-doc.md](docs/system-self-doc.md) 与 [docs/model-turns.md](docs/model-turns.md)。
 - OpenAI兼容模型适配器、角色模型覆盖、独立账号/确认校验、模型调用与回复审计。

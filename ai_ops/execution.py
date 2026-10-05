@@ -119,6 +119,11 @@ def install_execution(app, transaction, audit, admin, agent_auth, policy=None):
             db.execute('INSERT INTO agent_presence(asset_id,instance_id,agent_version,protocol_version,last_seen,busy,busy_by,busy_task) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(asset_id) DO UPDATE SET instance_id=excluded.instance_id,agent_version=excluded.agent_version,protocol_version=excluded.protocol_version,last_seen=excluded.last_seen,busy=excluded.busy,busy_by=excluded.busy_by,busy_task=excluded.busy_task', (asset_id, body.instance_id, body.agent_version, body.protocol_version, now, 1 if body.busy else 0, body.busy_by, body.busy_task))
             if old is None or old['instance_id'] != body.instance_id or now - old['last_seen'] > 30:
                 audit(db, 'agent.connected', asset_id, 'agent:' + asset_id, body.model_dump())
+            # A host that just came back clears the offline debounce, so it can
+            # emit a fresh offline event only after it goes silent again.
+            if old is not None and now - old['last_seen'] > 30:
+                from .asset_lifecycle import note_seen
+                db.execute('DELETE FROM asset_offline_events WHERE asset_id=?', (asset_id,))
             return {'accepted': True, 'server_time': now, 'offline_after_seconds': 30}
 
     def busy_owner(db, asset_id, now):

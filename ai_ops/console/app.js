@@ -284,7 +284,7 @@
       ["custom", "定制任务"], ["turns-loop", "触发器事件"], ["turns", "角色轮次"], ["alert-notify", "告警外推"],
     ]],
     ["资产与知识", [
-      ["assets", "资产"], ["local", "本机"], ["skills", "Skills"], ["documents", "文档"], ["memory", "记忆"],
+      ["assets", "资产"], ["asset-life", "资产生命周期"], ["local", "本机"], ["skills", "Skills"], ["documents", "文档"], ["memory", "记忆"],
     ]],
     ["系统", [
       ["roles", "角色"], ["channels", "渠道"], ["audit", "审计"], ["output", "输出"],
@@ -318,7 +318,7 @@
       overview: loadOverview, attention: loadAttention, alarms: loadAlarms, tasks: loadTasks,
       turns: loadTurns, custom: loadCustom, "turns-loop": loadEvents, documents: loadDocuments,
       "alert-notify": loadAlertNotify,
-      assets: loadAssets, local: loadLocalConnector, channels: loadChannels, skills: loadSkills, memory: loadMemory, audit: loadAudit, output: loadOutput,
+      assets: loadAssets, "asset-life": loadAssetLifecycle, local: loadLocalConnector, channels: loadChannels, skills: loadSkills, memory: loadMemory, audit: loadAudit, output: loadOutput,
       roles: loadRoles,
     };
     loaders[state.tab](holder).catch((err) => holder.appendChild(el("div", "card error", "加载失败：" + err.message)));
@@ -989,7 +989,62 @@
     };
     box.appendChild(el("p", "muted small", "接入方式与凭据在这里不可改；token 轮换请用管理员 API。"));
     box.appendChild(fields); box.appendChild(notes); box.appendChild(save); box.appendChild(feedback);
+    // Lifecycle: retire (reversible, keeps history) vs purge (destructive, typed confirm).
+    const life = el("div", "fields");
+    life.style.marginTop = "12px";
+    const retire = el("button", "ghost", "注销（保留历史，可恢复）");
+    retire.onclick = async () => {
+      if (!confirm("注销该资产？它会从资产列表隐藏，但历史任务与审计保留，可恢复。")) return;
+      try { await api("POST", "/api/v1/assets/" + record.id + "/retire", { note: "from console" }); $("modal").hidden = true; say("资产已注销（历史保留）"); renderConsole(); }
+      catch (err) { feedback.textContent = err.message; }
+    };
+    const purge = el("button", "ghost danger", "彻底删除（不可恢复）");
+    purge.onclick = async () => {
+      const typed = prompt("彻底删除会连同该资产的任务、输出、审计一起清除，不可恢复。\n请输入资产 ID 以确认：");
+      if (typed !== record.id) { if (typed !== null) feedback.textContent = "确认 ID 不匹配，已取消。"; return; }
+      try { await api("POST", "/api/v1/assets/" + record.id + "/purge", { confirm_asset_id: record.id }); $("modal").hidden = true; say("资产已彻底删除"); renderConsole(); }
+      catch (err) { feedback.textContent = err.message; }
+    };
+    life.appendChild(retire); life.appendChild(purge);
+    box.appendChild(life);
     modalContent("资产 " + record.id, box);
+  }
+
+  async function loadAssetLifecycle(host) {
+    const offline = await api("GET", "/api/v1/assets/offline");
+    const box = card("当前失联资产（超过在线阈值）");
+    box.appendChild(el("p", "muted small", "平台只负责“检测到失联”，并将事件交给已配置的告警 Webhook；不会自动重派任务，也不会去探测该主机。"));
+    box.appendChild(table(["资产", "名称", "静默（秒）", "最后心跳"],
+      offline.map((r) => [r.asset_id, r.name || "-", r.silent_for, fmt(r.last_seen)])));
+    host.appendChild(box);
+    const assets = await api("GET", "/api/v1/assets");
+    const retired = card("历史 / 注销资产（默认隐藏，可恢复）");
+    const holder = el("div", "");
+    retired.appendChild(holder);
+    host.appendChild(retired);
+    holder.appendChild(el("p", "muted small", "注销的资产不会出现在资产列表；输入 ID 可查询其生命周期与失联事件。"));
+    const row = el("div", "fields");
+    const idInput = el("input"); idInput.placeholder = "资产 ID";
+    const look = el("button", "small", "查询");
+    const out = el("div", "");
+    look.onclick = async () => {
+      out.textContent = "";
+      try {
+        const life = await api("GET", "/api/v1/assets/" + idInput.value.trim() + "/lifecycle");
+        out.appendChild(el("p", "small", "retired=" + life.retired + "，retired_at=" + fmt(life.retired_at)));
+        if (life.retire) out.appendChild(el("p", "muted small", "注销说明：" + (life.retire.retire_note || "（无）")));
+        if (life.offline_events.length) {
+          out.appendChild(table(["时间", "静默（秒）", "已推送"], life.offline_events.map((e) => [fmt(e.emitted_at), e.silent_for, e.delivered ? "是" : "否"])));
+        } else { out.appendChild(el("p", "muted small", "无失联事件记录。")); }
+        if (life.retired) {
+          const back = el("button", "small", "恢复（取消注销）");
+          back.onclick = async () => { try { await api("POST", "/api/v1/assets/" + idInput.value.trim() + "/unretire"); say("已恢复"); renderConsole(); } catch (err) { alert(err.message); } };
+          out.appendChild(back);
+        }
+      } catch (err) { out.appendChild(el("p", "error small", "查询失败：" + err.message)); }
+    };
+    row.appendChild(idInput); row.appendChild(look);
+    holder.appendChild(row); holder.appendChild(out);
   }
 
   async function loadMemory(host) {

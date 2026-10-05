@@ -43,6 +43,7 @@ Agent 脚本会创建两个最小权限账号（`aiops_read` 只读、`aiops_ops
 - **消息渠道第一层**：飞书/企业微信/微信共用同一角色的记忆与串行队列；一次性配对码绑定身份，按身份隔离出站。见 [docs/channels.md](docs/channels.md)。
 - **告警结果外推**：Alertmanager 是第一棒（原始告警），AI Ops 是第二棒（AI 排查后的结论）——推的是“结论”不是“原始告警”。一个 Webhook 覆盖飞书/钉钉/企微/Slack/Discord（按 URL 主机自动识别）；持久化 outbox + 有界重试；**SSRF 防护**为安全底线。见 [docs/alert-webhook.md](docs/alert-webhook.md)。
 - **管理写入面**：控制台可改名/备注资产/允许账号、编辑文档、创建角色、注册资产、创建/编辑定制任务，以及管理并注入本地 Skills（Skill 是数据不是代码）。一次性凭据只在创建时出示。见 [docs/management.md](docs/management.md)。
+- **本机 Connector（控制主机纳管）**：控制服务所在的机器默认纳入管理，接入方式为 `local`——无需 Agent、无需 SSH 凭据，与其它资产共用同一套任务、租约、权限白名单与审计通道。本机凭据不可用（fail-closed），停用仅隐藏资产、保留历史。见 [docs/connector-local.md](docs/connector-local.md)。
 - **P3 真机验收已完成**：12 项端到端检查全部通过（含控制台真机截图）。见 [docs/p3-acceptance-report.md](docs/p3-acceptance-report.md)。
 - **真机连贯性联调已完成**：用真实付费模型在预览机跑 11 项检查全通过（自我认知/Skill 与文档角色隔离注入/权限注入/confirm 真机执行/同日与跨日记忆回忆/多步连贯/产品自我认知）。模型知识自己属于「AI Ops」产品、产品提供哪些能力面、以及哪些才是它自己的工具。见 [docs/system-self-doc.md](docs/system-self-doc.md) 与 [docs/model-turns.md](docs/model-turns.md)。
 - OpenAI兼容模型适配器、角色模型覆盖、独立账号/确认校验、模型调用与回复审计。
@@ -53,7 +54,7 @@ Agent 脚本会创建两个最小权限账号（`aiops_read` 只读、`aiops_ops
 
 ## 明确尚未实现
 
-OpenClaw 集成（已定：不自研 fork，见 docs/self-built-route.md）、模型生成的**高质量梗概**（按天分层记忆已实现，见 docs/memory.md）、**内置告警日志已实现（见 docs/alarms.md）**、**Web 控制台第一版已实现（见 docs/console.md）**、**消息渠道第一层已实现（见 docs/channels.md）**、**管理写入面（角色创建/资产注册/文档/Skills/定制任务创建编辑）已实现（见 docs/management.md）**、飞书/微信的**真实出站发送与平台签名校验**（属部署侧）仍需完成。原始输出归档与运行中取消已在协议 1.1 实现，但仅限声明 1.1 的 Agent；`POST /tasks` 仍是管理员单命令入口；模型聊天使用 `/api/v1/roles/{id}/messages`，模型只能通过受控工具创建该轮次的子任务。SSH Connector、输出保留配额、备份恢复、输出/审计的敏感信息脱敏、以及凭据轮换（资产 token 轮换 + admin token 热轮换）已实现（见 `docs/` 下对应文档）。
+OpenClaw 集成（已定：不自研 fork，见 docs/self-built-route.md）、模型生成的**高质量梗概**（按天分层记忆已实现，见 docs/memory.md）、**内置告警日志已实现（见 docs/alarms.md）**、**Web 控制台第一版已实现（见 docs/console.md）**、**消息渠道第一层已实现（见 docs/channels.md）**、**管理写入面（角色创建/资产注册/文档/Skills/定制任务创建编辑）已实现（见 docs/management.md）**、飞书/微信的**真实出站发送与平台签名校验**（属部署侧）仍需完成。原始输出归档与运行中取消已在协议 1.1 实现，但仅限声明 1.1 的 Agent；`POST /tasks` 仍是管理员单命令入口；模型聊天使用 `/api/v1/roles/{id}/messages`，模型只能通过受控工具创建该轮次的子任务。SSH Connector、**本机 Connector（控制主机纳管，见 docs/connector-local.md）**、输出保留配额、备份恢复、输出/审计的敏感信息脱敏、以及凭据轮换（资产 token 轮换 + admin token 热轮换）已实现（见 `docs/` 下对应文档）。
 
 模型配置与边界见 [docs/model-turns.md](docs/model-turns.md)，执行协议 1.1（心跳、取消、原始输出归档）见 [docs/protocol-v11.md](docs/protocol-v11.md)，Agent 安装与升级见 [docs/operations.md](docs/operations.md)，租约与未知执行处置见 [docs/leases.md](docs/leases.md)。不自动把提示词当命令；模型请求启用非流式响应，遇到不支持的响应或未知执行状态明确停止。
 

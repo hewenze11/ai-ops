@@ -23,6 +23,7 @@ P1 完整后端执行可靠性已基本收口：多步骤轮次、心跳、取�
 - 输出保留与磁盘配额：已完成（时间窗 + 字节预算 + 保留下限 + 上传时分流保护；只清理已终结任务的 finalized 归档，in-flight/unknown 不删；清理写入审计；管理员 usage/prune 接口 + 后台定期清理线程）。
 - cgroup 级后代清理：已完成（Agent cgroup v2 任务组 + cgroup.kill，真机验证 setsid 逃逸进程也能回收；不可写时降级进程组终止）。
 - SSH Connector，资产接入方式二选一：已完成直连执行、租约、取消、可达性检查；主机公钥强制预置并以 RejectPolicy 严格校验，未预置/密钥不匹配即拒绝连接（fail closed，不做 TOFU），真机 smoke 验证错钥 reachable=false。
+- 本机 Connector（控制主机纳管，2026-10-04）：已完成。`ai_ops/connector_local.py`。控制服务所在的机器默认注册为 `connection_type='local'` 的资产，**复用同一套任务/租约/权限白名单/审计通道**（不新造权限与审计）；免凭据、默认存在，凭据置为不可用（fail closed）；停用仅隐藏资产、保留历史（任务外键引用不可硬删）。控制台新增“本机”页签。见 docs/connector-local.md。
 - 协议冻结、跨版本兼容测试、安装/升级流程。
 
 ## P2：模型与角色后端

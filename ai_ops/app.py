@@ -154,11 +154,13 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         from .execution import SCHEMA as EXEC_SCHEMA, migrate as migrate_execution
         from .leases import SCHEMA as LEASE_SCHEMA, migrate as migrate_leases
         from .connector_ssh import SCHEMA as CONNECTOR_SCHEMA, migrate as migrate_connector
-        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA + LEASE_SCHEMA + CONNECTOR_SCHEMA + MEMORY_SCHEMA + ALARM_SCHEMA + CHANNEL_SCHEMA + ALERT_NOTIFY_SCHEMA + MANAGEMENT_SCHEMA)
+        from .connector_local import SCHEMA as LOCAL_SCHEMA, migrate as migrate_local
+        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA + LEASE_SCHEMA + CONNECTOR_SCHEMA + LOCAL_SCHEMA + MEMORY_SCHEMA + ALARM_SCHEMA + CHANNEL_SCHEMA + ALERT_NOTIFY_SCHEMA + MANAGEMENT_SCHEMA)
         migrate(db)
         migrate_execution(db)
         migrate_leases(db)
         migrate_connector(db)
+        migrate_local(db)
         # Schema 7: asset credential rotation keeps a previous token hash for an
         # optional grace window so a rollout can overlap token switches.
         asset_columns = {r[1] for r in db.execute("PRAGMA table_info(assets)")}
@@ -166,6 +168,12 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
             if name not in asset_columns:
                 db.execute("ALTER TABLE assets ADD COLUMN " + name + " " + kind)
         db.execute("PRAGMA user_version=8")
+        # Register the control host itself once. It is a normal asset with a
+        # 'local' transport: no credential, no agent, but the same task, lease
+        # and audit path as everything else. Disable with
+        # AI_OPS_LOCAL_CONNECTOR_ENABLED=0 before startup.
+        from .connector_local import ensure_local_asset
+        ensure_local_asset(db)
         # Do not repeat a provider call whose response was lost during a crash.
         interrupted = db.execute("SELECT id FROM role_turns WHERE state='calling'").fetchall()
         for row in interrupted:
@@ -256,6 +264,8 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     install_leases(app, transaction, audit, admin)
     from .connector_ssh import install_connector, start_connector_workers
     install_connector(app, transaction, audit, admin)
+    from .connector_local import install_local_connector, start_local_connector_workers
+    install_local_connector(app, transaction, audit, admin)
     from .console import install_console
     install_console(app, transaction, audit, admin)
     from .channels import install_channels
@@ -303,8 +313,17 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     def list_assets():
         with transaction() as db:
             from .connector_ssh import connection_view
+            from .connector_local import local_asset_ids
+            local = local_asset_ids(db)
+            hidden = local['asset_id'] if (local is not None and not local['enabled']) else None
+            # Operator-registered assets come first; the control host sorts last
+            # so it never displaces the operator's own inventory at the top.
+            local_id = local['asset_id'] if local is not None else None
+            rows = [r for r in db.execute("SELECT * FROM assets ORDER BY id") if r["id"] != hidden]
+            rows.sort(key=lambda r: (r["id"] == local_id, r["id"]))
             return [{"id": r["id"], "name": r["name"], "allowed_users": json.loads(r["allowed_users"]), "notes": r["notes"],
-                     "connection_type": connection_view(db, r["id"])["connection_type"]} for r in db.execute("SELECT * FROM assets ORDER BY id")]
+                     "connection_type": connection_view(db, r["id"])["connection_type"]}
+                    for r in rows]
 
     @app.post("/api/v1/assets/{asset_id}/rotate-token", dependencies=[Depends(admin)])
     def rotate_asset_token(asset_id: str, body: RotateToken):

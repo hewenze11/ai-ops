@@ -32,6 +32,10 @@ def main():
         from .connector_ssh import start_connector_workers
         stop, threads = start_connector_workers(app, app.state.transaction, app.state.audit)
         background.append((stop, threads[0] if threads else None))
+    if os.environ.get("AI_OPS_LOCAL_CONNECTOR_ENABLED", "1") == "1":
+        from .connector_local import start_local_connector_workers
+        stop, thread = start_local_connector_workers(app, app.state.transaction, app.state.audit)
+        background.append((stop, thread))
     if os.environ.get("AI_OPS_RETENTION_ENABLED", "1") == "1":
         from .retention import start_retention_worker
         stop, thread = start_retention_worker(app.state.transaction, app.state.audit, app.state.retention_policy)

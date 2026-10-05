@@ -284,7 +284,7 @@
       ["custom", "定制任务"], ["turns-loop", "触发器事件"], ["turns", "角色轮次"], ["alert-notify", "告警外推"],
     ]],
     ["资产与知识", [
-      ["assets", "资产"], ["skills", "Skills"], ["documents", "文档"], ["memory", "记忆"],
+      ["assets", "资产"], ["local", "本机"], ["skills", "Skills"], ["documents", "文档"], ["memory", "记忆"],
     ]],
     ["系统", [
       ["roles", "角色"], ["channels", "渠道"], ["audit", "审计"], ["output", "输出"],
@@ -318,7 +318,7 @@
       overview: loadOverview, attention: loadAttention, alarms: loadAlarms, tasks: loadTasks,
       turns: loadTurns, custom: loadCustom, "turns-loop": loadEvents, documents: loadDocuments,
       "alert-notify": loadAlertNotify,
-      assets: loadAssets, channels: loadChannels, skills: loadSkills, memory: loadMemory, audit: loadAudit, output: loadOutput,
+      assets: loadAssets, local: loadLocalConnector, channels: loadChannels, skills: loadSkills, memory: loadMemory, audit: loadAudit, output: loadOutput,
       roles: loadRoles,
     };
     loaders[state.tab](holder).catch((err) => holder.appendChild(el("div", "card error", "加载失败：" + err.message)));
@@ -888,6 +888,38 @@
           table(["在线", "最近心跳", "未完成任务"], [[status.online ? "在线" : "离线", status.presence ? fmt(status.presence.last_seen) : "-", status.unfinished_tasks.length]]));
       } catch (err) { /* ssh assets have no agent presence */ }
     }
+  }
+
+  async function loadLocalConnector(host) {
+    let config = { enabled: false, asset_id: null };
+    try { config = await api("GET", "/api/v1/local-connector"); } catch (err) { /* show state anyway */ }
+    const box = card("本机（控制服务所在的机器）");
+    box.appendChild(el("p", "muted small", "本机默认纳入管理：无需安装 Agent、无需 SSH 凭据，与其它资产共用同一套任务、租约与审计通道。对本机执行命令须使用“允许账号”中的账号。"));
+    box.appendChild(table(["状态", "资产 ID", "允许账号", "默认执行账号"], [[
+      config.enabled ? "已启用" : "已停用", config.asset_id || "-",
+      config.allowed_users ? config.allowed_users.join(", ") : "-", config.run_as || "-",
+    ]]));
+    const actions = el("div", "fields");
+    if (config.enabled) {
+      const off = el("button", "small", "停用本机纳管");
+      off.onclick = async () => {
+        try { await api("POST", "/api/v1/local-connector/disable"); say("已停用本机纳管"); renderConsole(); }
+        catch (err) { alert("失败：" + err.message); }
+      };
+      actions.appendChild(off);
+      actions.appendChild(el("p", "muted small", "停用后会从资产列表隐藏；历史任务与审计记录仍保留。"));
+    } else {
+      const on = el("button", "small", "启用本机纳管");
+      on.onclick = async () => {
+        try { await api("POST", "/api/v1/local-connector/enable"); say("已启用本机纳管"); renderConsole(); }
+        catch (err) { alert("失败：" + err.message); }
+      };
+      actions.appendChild(on);
+    }
+    box.appendChild(actions);
+    host.appendChild(box);
+    host.appendChild(card("提示")).appendChild(el("p", "muted small",
+      "本机是控制端自己：对它执行命令相当于在“大脑”里动刀。建议把它的允许账号收窄到最小，风险高的操作优先走 confirm 审批。"));
   }
 
   function assetCreator() {

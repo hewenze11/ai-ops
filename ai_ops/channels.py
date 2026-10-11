@@ -37,6 +37,7 @@ from fastapi import Depends, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from .models import Identifier as ID
+from . import account_grants
 
 # Channel names are a small closed set for now; a new transport is a real plumbing
 # change, so we validate rather than accept arbitrary strings.
@@ -65,6 +66,7 @@ class Pairing(BaseModel):
     role_id: ID
     mode: str = Field(default="confirm")
     execution_users: list[str] = Field(default_factory=list, max_length=100)
+    execution_grants: list[account_grants.Grant] = Field(default_factory=list, max_length=100)
     ttl_seconds: int = Field(default=3600, ge=60, le=604800)
 
 
@@ -82,6 +84,10 @@ def install_channels(app, transaction, audit, admin, admin_token_provider):
     """Register channel APIs. ``admin_token_provider`` mirrors custom_tasks: the
     channel bridge authenticates with the CURRENT admin credential, re-read on
     every call so a rotated token is honoured without a restart."""
+    with transaction() as db:
+        for table in ('channel_pairing', 'channel_identities'):
+            if 'execution_grants' not in {r[1] for r in db.execute('PRAGMA table_info(' + table + ')')}:
+                db.execute('ALTER TABLE ' + table + " ADD COLUMN execution_grants TEXT NOT NULL DEFAULT '[]'")
     if isinstance(admin_token_provider, str):
         admin_token_provider = (lambda value: (lambda: value))(admin_token_provider)
 
@@ -95,7 +101,7 @@ def install_channels(app, transaction, audit, admin, admin_token_provider):
             raise HTTPException(403, "Invalid channel bridge credential")
 
     def view_identity(row):
-        return {**dict(row), "execution_users": json.loads(row["execution_users"])}
+        return {**dict(row), "execution_users": json.loads(row["execution_users"]), 'execution_grants': json.loads(row['execution_grants'])}
 
     @app.post("/api/v1/channels/pairings", dependencies=[Depends(admin)], status_code=201)
     def create_pairing(body: Pairing):
@@ -106,9 +112,13 @@ def install_channels(app, transaction, audit, admin, admin_token_provider):
         with transaction() as db:
             if not db.execute("SELECT 1 FROM roles WHERE id=?", (body.role_id,)).fetchone():
                 raise HTTPException(404, "Role not found")
-            db.execute("INSERT INTO channel_pairing VALUES(?,?,?,?,?,NULL,?)",
+            from .role_lifecycle import require_active
+            require_active(db, body.role_id)
+            grants = account_grants.resolve_input(db, body.execution_grants, body.execution_users)
+            db.execute("INSERT INTO channel_pairing(code_hash,role_id,mode,execution_users,expires_at,used_at,created_at) VALUES(?,?,?,?,?,NULL,?)",
                        (hashlib.sha256(code.encode()).hexdigest(), body.role_id, body.mode,
-                        json.dumps(body.execution_users), now + body.ttl_seconds, now))
+                        json.dumps(sorted({g['username'] for g in grants})), now + body.ttl_seconds, now))
+            db.execute('UPDATE channel_pairing SET execution_grants=? WHERE code_hash=?', (json.dumps(grants), hashlib.sha256(code.encode()).hexdigest()))
             audit(db, "channel.pairing_created", body.role_id, "admin",
                   {"mode": body.mode, "ttl_seconds": body.ttl_seconds})
         # The code is shown once, like a trigger token; only its hash is stored.
@@ -158,10 +168,13 @@ def install_channels(app, transaction, audit, admin, admin_token_provider):
                     raise HTTPException(409, "Pairing code already used")
                 if row["expires_at"] < now:
                     raise HTTPException(410, "Pairing code expired")
-                db.execute("INSERT INTO channel_identities VALUES(?,?,?,?,?,?,?) "
+                from .role_lifecycle import require_active
+                require_active(db, row['role_id'])
+                db.execute("INSERT INTO channel_identities(channel,user_id,role_id,mode,execution_users,created_at,last_seen) VALUES(?,?,?,?,?,?,?) "
                            "ON CONFLICT(channel,user_id) DO UPDATE SET role_id=excluded.role_id,"
                            "mode=excluded.mode,execution_users=excluded.execution_users,last_seen=excluded.last_seen",
                            (body.channel, body.user_id, row["role_id"], row["mode"], row["execution_users"], now, now))
+                db.execute('UPDATE channel_identities SET execution_grants=? WHERE channel=? AND user_id=?', (row['execution_grants'], body.channel, body.user_id))
                 db.execute("UPDATE channel_pairing SET used_at=? WHERE code_hash=?", (now, row["code_hash"]))
                 audit(db, "channel.paired", body.user_id, "channel-bridge",
                       {"channel": body.channel, "role_id": row["role_id"]})
@@ -187,12 +200,15 @@ def install_channels(app, transaction, audit, admin, admin_token_provider):
                     return {"status": "duplicate", "turn_id": existing["turn_id"], "message_id": existing["id"]}
 
             source_id = "channel:%s:%s" % (body.channel, body.external_id or message_id)
-            users = json.loads(identity["execution_users"])
+            grants = account_grants.validate_grants(db, json.loads(identity['execution_grants']))
+            if json.loads(identity['execution_users']) and not grants:
+                raise HTTPException(409, 'Legacy channel requires pairing with asset-scoped grants')
+            users = sorted({g['username'] for g in grants})
             db.execute("INSERT INTO channel_messages(id,channel,user_id,direction,role_id,text,created_at) VALUES(?,?,?,?,?,?,?)",
                        (inbound_id, body.channel, body.user_id, "inbound", identity["role_id"], body.text, now))
             from .turns import enqueue_turn
             turn_id = enqueue_turn(db, identity["role_id"], "chat", source_id, users,
-                                   identity["mode"], body.text, {}, caller="channel:" + body.channel)
+                                   identity["mode"], body.text, {}, caller="channel:" + body.channel, grants=grants)
             db.execute("UPDATE channel_messages SET turn_id=? WHERE id=?", (turn_id, inbound_id))
             db.execute("UPDATE channel_identities SET last_seen=? WHERE channel=? AND user_id=?",
                        (now, body.channel, body.user_id))
@@ -232,7 +248,11 @@ def install_channels(app, transaction, audit, admin, admin_token_provider):
             if mark == "1" and result:
                 db.execute("UPDATE channel_messages SET delivered_at=? WHERE seq IN (%s)" %
                            ",".join("?" * len(result)), [time.time()] + [r["seq"] for r in result])
-        return {"messages": result, "cursor": result[-1]["seq"] if result else after}
+            # Nonterminal decisions do not advance the reply cursor; otherwise
+            # the eventual final reply for this same inbound message would vanish.
+            pending = db.execute("SELECT t.id AS turn_id,q.id AS question_id,q.question FROM channel_messages m JOIN role_turns t ON t.id=m.turn_id JOIN turn_questions q ON q.turn_id=t.id WHERE m.channel=? AND m.user_id=? AND m.direction='inbound' AND t.state='waiting_user' AND q.state='pending' ORDER BY m.seq LIMIT 100", (channel, user_id)).fetchall()
+            waiting_user = [{**dict(r), 'state': 'waiting_user', 'text': '需要你选择，请打开 AI Ops Web 聊天回答后继续原任务。', 'web_fragment': '#turn=' + r['turn_id']} for r in pending]
+        return {"messages": result, "cursor": result[-1]["seq"] if result else after, 'waiting_user': waiting_user}
 
     @app.get("/api/v1/channels/conversation", dependencies=[Depends(admin)])
     def conversation(channel: str, user_id: str, limit: int = 100):

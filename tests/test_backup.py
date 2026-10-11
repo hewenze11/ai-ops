@@ -2,6 +2,7 @@ import json
 import gc
 import os
 import sqlite3
+from contextlib import closing
 import time
 from pathlib import Path
 
@@ -102,19 +103,11 @@ def test_restore_replaces_live_database_and_keeps_previous(tmp_path, env):
     # POSIX would tolerate an open handle, but the sequence is identical.
     _stop_service(c)
     gc.collect()
-    with sqlite3.connect(path) as db:
+    # sqlite3.Connection's context manager commits/rolls back but does not close.
+    # Explicitly release this verification handle; do not skip the restore test
+    # because its own local variable keeps the database open on Windows.
+    with closing(sqlite3.connect(path)) as db:
         assert db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2
-    # Wait for the filesystem to release the handle from the read above.
-    for _ in range(40):
-        gc.collect()
-        try:
-            os.replace(str(path), str(path) + ".probe")
-            os.replace(str(path) + ".probe", str(path))
-            break
-        except PermissionError:
-            time.sleep(0.25)
-    else:
-        pytest.skip("filesystem still holds the live database; restore is a stop-the-service operation")
 
     result = backup.restore_backup(str(out), str(path))
     # The restored database has the pre-mutation state.

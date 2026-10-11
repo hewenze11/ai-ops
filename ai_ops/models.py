@@ -1,5 +1,11 @@
 """Shared strict base models and identifier constraints (no app import)."""
 from typing import Annotated
+import uuid
+
+
+def new_id(prefix):
+    """Opaque server-generated identifier; existing supplied IDs remain supported."""
+    return prefix + '-' + uuid.uuid4().hex
 
 from pydantic import BaseModel, ConfigDict, StringConstraints
 

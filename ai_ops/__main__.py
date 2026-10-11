@@ -13,17 +13,22 @@ def main():
     app = create_app(os.environ.get("AI_OPS_DB", "data/control.db"), token,
                      os.environ.get("AI_OPS_MODEL", ""), admin_token_file=secret_file,
                      search_provider=search_provider)
+    app.state.enforce_model_readiness = True
     port = int(os.environ.get("AI_OPS_PORT", "8765"))
     background = []
     if os.environ.get("AI_OPS_SCHEDULER_ENABLED", "1") == "1":
         from .scheduler import start_scheduler
         background.append(start_scheduler(app.state.custom_tasks, port, token))
-    if os.environ.get("AI_OPS_MODEL_KEY_FILE"):
+    if os.environ.get('AI_OPS_MODEL_WORKER_ENABLED', '1') == '1':
         from .model_client import OpenAICompatible
         from .model_worker import start_model_workers
         from .memory_worker import start_memory_archiver
-        client = OpenAICompatible(os.environ.get("AI_OPS_MODEL_BASE_URL", ""), os.environ["AI_OPS_MODEL_KEY_FILE"])
-        background.append(start_model_workers(app.state.role_engine, client))
+        client = None
+        if os.environ.get("AI_OPS_MODEL_KEY_FILE"):
+            client = OpenAICompatible(os.environ.get("AI_OPS_MODEL_BASE_URL", ""), os.environ["AI_OPS_MODEL_KEY_FILE"])
+        model_worker = start_model_workers(app.state.role_engine, client)
+        background.append(model_worker)
+        app.state.model_worker_threads = [model_worker[1]]
         # Let the role's own model author each day's memory archive, off the
         # context path. Disable with AI_OPS_MEMORY_ARCHIVER_ENABLED=0.
         if os.environ.get("AI_OPS_MEMORY_ARCHIVER_ENABLED", "1") == "1":
@@ -44,6 +49,7 @@ def main():
         from .alert_notify import start_alert_notify_worker
         stop, thread = start_alert_notify_worker(app.state.transaction, app.state.audit)
         background.append((stop, thread))
+        app.state.notification_worker_thread = thread
     if os.environ.get("AI_OPS_OFFLINE_WATCH_ENABLED", "1") == "1":
         from .asset_lifecycle import start_offline_worker
         stop, thread = start_offline_worker(app.state.transaction, app.state.audit)

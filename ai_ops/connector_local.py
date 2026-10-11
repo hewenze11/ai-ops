@@ -182,7 +182,8 @@ class LocalExecutor:
                 AND NOT EXISTS (SELECT 1 FROM tasks prior WHERE prior.turn_id=t.turn_id AND prior.seq<t.seq
                   AND prior.state IN ('queued','awaiting_approval','claimed','unknown'))
                 ORDER BY rt.seq,t.seq LIMIT 1""", (asset_id,)).fetchone()
-            if row is None:
+            from .authority import claim_allowed
+            if row is None or not claim_allowed(db, row):
                 return None
             claim_id = 'local-' + uuid.uuid4().hex
             db.execute("UPDATE tasks SET state='claimed',claim_id=?,claimed_protocol=?,lease_seconds=?,claim_count=claim_count+1,updated_at=? WHERE id=?",
@@ -231,7 +232,7 @@ class LocalExecutor:
         argv = self._build_argv(run_as, command)
         if argv is None:
             result['error_code'] = 'LOCAL_RUN_AS_UNSUPPORTED'
-            result['stderr'] = 'local execution requires a POSIX host'
+            result['stderr'] = 'requested account cannot be represented by this local executor'
             return result
         try:
             proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **popen_kwargs)
@@ -290,9 +291,11 @@ class LocalExecutor:
     @staticmethod
     def _build_argv(run_as, command):
         if os.name != 'posix':
-            # Windows: no sudo, no run_as switching. We run under the service
-            # account via cmd.exe. The editorial guarantee we keep is the same:
-            # authority was already checked against allowed_users at submit time.
+            # Windows has no account-switching implementation. Never execute as
+            # the service account while claiming a different requested identity.
+            import getpass
+            if run_as.casefold() != getpass.getuser().casefold():
+                return None
             comspec = os.environ.get('COMSPEC', 'cmd.exe')
             return [comspec, '/d', '/s', '/c', command]
         # Run under run_as without a login shell, exactly like the SSH connector
@@ -412,7 +415,8 @@ def install_local_connector(app, transaction, audit, admin):
                 return {'enabled': False, 'asset_id': None}
             asset = db.execute('SELECT * FROM assets WHERE id=?', (row['asset_id'],)).fetchone()
             import json
-            return {'enabled': bool(row['enabled']), 'asset_id': row['asset_id'],
+            from .observability import LOCAL_SCOPE
+            return {'enabled': bool(row['enabled']), 'asset_id': row['asset_id'], **LOCAL_SCOPE,
                     'registered_at': row['registered_at'],
                     'allowed_users': json.loads(asset['allowed_users']) if asset else [],
                     'run_as': (json.loads(asset['allowed_users'])[0] if asset and json.loads(asset['allowed_users']) else None)}
@@ -495,5 +499,6 @@ def start_local_connector_workers(app, transaction, audit, poll_seconds=1):
                 stop.wait(poll_seconds)
 
     thread = threading.Thread(target=loop, name='local-connector', daemon=True)
+    app.state.local_worker_thread = thread
     thread.start()
     return stop, thread

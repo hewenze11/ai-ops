@@ -83,6 +83,10 @@ def prune(db, audit, policy, now=None):
     Returns a summary. Never touches in-flight tasks or unresolved unknown ones.
     """
     now = time.time() if now is None else now
+    # Heartbeat samples are short-lived telemetry, not the immutable audit log.
+    db.execute('DELETE FROM heartbeat_samples WHERE received_at<?', (now - 86400,))
+    from .heartbeat_telemetry import prune as prune_heartbeats
+    prune_heartbeats(db, now)
     rows = _archive_rows(db)
     # Group by task so a task's stdout and stderr are pruned together and the
     # "keep the newest N tasks" floor counts tasks, not streams.

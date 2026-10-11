@@ -28,7 +28,10 @@ class OpenAICompatible:
     def complete(self, request_body):
         # Secret is loaded only at the HTTP boundary. Not a model argument,
         # database field, log value, CLI argument, or ordinary execution env var.
-        key = self.key_file.read_text().strip()
+        try:
+            key = self.key_file.read_text().strip()
+        except OSError:
+            raise ModelFailure('MODEL_CREDENTIAL_UNAVAILABLE') from None
         if not key:
             raise ModelFailure("MODEL_CREDENTIAL_EMPTY")
         request = urllib.request.Request(self.url, method="POST", data=json.dumps(request_body).encode(),
@@ -45,7 +48,17 @@ class OpenAICompatible:
             raise
         except Exception:
             raise ModelFailure("MODEL_TRANSPORT_OR_JSON_ERROR") from None
-        return normalize_response(data)
+        # Some gateways echo Authorization in error or assistant payloads.
+        # Never persist this request's credential in calls/context/audit.
+        def redact(value):
+            if isinstance(value, str):
+                return value.replace(key, '[REDACTED]')
+            if isinstance(value, list):
+                return [redact(v) for v in value]
+            if isinstance(value, dict):
+                return {k: redact(v) for k, v in value.items()}
+            return value
+        return normalize_response(redact(data))
 
 
 def normalize_response(data):

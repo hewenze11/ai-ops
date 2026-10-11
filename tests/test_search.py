@@ -112,11 +112,11 @@ def test_web_search_tool_runs_inline_without_assets():
 def test_web_search_tool_spec_exposed_only_when_provider_configured():
     from ai_ops.turns import tool_spec
     names = [t["function"]["name"] for t in tool_spec([], FakeProvider())]
-    assert names == ["web_search", "fetch_page"]
-    assert tool_spec([], None) == []
-    # With an account selected, the execution tool comes first, then search.
+    assert names == ["ask_user", "read_asset_memory", "request_execution_account", "web_search", "fetch_page"]
+    assert [t['function']['name'] for t in tool_spec([], None)] == ['ask_user', 'read_asset_memory', 'request_execution_account']
+    # Decision tool never grants execution authority.
     with_user = [t["function"]["name"] for t in tool_spec(["ops_read"], FakeProvider())]
-    assert with_user == ["execute_command", "web_search", "fetch_page"]
+    assert with_user == ["ask_user", "read_asset_memory", "request_execution_account", "execute_command", "web_search", "fetch_page"]
 
 
 def test_search_failure_is_returned_as_tool_error_not_a_crash():

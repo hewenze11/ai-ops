@@ -59,7 +59,11 @@ class Strict(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
 
+from .heartbeat_telemetry import Telemetry
+
+
 class Heartbeat(Strict):
+    heartbeat_telemetry: Telemetry | None = None
     instance_id: str = Field(min_length=1, max_length=100)
     agent_version: str = Field(min_length=1, max_length=100)
     protocol_version: Literal['1.1', '1.2']
@@ -116,6 +120,19 @@ def install_execution(app, transaction, audit, admin, agent_auth, policy=None):
             agent_auth(db, asset_id, authorization)
             old = db.execute('SELECT * FROM agent_presence WHERE asset_id=?', (asset_id,)).fetchone()
             now = time.time()
+            from .observability import heartbeat_sample
+            if body.heartbeat_telemetry is not None:
+                if body.heartbeat_telemetry.session_id != body.instance_id:
+                    raise HTTPException(422, 'Telemetry session must match instance_id')
+                from .heartbeat_telemetry import record
+                if not record(db, asset_id, body.heartbeat_telemetry, now):
+                    # Late evidence can repair a gap, but cannot roll back busy
+                    # ownership or resurrect a previous startup's presence.
+                    heartbeat_sample(db, asset_id, now)
+                    return {'accepted': True, 'server_time': now, 'offline_after_seconds': 30}
+            heartbeat_sample(db, asset_id, now)
+            from .observability import record_state
+            record_state(db, asset_id, body, now)
             db.execute('INSERT INTO agent_presence(asset_id,instance_id,agent_version,protocol_version,last_seen,busy,busy_by,busy_task) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(asset_id) DO UPDATE SET instance_id=excluded.instance_id,agent_version=excluded.agent_version,protocol_version=excluded.protocol_version,last_seen=excluded.last_seen,busy=excluded.busy,busy_by=excluded.busy_by,busy_task=excluded.busy_task', (asset_id, body.instance_id, body.agent_version, body.protocol_version, now, 1 if body.busy else 0, body.busy_by, body.busy_task))
             if old is None or old['instance_id'] != body.instance_id or now - old['last_seen'] > 30:
                 audit(db, 'agent.connected', asset_id, 'agent:' + asset_id, body.model_dump())
@@ -142,8 +159,9 @@ def install_execution(app, transaction, audit, admin, agent_auth, policy=None):
         with transaction() as db:
             if not db.execute('SELECT 1 FROM assets WHERE id=?', (asset_id,)).fetchone():
                 raise HTTPException(404, 'Asset not found')
-            row = db.execute('SELECT * FROM agent_presence WHERE asset_id=?', (asset_id,)).fetchone()
-            return {'asset_id': asset_id, 'online': bool(row and time.time() - row['last_seen'] <= 30), 'presence': dict(row) if row else None,
+            from .observability import health_view
+            asset = db.execute('SELECT * FROM assets WHERE id=?', (asset_id,)).fetchone()
+            return {**health_view(db, asset, app),
                     'unfinished_tasks': [dict(r) for r in db.execute("SELECT id,state,cancel_requested_at FROM tasks WHERE asset_id=? AND state IN ('claimed','unknown') ORDER BY seq", (asset_id,))]}
 
     @app.post('/api/v1/agents/{asset_id}/tasks/{task_id}/control')

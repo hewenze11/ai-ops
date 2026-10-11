@@ -1,6 +1,6 @@
 services:
   control:
-    image: ${AI_OPS_IMAGE:-ai-ops-service:local}
+    image: ${AI_OPS_IMAGE:-ghcr.io/hewenze11/ai-ops:latest}
     build:
       context: .
       target: runtime
@@ -12,11 +12,30 @@ services:
       - "${AI_OPS_BIND:-127.0.0.1}:${AI_OPS_PORT:-8765}:8765"
     environment:
       AI_OPS_ADMIN_TOKEN_FILE: /run/secrets/admin_token
+      # Independent role model credentials are configured later in the UI.
+      AI_OPS_LOCAL_CONNECTOR_ENABLED: "${AI_OPS_LOCAL_CONNECTOR_ENABLED:-0}"
+      AI_OPS_ALERT_NOTIFY_ENABLED: "${AI_OPS_ALERT_NOTIFY_ENABLED:-0}"
+      AI_OPS_MEMORY_ARCHIVER_ENABLED: "${AI_OPS_MEMORY_ARCHIVER_ENABLED:-0}"
     volumes:
-      - ./state:/data
-      - ./secrets/admin_token:/run/secrets/admin_token:ro
-      # SSH connector keys live outside the image and are mounted read-only.
-      - ./connector:/run/connector:ro
+      - type: bind
+        source: ./state
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/admin_token
+        target: /run/secrets/admin_token
+        read_only: true
+        bind:
+          create_host_path: false
+      # Only needed for legacy file-based SSH credentials; UI-managed keys
+      # and passwords live encrypted under /data, never inside the image.
+      - type: bind
+        source: ./connector
+        target: /run/connector
+        read_only: true
+        bind:
+          create_host_path: false
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=32m

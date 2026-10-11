@@ -20,10 +20,11 @@ import urllib.error
 import urllib.request
 
 from fastapi import Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from .custom_tasks import CustomTask, trigger_path
-from .models import Identifier as ID, UserName as USER
+from .models import Identifier as ID, UserName as USER, new_id
+from .turns import RoleModel
 
 MAX_SKILL_CHARS = 100000
 
@@ -46,7 +47,7 @@ CREATE TABLE IF NOT EXISTS skills(
 
 class Skill(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    id: ID
+    id: ID = Field(default_factory=lambda: new_id('skill'))
     name: str = Field(min_length=1, max_length=200)
     content: str = Field(max_length=MAX_SKILL_CHARS)
     role_ids: list[ID] = Field(default_factory=list, max_length=100)
@@ -61,33 +62,34 @@ class RoleUpdate(BaseModel):
 class RoleCreate(BaseModel):
     """Create a role from the console.
 
-    No credential is minted here: a role only holds a name until an operator
-    configures its model and memory separately, so there is nothing secret to
-    hand back. This is a convenience wrapper over the same admin POST route.
+    Optional role settings and file-based credentials commit together.
+    Omitting model preserves the legacy name-only API behavior.
     """
     model_config = ConfigDict(extra="forbid")
-    id: ID
+    id: ID = Field(default_factory=lambda: new_id('role'))
     name: str = Field(min_length=1, max_length=200)
+    model: RoleModel | None = None
 
 
 class AssetCreate(BaseModel):
     """Register an asset from the console. The agent token is returned once.
 
-    SSH fields mirror the core Asset model. The secret itself never travels
-    through this route: ``ssh_secret_ref`` is a pointer to a secret file the
-    operator placed on the server, exactly as the admin API expects.
+    SSH fields mirror the core Asset model. A write-only secret is encrypted
+    before saving its file reference. Legacy server file references still work.
     """
     model_config = ConfigDict(extra="forbid")
-    id: ID
+    id: ID = Field(default_factory=lambda: new_id('asset'))
     name: str = Field(min_length=1, max_length=200)
     connection_type: str = Field(default="agent", pattern="^(agent|ssh)$")
     allowed_users: list[USER] = Field(min_length=1, max_length=100)
+    account_notes: dict[str, str] | None = None
     notes: str = Field(default="", max_length=16000)
     ssh_host: str | None = Field(default=None, max_length=255)
     ssh_port: int = Field(default=22, ge=1, le=65535)
     ssh_user: str | None = Field(default=None, max_length=64)
     ssh_auth_kind: str | None = Field(default=None, pattern="^(key|password)$")
     ssh_secret_ref: str | None = Field(default=None, max_length=512)
+    ssh_secret: SecretStr | None = Field(default=None, min_length=1, max_length=65536)
     ssh_host_key: str | None = Field(default=None, max_length=2000)
 
 
@@ -95,6 +97,7 @@ class AssetUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str | None = Field(default=None, max_length=200)
     allowed_users: list[USER] | None = Field(default=None, max_length=100)
+    account_notes: dict[str, str] | None = None
     notes: str | None = Field(default=None, max_length=16000)
 
 
@@ -181,11 +184,15 @@ def install_management(app, transaction, audit, admin):
     # ---- roles -------------------------------------------------------------
     @app.post("/api/v1/console/roles", dependencies=[Depends(admin)], status_code=201)
     def create_role(body: RoleCreate):
-        with transaction() as db:
-            if db.execute("SELECT 1 FROM roles WHERE id=?", (body.id,)).fetchone():
-                raise HTTPException(409, "Role already exists")
-            db.execute("INSERT INTO roles(id,name) VALUES(?,?)", (body.id, body.name))
-            audit(db, "role.created", body.id, "admin", body.model_dump())
+        with app.state.role_providers.mutation() as created:
+            with transaction() as db:
+                if db.execute("SELECT 1 FROM roles WHERE id=?", (body.id,)).fetchone():
+                    raise HTTPException(409, "Role already exists")
+                db.execute("INSERT INTO roles(id,name) VALUES(?,?)", (body.id, body.name))
+                if body.model is not None:
+                    settings = app.state.role_providers.prepare(body.id, body.model, {}, created)
+                    db.execute("INSERT INTO role_models VALUES(?,?)", (body.id, json.dumps(settings)))
+                audit(db, "role.created", body.id, "admin", {'id': body.id, 'name': body.name})
         return {"id": body.id, "name": body.name}
 
     @app.put("/api/v1/roles/{role_id}", dependencies=[Depends(admin)])
@@ -210,38 +217,37 @@ def install_management(app, transaction, audit, admin):
                 raise HTTPException(422, "Duplicate allowed users")
             db.execute("UPDATE assets SET name=?,allowed_users=?,notes=? WHERE id=?",
                        (name, json.dumps(users), notes, asset_id))
+            from .account_grants import save_notes
+            save_notes(db, asset_id, users, body.account_notes)
             audit(db, "asset.updated", asset_id, "admin",
                   {"name": name, "allowed_users": users, "notes": notes})
         return {"id": asset_id, "name": name, "allowed_users": users, "notes": notes}
 
-    # This route existed on the core app already; the console still calls the
-    # original POST /api/v1/assets. We re-register a console-facing alias so the
-    # one-time agent token is returned through a path the console owns, keeping
-    # the SSH key material out of the browser entirely.
+    # Console-facing registration shares core validation and managed secret
+    # storage. Submitted credentials are write-only, never part of the response.
     @app.post("/api/v1/console/assets", dependencies=[Depends(admin)], status_code=201)
     def create_asset(body: AssetCreate):
         from .app import Asset
 
+        try:
+            asset = Asset(**body.model_dump())
+        except ValueError:
+            # Validation messages must not echo submitted secrets.
+            raise HTTPException(422, 'Invalid asset or SSH connection configuration') from None
         token = secrets.token_urlsafe(36)
-        with transaction() as db:
+        with app.state.connector_secrets.mutation(asset) as prepared, transaction() as db:
             if db.execute("SELECT 1 FROM assets WHERE id=?", (body.id,)).fetchone():
                 raise HTTPException(409, "Asset already exists")
             if len(set(body.allowed_users)) != len(body.allowed_users):
                 raise HTTPException(422, "Duplicate allowed users")
-            try:
-                asset = Asset(id=body.id, name=body.name, connection_type=body.connection_type,
-                              allowed_users=body.allowed_users, notes=body.notes,
-                              ssh_host=body.ssh_host, ssh_port=body.ssh_port, ssh_user=body.ssh_user,
-                              ssh_auth_kind=body.ssh_auth_kind, ssh_secret_ref=body.ssh_secret_ref,
-                              ssh_host_key=body.ssh_host_key)
-            except ValueError as e:
-                raise HTTPException(422, str(e))
             db.execute("INSERT INTO assets(id,name,allowed_users,notes,token_hash,connection_type) VALUES(?,?,?,?,?,?)",
                        (body.id, body.name, json.dumps(body.allowed_users), body.notes,
                         hashlib.sha256(token.encode()).hexdigest(), body.connection_type))
             if body.connection_type == "ssh":
                 from .connector_ssh import save_connection
-                save_connection(db, asset)
+                save_connection(db, prepared)
+            from .account_grants import save_notes
+            save_notes(db, body.id, body.allowed_users, body.account_notes)
             audit(db, "asset.provisioned", body.id, "admin",
                   {"name": body.name, "connection_type": body.connection_type, "via": "console"})
         response = {"asset_id": body.id, "connection_type": body.connection_type}
@@ -256,7 +262,8 @@ def install_management(app, transaction, audit, admin):
     # dedicated rotate route, if an operator ever needs it).
     @app.post("/api/v1/console/custom-tasks", dependencies=[Depends(admin)], status_code=201)
     def create_task(body: CustomTask):
-        from .custom_tasks import next_fire
+        from .custom_tasks import next_fire, prepare_notification
+        prepare_notification(body)
 
         secret = secrets.token_urlsafe(36)
         now = time.time()
@@ -284,6 +291,8 @@ def install_management(app, transaction, audit, admin):
             if old is None:
                 raise HTTPException(404, "Custom task not found")
             before = json.loads(old["config"])
+            from .custom_tasks import prepare_notification
+            prepare_notification(body, before)
             schedule_keys = ("kind", "cron", "timezone", "enabled")
             if all(before[k] == body.model_dump()[k] for k in schedule_keys):
                 due = old["next_fire_at"]
@@ -303,6 +312,18 @@ def install_management(app, transaction, audit, admin):
         with transaction() as db:
             return [{**dict(r), "role_ids": json.loads(r["role_ids"]), "enabled": bool(r["enabled"])}
                     for r in db.execute("SELECT * FROM skills WHERE deleted_at IS NULL ORDER BY id")]
+
+    @app.post("/api/v1/skills", dependencies=[Depends(admin)], status_code=201)
+    def create_skill(body: Skill):
+        with transaction() as db:
+            if db.execute('SELECT 1 FROM skills WHERE id=?', (body.id,)).fetchone():
+                raise HTTPException(409, 'Skill ID already exists')
+            for role in body.role_ids:
+                require_role(db, role)
+            db.execute('INSERT INTO skills(id,name,content,role_ids,enabled,revision,deleted_at) VALUES(?,?,?,?,?,1,NULL)',
+                       (body.id, body.name, body.content, json.dumps(body.role_ids), int(body.enabled)))
+            audit(db, 'skill.created', body.id, 'admin', {'name': body.name})
+        return body
 
     @app.put("/api/v1/skills/{skill_id}", dependencies=[Depends(admin)])
     def save_skill(skill_id: ID, body: Skill):

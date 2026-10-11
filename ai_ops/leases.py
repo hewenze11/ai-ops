@@ -111,6 +111,11 @@ def install_leases(app, transaction, audit, admin):
         now = time.time()
         with transaction() as db:
             unknown = [dict(r) for r in db.execute("SELECT id,asset_id,role_id,payload,updated_at FROM tasks WHERE state='unknown' ORDER BY seq")]
+            # Attention is the complete outstanding work queue, not the recent
+            # task-history page. Old standalone approvals must never disappear.
+            from .scrubbing import redact_structure
+            approvals = [{**dict(r), 'payload': redact_structure(_json_load(r['payload']))}
+                         for r in db.execute("SELECT id,asset_id,role_id,turn_id,state,payload,created_at,updated_at FROM tasks WHERE state='awaiting_approval' ORDER BY seq")]
             stale = []
             for row in db.execute("SELECT l.*,t.state FROM task_leases l JOIN tasks t ON t.id=l.task_id"):
                 if row['closed_at'] is not None or row['expires_at'] > now:
@@ -122,4 +127,5 @@ def install_leases(app, transaction, audit, admin):
             for row in db.execute('SELECT asset_id,last_seen FROM agent_presence'):
                 if now - row['last_seen'] > 30:
                     offline.append({'asset_id': row['asset_id'], 'silent_for': round(now - row['last_seen'], 1)})
-            return {'unknown_executions': unknown, 'stale_leases': stale, 'offline_assets': offline}
+            return {'unknown_executions': unknown, 'awaiting_approvals': approvals,
+                    'stale_leases': stale, 'offline_assets': offline}

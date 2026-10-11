@@ -10,10 +10,11 @@ Two deliberate boundaries:
   admin endpoint already governs (``/api/v1/roles``, ``/api/v1/console/tasks``)
   or aggregate existing admin reads. Nothing here can execute a command.
 """
+import hashlib
 import json
 
 from fastapi import Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 
 ASSETS = {
     "index.html": "text/html; charset=utf-8",
@@ -28,22 +29,41 @@ def console_dir():
 
 
 def install_console(app, transaction, audit, admin):
+    # Hash the actual installed package resources, not a manually bumped release
+    # number. A fresh HTML entry point must never select a previous UI bundle.
+    root = console_dir()
+    revision = hashlib.sha256(b"".join(
+        name.encode() + b"\0" + (root / name).read_bytes()
+        for name in sorted(ASSETS)
+    )).hexdigest()[:16]
+    headers = {"Cache-Control": "no-store", "X-AI-Ops-UI-Revision": revision}
+
     @app.get("/", include_in_schema=False)
     def index():
-        return FileResponse(console_dir() / "index.html", media_type=ASSETS["index.html"])
+        html = (root / "index.html").read_text(encoding="utf-8")
+        html = html.replace("__AI_OPS_UI_REVISION__", revision)
+        return HTMLResponse(html, headers=headers)
 
+    @app.get("/assets/{requested_revision}/{filename}", include_in_schema=False)
+    def versioned_asset(requested_revision: str, filename: str):
+        if requested_revision != revision or filename not in ("app.css", "app.js"):
+            raise HTTPException(404, "UI asset version not found; reload the page")
+        return FileResponse(root / filename, media_type=ASSETS[filename], headers={**headers, "Cache-Control": "public, max-age=31536000, immutable"})
+
+    # Existing open clients may still request the old fixed URL. Keep it valid
+    # but prohibit reuse of an obsolete response on subsequent visits.
     @app.get("/assets/app.css", include_in_schema=False)
     def styles():
-        return FileResponse(console_dir() / "app.css", media_type=ASSETS["app.css"])
+        return FileResponse(root / "app.css", media_type=ASSETS["app.css"], headers=headers)
 
     @app.get("/assets/app.js", include_in_schema=False)
     def script():
-        return FileResponse(console_dir() / "app.js", media_type=ASSETS["app.js"])
+        return FileResponse(root / "app.js", media_type=ASSETS["app.js"], headers=headers)
 
     @app.get("/api/v1/roles", dependencies=[Depends(admin)])
-    def list_roles():
-        with transaction() as db:
-            return [dict(r) for r in db.execute("SELECT id,name FROM roles ORDER BY id")]
+    def list_roles(include_retired: bool = False):
+        with app.state.read_transaction() as db:
+            return [dict(r) for r in db.execute('SELECT r.id,r.name,x.retired_at FROM roles r LEFT JOIN retired_roles x ON x.role_id=r.id WHERE (? OR x.role_id IS NULL) ORDER BY r.id', (include_retired,))]
 
     @app.get("/api/v1/console/tasks", dependencies=[Depends(admin)])
     def list_tasks(limit: int = 100):

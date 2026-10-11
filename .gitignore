@@ -10,6 +10,9 @@ data/
 secrets/
 .env
 .env.*
+!.env.example
+connector/
+*.secret
 *.db
 *.db-wal
 *.db-shm

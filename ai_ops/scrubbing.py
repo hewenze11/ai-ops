@@ -91,7 +91,12 @@ def _redact_value(value, literals):
         # key-name match is what protects nested payloads (alarm/audit details).
         result = {}
         for key, item in value.items():
-            if isinstance(key, str) and _SECRET_KEY_RE.search(key):
+            if key == 'notification' and isinstance(item, dict):
+                from .alert_notify import redact_url
+                result[key] = _redact_value(item, literals)
+                if item.get('url'):
+                    result[key]['url'] = redact_url(item['url'])
+            elif isinstance(key, str) and _SECRET_KEY_RE.search(key):
                 result[key] = MASK
             else:
                 result[key] = _redact_value(item, literals)

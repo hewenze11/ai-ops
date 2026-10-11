@@ -26,7 +26,7 @@ export AI_OPS_MODEL=your-verified-model-id
 docker compose -f compose.yaml -f compose.model.yaml -p ai-ops-preview up -d
 ```
 
-不配置Key时不启动模型工作线程。配置全局Key也不自动启用所有角色；每个角色模型设置默认enabled=false，防止升级后把旧测试队列一口气发往收费模型。
+模型工作线程默认启动，以支持完全不配置全局接口、仅配置独立角色接口；可用 `AI_OPS_MODEL_WORKER_ENABLED=0` 关闭。线程启动不自动启用角色：API角色模型默认enabled=false，前端新建时明确显示启用复选框。已有角色开关不改，不补跑被禁用角色的旧队列。
 
 ## 角色模型与消息API
 
@@ -36,13 +36,18 @@ docker compose -f compose.yaml -f compose.model.yaml -p ai-ops-preview up -d
 {
   "enabled": true,
   "model": "",
-  "max_model_steps": 8,
+  "provider_mode": "inherit",
+  "max_model_steps": null,
   "max_output_tokens": 2048,
   "max_context_chars": 250000
 }
 ```
 
-model为空继承全局配置；非空覆盖模型名称，目前仍共用一个全局供应商地址和Key。角色多供应商/多凭据配置尚未实现。步骤、输出和上下文预算明确可配；耗尽就报告错误，不声称任务已完成，也不限制等待队列长度。禁用角色模型停止后续模型调用，不代替取消已提交的远程命令。
+`provider_mode=inherit` 时model为空继承全局模型、非空只覆盖名称。`provider_mode=independent` 时传 `base_url`、`model` 和首次写入的 `api_key`，独立支持 OpenAI 兼容 `/chat/completions`，不支持原生Claude/Gemini协议。地址限公网HTTPS默认443端口，无账号密码/查询/片段；每次连接解析DNS、拒绝私网/回环/元数据并固定到检查过的IP，TLS仍验证原域名，拒绝重定向。不得把不受信任的中转商当作可信供应商。
+
+`api_key`只写，GET/PUT只给 `api_key_configured` 状态；空字符串/省略保留，`clear_api_key=true`清除当前引用（需先禁用或切到继承）。Key不写入SQLite、审计、模型上下文和前端存储；保存在DB目录下 `role-secrets`（或部署管理员的 `AI_OPS_ROLE_SECRET_DIR`）的0700目录、0600原子写入文件，文件名由角色ID哈希和随机修订号派生。并发请求各自保留不可变凭据修订，数据库提交失败删除新文件。切回继承保留原独立凭据；清除/换Key使旧修订不再用于新调用，已有调用与旧备份可能仍持有旧凭据，撤销凭据应在供应商侧轮换。旧修订目前不自动清理，避免破坏进行中的请求/备份；主机管理员按备份保留周期处理。
+
+`max_model_steps:null`是真正不限制步骤次数；新角色默认null，已有显式6/8不迁移改变，省略更新也保留旧值。非null范围1–1000，0无效。输出和上下文预算仍真实有限，达到限额或接口截断即错误，不声称任务完成。不限步骤可能持续产生费用；取消、审批、账户授权仍有效。禁用模型停止后续调用，不代替取消已提交的远程命令。每日记忆归档也按该角色独立接口/模型路由，未启用时保留确定性归档，不额外付费调用。
 
 `POST /api/v1/roles/{role_id}/messages`：
 

@@ -201,24 +201,15 @@ def build_console_link(console_url, turn_id):
 
 
 def redact_url(url):
-    """Mask credential-looking query values so a stored URL can be shown back."""
+    """Webhook credentials often live in PATHS, not only query parameters."""
     try:
         parts = urllib.parse.urlsplit(url)
+        host = parts.hostname or ''
+        if parts.port:
+            host += ':' + str(parts.port)
+        return urllib.parse.urlunsplit((parts.scheme, host, '/[REDACTED]', '', ''))
     except ValueError:
-        return url
-    if not parts.query:
-        return url
-    pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
-    masked = []
-    secret_hint = ("key", "token", "secret", "access", "sign", "auth", "pass")
-    for k, v in pairs:
-        if any(h in k.lower() for h in secret_hint):
-            masked.append((k, "[REDACTED]"))
-        else:
-            masked.append((k, v))
-    query = "&".join("%s=%s" % (urllib.parse.quote(k, safe=""), urllib.parse.quote(v, safe="[]"))
-                      for k, v in masked)
-    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
+        return '[REDACTED]'
 
 
 def build_payload(channel, title, body, url=None):
@@ -244,6 +235,25 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise RuntimeError("SSRF_REDIRECT_REFUSED")
 
 
+class WebhookBusinessFailure(RuntimeError):
+    def __init__(self, status):
+        super().__init__('WEBHOOK_BUSINESS_REJECTED')
+        self.status = status
+
+
+def check_business_response(channel, raw, status):
+    if channel in ('feishu', 'dingtalk', 'wecom'):
+        try:
+            value = json.loads(raw)
+            code = value.get('code', value.get('StatusCode', value.get('errcode')))
+            if code not in (0, '0'):
+                raise ValueError()
+        except (ValueError, TypeError, AttributeError):
+            raise WebhookBusinessFailure(status)
+    elif channel == 'slack' and raw.strip() != b'ok':
+        raise WebhookBusinessFailure(status)
+
+
 def post_once(url, channel, title, body):
     """Single POST attempt. Returns None on success or raises RuntimeError(type)."""
     validate_url(url)
@@ -253,11 +263,66 @@ def post_once(url, channel, title, body):
         url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), method="POST",
         headers={"Content-Type": "application/json", "User-Agent": "ai-ops/0.1"})
     with opener.open(req, timeout=TIMEOUT) as response:
-        response.read(MAX_RESPONSE)  # bound the read; body is not interpreted
+        raw = response.read(MAX_RESPONSE + 1)
+        status = getattr(response, 'status', 200)
+        if len(raw) > MAX_RESPONSE:
+            raise WebhookBusinessFailure(status)
+        check_business_response(channel, raw, status)
+        return status
+
+
+class NotificationTest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    mode: str = Field(default='custom', pattern='^(custom|inherit)$')
+    custom_task_id: str | None = Field(default=None, max_length=64)
+    url: str | None = Field(default=None, max_length=2000)
+    channel: str = Field(default='auto', max_length=32)
 
 
 def install_alert_notify(app, transaction, audit, admin):
     """Config + read APIs. Delivery is driven by the background worker below."""
+
+    @app.post('/api/v1/custom-tasks/notification-test', dependencies=[Depends(admin)])
+    def test_task_notification(body: NotificationTest):
+        # Explicit user click only: no writes to config/outbox and no automatic replay.
+        with transaction() as db:
+            if body.mode == 'inherit':
+                row = db.execute('SELECT * FROM alert_notify_config WHERE id=1').fetchone()
+                if not row or not row['enabled']:
+                    raise HTTPException(409, '全局 Webhook 未启用')
+                url, channel = row['url'], row['channel']
+            else:
+                url, channel = body.url, body.channel
+                if not url and body.custom_task_id:
+                    row = db.execute('SELECT config FROM custom_tasks WHERE id=? AND deleted_at IS NULL', (body.custom_task_id,)).fetchone()
+                    if not row:
+                        raise HTTPException(404, 'Custom task not found')
+                    saved = json.loads(row['config']).get('notification') or {}
+                    url = saved.get('url')
+                    if channel == 'auto':
+                        channel = saved.get('channel', 'auto')
+                if not url:
+                    raise HTTPException(422, '请填写 Webhook 地址，或先保存任务地址')
+        if channel not in CHANNELS:
+            raise HTTPException(422, 'Unknown channel')
+        channel = classify_channel(url) if channel == 'auto' else channel
+        try:
+            status = post_once(url, channel, '[测试] AI Ops 任务通知', '这是一条由管理员点击测试连通发送的测试消息，不是任务执行结果。')
+        except WebhookBusinessFailure as e:
+            return {'http_delivered': True, 'http_status': e.status, 'business_accepted': False, 'error': 'WEBHOOK_BUSINESS_REJECTED'}
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        except urllib.error.HTTPError as e:
+            return {'http_delivered': False, 'http_status': e.code, 'error': 'HTTP_REJECTED'}
+        except Exception as e:
+            return {'http_delivered': False, 'http_status': None, 'error': type(e).__name__}
+        with transaction() as db:
+            audit(db, 'notification.tested', body.custom_task_id or 'unsaved', 'admin', {'channel': channel, 'http_status': status})
+        # Only these channels have an explicit response-body business check.
+        # Generic/Discord HTTP success is not evidence of recipient delivery.
+        return {'http_delivered': True, 'http_status': status, 'channel': channel,
+                'business_accepted': True if channel in ('feishu', 'dingtalk', 'wecom', 'slack') else None,
+                'recipient_confirmed': False}
 
     @app.put("/api/v1/alert-notify/config", dependencies=[Depends(admin)])
     def set_config(body: NotifyConfig):
@@ -390,7 +455,8 @@ def _conclusion_body(role_id, state, final_text, source, alarm_state, console_li
     if console_link:
         lines.append("")
         lines.append("查看 / 继续对话：%s" % console_link)
-    return "\n".join(lines)
+    from .scrubbing import redact_text
+    return redact_text("\n".join(lines))
 
 
 def collect_conclusions(transaction, audit, now=None):
@@ -402,10 +468,18 @@ def collect_conclusions(transaction, audit, now=None):
     now = time.time() if now is None else now
     created = 0
     with transaction() as db:
-        cfg = db.execute("SELECT * FROM alert_notify_config WHERE id=1 AND enabled=1").fetchone()
-        if cfg is None:
-            return 0
+        legacy = db.execute("SELECT * FROM alert_notify_config WHERE id=1 AND enabled=1").fetchone()
         for row in db.execute(COLLECT_SQL).fetchall():
+            event = db.execute('SELECT snapshot FROM trigger_events WHERE turn_id=?', (row['turn_id'],)).fetchone()
+            notification = json.loads(event['snapshot']).get('notification') if event else None
+            if notification is not None:
+                if not notification.get('enabled'):
+                    continue
+                cfg = notification
+            else:
+                cfg = legacy
+            if cfg is None:
+                continue
             payload_row = db.execute("SELECT payload FROM alarm_log WHERE turn_id=? LIMIT 1",
                                      (row["turn_id"],)).fetchone()
             try:
@@ -419,7 +493,7 @@ def collect_conclusions(transaction, audit, now=None):
                                     row["source"], alarm_state, console_link)
             notify_id = enqueue_notification(
                 db, turn_id=row["turn_id"], dedupe_key="turn:" + row["turn_id"],
-                url=cfg["url"], channel=cfg["channel"], title=title, body=body,
+                url=cfg["url"], channel=classify_channel(cfg['url']) if cfg['channel'] == 'auto' else cfg['channel'], title=title, body=body,
                 alarm_state=alarm_state)
             if notify_id is not None:
                 audit(db, "alert_notify.queued", notify_id, "service",

@@ -12,23 +12,24 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 
 from . import scrubbing
-from .models import Identifier, StrictModel, UserName
+from .models import Identifier, StrictModel, UserName, new_id
 
 PROTOCOL = "1.0"
 
 
 class Role(StrictModel):
-    id: Identifier
+    id: Identifier = Field(default_factory=lambda: new_id('role'))
     name: str = Field(min_length=1, max_length=200)
 
 
 class Asset(StrictModel):
-    id: Identifier
+    id: Identifier = Field(default_factory=lambda: new_id('asset'))
     name: str = Field(min_length=1, max_length=200)
     allowed_users: list[UserName] = Field(min_length=1, max_length=100)
+    account_notes: dict[str, str] | None = None
     notes: str = Field(default="", max_length=16000)
     connection_type: Literal["agent", "ssh"] = "agent"
     # Only meaningful for connection_type="ssh". Credentials are never stored
@@ -39,6 +40,7 @@ class Asset(StrictModel):
     ssh_user: str | None = Field(default=None, max_length=64)
     ssh_auth_kind: Literal["key", "password"] | None = None
     ssh_secret_ref: str | None = Field(default=None, max_length=512)
+    ssh_secret: SecretStr | None = Field(default=None, min_length=1, max_length=65536)
     # Pinned host public key (openSSH "ssh-ed25519 AAAA..." form). The connector
     # refuses to connect when this is absent.
     ssh_host_key: str | None = Field(default=None, max_length=2000)
@@ -49,10 +51,14 @@ class Asset(StrictModel):
         if self.connection_type == "ssh":
             if not self.ssh_host or not self.ssh_user or not self.ssh_auth_kind:
                 raise ValueError("ssh assets require ssh_host, ssh_user and ssh_auth_kind")
-            if not self.ssh_secret_ref:
-                raise ValueError("ssh assets require ssh_secret_ref")
+            if bool(self.ssh_secret_ref) == bool(self.ssh_secret):
+                raise ValueError("SSH assets require either a secret or an existing file reference, not both")
             if not self.ssh_host_key:
                 raise ValueError("ssh assets require a pinned ssh_host_key")
+        elif self.ssh_secret is not None:
+            raise ValueError('Agent assets do not use an SSH password or key')
+        if len(set(self.allowed_users)) != len(self.allowed_users):
+            raise ValueError('Duplicate asset usernames')
         return self
 
 
@@ -146,6 +152,8 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         from .custom_tasks import SCHEMA as CUSTOM_SCHEMA
         from .turns import SCHEMA as TURN_SCHEMA, migrate, enqueue_turn, set_turn_state
         from .memory import SCHEMA as MEMORY_SCHEMA
+        from .asset_memory import SCHEMA as ASSET_MEMORY_SCHEMA
+        from .attachments import SCHEMA as ATTACHMENT_SCHEMA
         from .alarms import SCHEMA as ALARM_SCHEMA
         from .channels import SCHEMA as CHANNEL_SCHEMA
         from .alert_notify import SCHEMA as ALERT_NOTIFY_SCHEMA
@@ -156,7 +164,10 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         from .connector_ssh import SCHEMA as CONNECTOR_SCHEMA, migrate as migrate_connector
         from .connector_local import SCHEMA as LOCAL_SCHEMA, migrate as migrate_local
         from .asset_lifecycle import SCHEMA as LIFECYCLE_SCHEMA, migrate as migrate_lifecycle
-        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA + LEASE_SCHEMA + CONNECTOR_SCHEMA + LOCAL_SCHEMA + LIFECYCLE_SCHEMA + MEMORY_SCHEMA + ALARM_SCHEMA + CHANNEL_SCHEMA + ALERT_NOTIFY_SCHEMA + MANAGEMENT_SCHEMA)
+        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA + LEASE_SCHEMA + CONNECTOR_SCHEMA + LOCAL_SCHEMA + LIFECYCLE_SCHEMA + MEMORY_SCHEMA + ASSET_MEMORY_SCHEMA + ALARM_SCHEMA + CHANNEL_SCHEMA + ALERT_NOTIFY_SCHEMA + MANAGEMENT_SCHEMA)
+        from .observability import SCHEMA as OBSERVABILITY_SCHEMA
+        from .role_lifecycle import SCHEMA as ROLE_LIFECYCLE_SCHEMA
+        db.executescript(OBSERVABILITY_SCHEMA + ROLE_LIFECYCLE_SCHEMA + ATTACHMENT_SCHEMA)
         migrate(db)
         migrate_execution(db)
         migrate_leases(db)
@@ -184,19 +195,21 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         from .connector_local import ensure_local_asset
         ensure_local_asset(db)
         # Do not repeat a provider call whose response was lost during a crash.
-        interrupted = db.execute("SELECT id FROM role_turns WHERE state='calling'").fetchall()
+        interrupted = db.execute("SELECT id FROM role_turns WHERE state IN ('calling','tool_calling')").fetchall()
         for row in interrupted:
             set_turn_state(db, row['id'], 'failed', 'MODEL_CALL_INTERRUPTED')
             db.execute("UPDATE model_calls SET state='failed',error_code='MODEL_CALL_INTERRUPTED',finished_at=? WHERE turn_id=? AND state='calling'", (time.time(), row['id']))
             db.execute("INSERT INTO audit(event,entity_id,actor,details,created_at) VALUES('model.interrupted',?,'service','{}',?)", (row['id'], time.time()))
 
     @contextmanager
-    def transaction():
+    def transaction(write=True):
         db = sqlite3.connect(path, timeout=15)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
         db.execute("PRAGMA synchronous=FULL")
-        db.execute("BEGIN IMMEDIATE")
+        db.execute('BEGIN IMMEDIATE' if write else 'BEGIN')
+        if not write:
+            db.execute('PRAGMA query_only=ON')
         try:
             yield db
             db.commit()
@@ -251,14 +264,43 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         return result
 
     app = FastAPI(title="AI Ops backend preview", version="0.1.0.dev6")
+    # Pydantic validation errors otherwise echo the submitted input, including
+    # a write-only API key (also for unknown nested fields). Never return input.
+    from fastapi.exceptions import RequestValidationError
+    from fastapi.responses import JSONResponse
+
+    @app.exception_handler(RequestValidationError)
+    async def safe_validation_error(request, error):
+        return JSONResponse(status_code=422, content={'detail': [
+            {'loc': list(item['loc']), 'type': item['type'], 'msg': 'Invalid request value'}
+            for item in error.errors()]})
     app.state.transaction = transaction
+    app.state.read_transaction = lambda: transaction(write=False)
+    from .role_lifecycle import install as install_role_lifecycle
+    install_role_lifecycle(app, transaction, audit, admin)
     app.state.audit = audit
+    from .attachments import install as install_attachments
+    install_attachments(app, path, admin)
+    from .connector_secrets import ConnectorSecrets
+    app.state.connector_secrets = ConnectorSecrets(path)
+    from .role_provider import RoleProviders
+    app.state.role_providers = RoleProviders(os.environ.get('AI_OPS_ROLE_SECRET_DIR') or path.parent / 'role-secrets')
     from .custom_tasks import install_custom_tasks
     from .turns import install_turns
+    from .observability import install_observability
+    install_observability(app, transaction, admin)
+    from .unified_logs import install_unified_logs
+    install_unified_logs(app, transaction, admin)
+    from .log_groups import install as install_log_groups
+    install_log_groups(app, admin)
     install_custom_tasks(app, transaction, audit, admin, current_admin_token)
     install_turns(app, transaction, audit, admin, default_model, search_provider)
+    from .runtime_status import install as install_runtime_status
+    install_runtime_status(app, admin)
     from .memory import install_memory
     install_memory(app, transaction, audit, admin)
+    from .asset_memory import install as install_asset_memory
+    install_asset_memory(app, transaction, audit, admin)
     from .alarms import install_alarms
     install_alarms(app, transaction, audit, admin)
     from .execution import install_execution, cancel_task, check_archives
@@ -284,12 +326,14 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     from .alert_notify import install_alert_notify
     install_alert_notify(app, transaction, audit, admin)
     app.state.alert_notify = {"transaction": transaction, "audit": audit}
+    from .skill_import import install as install_skill_import
+    install_skill_import(app, admin)
     from .management import install_management
     install_management(app, transaction, audit, admin)
 
     @app.get("/healthz")
     def health():
-        with transaction() as db:
+        with transaction(write=False) as db:
             db.execute("SELECT 1")
         return {"status": "ok", "protocol_version": PROTOCOL}
 
@@ -305,14 +349,17 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     @app.post("/api/v1/assets", dependencies=[Depends(admin)], status_code=201)
     def provision_asset(body: Asset):
         token = secrets.token_urlsafe(36)
-        with transaction() as db:
+        with app.state.connector_secrets.mutation(body) as prepared, transaction() as db:
+            body = prepared
             if db.execute("SELECT 1 FROM assets WHERE id=?", (body.id,)).fetchone():
                 raise HTTPException(409, "Asset already exists")
             db.execute("INSERT INTO assets(id,name,allowed_users,notes,token_hash,connection_type) VALUES(?,?,?,?,?,?)", (body.id, body.name, json.dumps(body.allowed_users), body.notes, hashlib.sha256(token.encode()).hexdigest(), body.connection_type))
             if body.connection_type == "ssh":
                 from .connector_ssh import save_connection
                 save_connection(db, body)
-            audit(db, "asset.provisioned", body.id, "admin", {**body.model_dump(), "ssh_secret_ref": "[redacted]"})
+            from .account_grants import save_notes
+            save_notes(db, body.id, body.allowed_users, body.account_notes)
+            audit(db, "asset.provisioned", body.id, "admin", {**body.model_dump(exclude={'ssh_secret', 'ssh_secret_ref'}), 'ssh_credential_configured': body.connection_type == 'ssh'})
         # One-time credential: never include it in an audit event or GET route.
         # SSH assets have no agent, so no token is issued for them.
         response = {"asset_id": body.id, "connection_type": body.connection_type, "protocol_version": PROTOCOL}
@@ -321,22 +368,29 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         return response
 
     @app.get("/api/v1/assets", dependencies=[Depends(admin)])
-    def list_assets():
-        with transaction() as db:
+    def list_assets(include_retired: bool = False, include_disabled_local: bool = False):
+        with transaction(write=False) as db:
             from .connector_ssh import connection_view
+            from .observability import health_view
+            from .account_grants import notes_view
             from .connector_local import local_asset_ids
             local = local_asset_ids(db)
             hidden = local['asset_id'] if (local is not None and not local['enabled']) else None
             # Operator-registered assets come first; the control host sorts last
             # so it never displaces the operator's own inventory at the top.
             local_id = local['asset_id'] if local is not None else None
-            rows = [r for r in db.execute("SELECT * FROM assets ORDER BY id") if r["id"] != hidden]
+            rows = [r for r in db.execute("SELECT * FROM assets ORDER BY id")
+                    if include_disabled_local or r["id"] != hidden]
             # Retired assets are kept (history is evidence) but hidden from the
             # default inventory; they remain reachable by id and via lifecycle.
-            rows = [r for r in rows if r["retired_at"] is None]
+            rows = [r for r in rows if include_retired or r["retired_at"] is None]
             rows.sort(key=lambda r: (r["id"] == local_id, r["id"]))
             return [{"id": r["id"], "name": r["name"], "allowed_users": json.loads(r["allowed_users"]), "notes": r["notes"],
-                     "connection_type": connection_view(db, r["id"])["connection_type"]}
+                     "connection_type": connection_view(db, r["id"])["connection_type"],
+                     "retired_at": r["retired_at"],
+                     "account_notes": notes_view(db, r['id']),
+                     "local_enabled": bool(local['enabled']) if r['id'] == local_id else None,
+                     "health": health_view(db, r, app)}
                     for r in rows]
 
     @app.post("/api/v1/assets/{asset_id}/rotate-token", dependencies=[Depends(admin)])
@@ -364,23 +418,27 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
 
     @app.get("/api/v1/assets/{asset_id}", dependencies=[Depends(admin)])
     def get_asset(asset_id: str):
-        with transaction() as db:
+        with transaction(write=False) as db:
             from .connector_ssh import connection_view
             row = db.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
             if row is None:
                 raise HTTPException(404, "Asset not found")
-            return {"id": row["id"], "name": row["name"], "allowed_users": json.loads(row["allowed_users"]),
+            from .account_grants import notes_view
+            return {"id": row["id"], "name": row["name"], "account_notes": notes_view(db, row['id']), "allowed_users": json.loads(row["allowed_users"]),
                     "notes": row["notes"], "connection_type": connection_view(db, row["id"])["connection_type"],
                     "previous_token_active": bool(row["previous_token_hash"] and row["previous_token_expires"] is not None and time.time() <= row["previous_token_expires"]),
                     "previous_token_expires": row["previous_token_expires"]}
 
     @app.post("/api/v1/tasks", dependencies=[Depends(admin)], status_code=201)
     def submit(body: Task):
-        payload = body.model_dump_json()
         with transaction() as db:
             old = db.execute("SELECT * FROM tasks WHERE idempotency_key=?", (body.idempotency_key,)).fetchone()
             if old:
-                if json.loads(old["payload"]) != body.model_dump():
+                original = json.loads(old["payload"])
+                # These fields are server-derived evidence, not caller input.
+                original.pop('execution_grants', None)
+                original.pop('authorization_revision', None)
+                if original != body.model_dump():
                     raise HTTPException(409, "Idempotency key reused with different payload")
                 return view(old, db)
             if not db.execute("SELECT 1 FROM roles WHERE id=?", (body.role_id,)).fetchone():
@@ -393,16 +451,22 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
             now = time.time()
             task_id = str(uuid.uuid4())
             state = "awaiting_approval" if body.mode == "confirm" else "queued"
-            turn_id = enqueue_turn(db, body.role_id, "command", task_id, body.execution_users, body.mode, "Administrative command", {}, now)
+            turn_id = enqueue_turn(db, body.role_id, "command", task_id, body.execution_users, body.mode, "Administrative command", {}, now,
+                grants=[{'asset_id': body.asset_id, 'username': u} for u in body.execution_users])
             db.execute("UPDATE role_turns SET state='waiting_tool',pending_task_id=? WHERE id=?", (task_id, turn_id))
+            from .account_grants import authority
+            auth = authority(db, turn_id)
+            evidence = {**body.model_dump(), 'execution_grants': auth['execution_grants'],
+                        'authorization_revision': auth['authorization_revision']}
+            payload = json.dumps(evidence, ensure_ascii=False)
             db.execute("INSERT INTO tasks(id,role_id,asset_id,payload,state,idempotency_key,created_at,updated_at,turn_id) VALUES(?,?,?,?,?,?,?,?,?)",
                        (task_id, body.role_id, body.asset_id, payload, state, body.idempotency_key, now, now, turn_id))
-            audit(db, "task.submitted", task_id, "admin", body.model_dump())
+            audit(db, "task.submitted", task_id, "admin", {'turn_id': turn_id, **evidence})
             return view(db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone(), db)
 
     @app.get("/api/v1/tasks/{task_id}", dependencies=[Depends(admin)])
     def get_task(task_id: str):
-        with transaction() as db:
+        with transaction(write=False) as db:
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if row is None:
                 raise HTTPException(404, "Task not found")
@@ -442,6 +506,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
             # own work. A controller never blocks itself (its own earlier task
             # is already 'claimed', so the query below would not return it).
             if body.controller is not None:
+                db.execute('INSERT INTO controller_observations(asset_id,controller,observed_at) VALUES(?,?,?) ON CONFLICT(asset_id) DO UPDATE SET controller=excluded.controller,observed_at=excluded.observed_at', (asset_id, body.controller, time.time()))
                 presence = db.execute('SELECT * FROM agent_presence WHERE asset_id=?', (asset_id,)).fetchone()
                 if presence is not None and presence['busy'] and time.time() - presence['last_seen'] <= 30 \
                         and presence['busy_by'] not in (None, body.controller):
@@ -459,8 +524,9 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
             if row is None:
                 return {"task": None, "protocol_version": body.protocol_version}
             payload = json.loads(row["payload"])
-            if payload["run_as"] not in json.loads(asset["allowed_users"]):
-                raise HTTPException(403, "Execution account is no longer available")
+            from .authority import claim_allowed
+            if not claim_allowed(db, row):
+                raise HTTPException(403, "Execution authority is no longer available")
             claim_id = secrets.token_urlsafe(24)
             db.execute("UPDATE tasks SET state='claimed',claim_id=?,claimed_protocol=?,lease_seconds=?,claim_count=claim_count+1,updated_at=? WHERE id=?", (claim_id, body.protocol_version, LEASE_SECONDS, time.time(), row["id"]))
             open_lease(db, row['id'], asset_id, claim_id)

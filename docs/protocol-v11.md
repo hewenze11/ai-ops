@@ -29,7 +29,8 @@
 
 ## 心跳
 
-- 字段：`instance_id`（进程内随机）、`agent_version`、`protocol_version`（必须 `1.1`）。
+- 字段：`instance_id`（进程内随机）、`agent_version`、`protocol_version`（`1.1`或`1.2`）。
+- 可选 `heartbeat_telemetry={session_id,controller,attempt_seq,previous_results}`：按controller/启动会话分开累计实际发送尝试，失败也递增；主服务按最后已收到最高序号向前最多10次统计接收证据，ACK确认另列，失联尾部未知。旧payload完全保留；字段限制、日志接口、24h保留与旧服务降级见 [心跳遥测契约](heartbeat-telemetry.md)。
 - 30 秒无心跳视为离线；离线只是观测信息，**不会**把已领取任务改回队列，也不会解除同角色阻塞。
 - 重连（实例号变化或超过 30 秒）写入 `agent.connected` 审计。
 

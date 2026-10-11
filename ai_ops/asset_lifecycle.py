@@ -143,10 +143,16 @@ def install_asset_lifecycle(app, transaction, audit, admin):
             # Detach tasks from turns, then remove the turns they belonged to.
             db.execute('UPDATE tasks SET turn_id=NULL WHERE asset_id=?', (asset_id,))
             db.execute('DELETE FROM tasks WHERE asset_id=?', (asset_id,))
+            db.execute('DELETE FROM heartbeat_attempts WHERE stream_id IN (SELECT id FROM heartbeat_streams WHERE asset_id=?)', (asset_id,))
+            db.execute('DELETE FROM heartbeat_streams WHERE asset_id=?', (asset_id,))
+            db.execute('DELETE FROM heartbeat_samples WHERE asset_id=?', (asset_id,))
+            db.execute('DELETE FROM asset_state_samples WHERE asset_id=?', (asset_id,))
+            db.execute('DELETE FROM controller_observations WHERE asset_id=?', (asset_id,))
             counts['agent_presence'] = db.execute('DELETE FROM agent_presence WHERE asset_id=?', (asset_id,)).rowcount
             db.execute('DELETE FROM asset_connections WHERE asset_id=?', (asset_id,))
             db.execute('DELETE FROM asset_lifecycle WHERE asset_id=?', (asset_id,))
             db.execute('DELETE FROM local_host WHERE asset_id=?', (asset_id,))
+            counts['account_notes'] = db.execute('DELETE FROM asset_account_notes WHERE asset_id=?', (asset_id,)).rowcount
             db.execute('DELETE FROM assets WHERE id=?', (asset_id,))
             audit(db, 'asset.purged', asset_id, 'admin', {'counts': counts})
         return {'asset_id': asset_id, 'purged': True, 'counts': counts}

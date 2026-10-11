@@ -4,12 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI 运维控制台</title>
-<link rel="stylesheet" href="/assets/app.css?v=5">
+<meta name="aiops-ui-revision" content="__AI_OPS_UI_REVISION__">
+<link rel="stylesheet" href="/assets/__AI_OPS_UI_REVISION__/app.css">
 </head>
 <body>
 <div id="login" class="login">
   <form id="login-form" autocomplete="off">
     <h1>AI 运维控制台</h1>
+    <p class="muted small">新版工作台 · 聊天 / 资产 / Skills / 文档 / 日志 / 定制任务<br>界面版本 <code>__AI_OPS_UI_REVISION__</code></p>
     <p class="muted">管理端凭据仅保存于本标签页内存，关闭即失效；不写入浏览器存储。</p>
     <label>管理员 Token
       <input id="token" type="password" required minlength="32" autocomplete="off" spellcheck="false" placeholder="粘贴部署时生成的管理员 Token">
@@ -25,39 +27,43 @@
     <nav id="nav"></nav>
     <div class="spacer"></div>
     <span id="status" class="muted"></span>
-    <button id="lock" class="ghost" title="清除内存中的凭据">锁定</button>
+    <span class="muted small" title="当前安装包静态资源指纹">UI <code>__AI_OPS_UI_REVISION__</code></span>
+    <button id="lock" class="ghost" title="仅退出当前页面，清除本页凭据与缓存；不会停止后台任务或撤销管理员 Token">退出控制台</button>
   </header>
 
   <main>
     <section id="view-chat" class="view">
       <div class="split">
         <aside class="pane pane-left">
-          <div class="pane-head"><h2>角色</h2><button id="chat-refresh" class="ghost small">刷新</button></div>
+          <div class="pane-head"><h2>角色</h2><button id="chat-new-role" class="small">＋ 新建</button></div>
           <div class="side-group"><ul id="chat-roles" class="list"></ul></div>
         </aside>
         <div class="pane pane-main">
           <div class="pane-head"><h2 id="chat-title">聊天</h2><span id="chat-model" class="muted small"></span></div>
           <div id="chat-log" class="log"></div>
           <form id="chat-form" class="composer">
-            <div class="composer-main">
-              <textarea id="chat-text" rows="2" placeholder="描述要运维处理的事情…（回车发送，Shift+回车换行）" required></textarea>
-              <button type="submit">发送</button>
-            </div>
             <div class="composer-opts">
               <button type="button" id="opts-toggle" class="ghost small" aria-expanded="false">选项 ▾</button>
               <div id="opts-body" class="opts-body" hidden>
                 <label class="inline">模式
                   <select id="chat-mode">
-                    <option value="confirm">confirm（逐条审批）</option>
-                    <option value="readonly">readonly（只读分析）</option>
-                    <option value="direct">direct（直接执行）</option>
+                    <option value="confirm">confirm · 每条命令先审批</option>
+                    <option value="readonly">readonly · 不提供命令执行工具</option>
+                    <option value="direct">direct · 命令直接入队</option>
                   </select>
                 </label>
-                <label class="inline grow">执行账号（逗号分隔）
-                  <input id="chat-users" placeholder="ops_read" autocomplete="off">
+                <label class="inline grow">本轮执行账号（资产.账号，可多选）
+                  <select id="chat-users" multiple aria-label="本轮资产执行账号"></select>
                 </label>
-                <span class="muted small">默认 confirm（逐条审批），最安全。</span>
+                <span class="muted small">模式由服务端执行约束，不靠提示词。confirm 审批所有命令（不限写操作）；direct 不自动拦截重大操作。最终能力还受资产允许账号与操作系统权限限制。</span>
               </div>
+            </div>
+            <div id="image-drafts" class="image-drafts" aria-live="polite"></div>
+            <div class="composer-main">
+              <button id="image-add" type="button" class="ghost" title="添加截图，也可粘贴或拖入图片">＋图片</button>
+              <input id="image-files" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
+              <textarea id="chat-text" rows="2" placeholder="描述要运维处理的事情…（回车发送，Shift+回车换行）"></textarea>
+              <button id="chat-send" type="submit">发送</button>
             </div>
           </form>
         </div>
@@ -65,24 +71,18 @@
     </section>
 
     <section id="view-console" class="view" hidden>
-      <div class="split">
-        <aside class="pane pane-left">
-          <div class="pane-head"><h2>控制台</h2></div>
-          <div id="console-tabs"></div>
-        </aside>
-        <div id="console-body" class="pane pane-main"></div>
-      </div>
+      <div id="console-body" class="pane pane-main workspace-body"></div>
     </section>
   </main>
 
   <div id="modal" class="modal" hidden>
     <div class="modal-box">
       <div class="modal-head"><h3 id="modal-title"></h3><button id="modal-close" class="ghost">关闭</button></div>
-      <pre id="modal-body" class="json"></pre>
+      <div id="modal-body" class="json"></div>
     </div>
   </div>
 </div>
 
-<script src="/assets/app.js?v=5"></script>
+<script src="/assets/__AI_OPS_UI_REVISION__/app.js"></script>
 </body>
 </html>

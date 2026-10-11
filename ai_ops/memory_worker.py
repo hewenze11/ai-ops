@@ -18,6 +18,7 @@ Non-negotiables:
 """
 import logging
 import threading
+import json
 
 log = logging.getLogger(__name__)
 
@@ -43,13 +44,18 @@ def archive_once(app, client):
             memory_module._close_archive(db, role_id, day, memory_module.ARCHIVE_DONE, None)
             return True
         full_text = row["full_text"]
+        model_row = db.execute('SELECT config FROM role_models WHERE role_id=?', (role_id,)).fetchone()
+        settings = json.loads(model_row['config']) if model_row else {}
+        if not settings.get('enabled'):
+            memory_module.mark_archive_fallback(db, role_id, day, 'MODEL_NOT_ENABLED')
+            return True
         attempts = db.execute("SELECT attempts FROM memory_archive WHERE role_id=? AND day=?",
                               (role_id, day)).fetchone()["attempts"]
         db.execute("UPDATE memory_archive SET attempts=attempts+1, updated_at=? WHERE role_id=? AND day=?",
                    (__import__("time").time(), role_id, day))
 
     body = {
-        "model": app.state.role_engine.default_model or "",
+        "model": settings.get('model') or app.state.role_engine.default_model or "",
         "messages": memory_module.build_archive_messages(full_text),
         "max_tokens": 900,
     }
@@ -58,7 +64,8 @@ def archive_once(app, client):
             memory_module.mark_archive_fallback(db, role_id, day, "MODEL_NOT_CONFIGURED")
         return True
     try:
-        response = client.complete(body)
+        selected_client = app.state.role_providers.client(settings, client)
+        response = selected_client.complete(body)
         parsed = memory_module.parse_archive_reply((response.get("message") or {}).get("content"))
         if parsed is None:
             raise ModelFailure("MODEL_INVALID_RESPONSE")
@@ -86,8 +93,6 @@ def archive_once(app, client):
 def start_memory_archiver(app, client, poll_seconds=2.0):
     """Bounded single-thread archiver. Archive calls are cheap and occasional."""
     stop = threading.Event()
-    if client is None:
-        return stop, None
 
     def run():
         while not stop.is_set():

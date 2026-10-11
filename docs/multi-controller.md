@@ -62,6 +62,10 @@ Agent 配置新增可选的 `controllers` 数组；`server_url` / `agent_token` 
 主服务收到 `busy=true` 且 `busy_by` 不是自己时，**claim 返回空**，
 任务留在 `queued`；等忙状态解除后自动可领。
 
+### 可选发送序号遥测（本地扩展，2026-10-08）
+
+协议版本仍为1.2；心跳可增加 `heartbeat_telemetry={session_id,controller,attempt_seq,previous_results}`。每个controller发送前独立加锁递增，失败也占号，重启更换session；主服务分别展示最后已收到最高序号截止的最多十次，不把其他主服务的失败混入本方。接收记录与Agent的ACK结果分列，失联尾部未知。旧payload继续可用，新Agent仅对旧服务端明确“未知扩展字段”的422执行按controller降级。完整协议与限额见 [心跳遥测](heartbeat-telemetry.md)。
+
 ## 执行级互斥
 
 Agent 主循环单线程，`agent.lock` 保证一个 journal 只有一个进程——

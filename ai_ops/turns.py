@@ -5,11 +5,13 @@ import uuid
 from typing import Annotated, Literal
 
 from fastapi import Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
+from . import account_grants
 from .context import SYSTEM, build_body
 from .model_client import ModelFailure
-from .models import Identifier as ID, UserName as USER
+from .models import Identifier as ID, UserName as USER, new_id
+from .questions import SCHEMA as QUESTION_SCHEMA, create_question, questions_for_turn, install_questions
 TERMINAL = ("completed", "failed", "cancelled")
 
 
@@ -142,7 +144,12 @@ CREATE TABLE IF NOT EXISTS documents(
 """
 
 
-def enqueue_turn(db, role_id, source, source_id, users, mode, prompt, payload, created_at=None, caller=None):
+SCHEMA += QUESTION_SCHEMA + account_grants.SCHEMA
+
+
+def enqueue_turn(db, role_id, source, source_id, users, mode, prompt, payload, created_at=None, caller=None, grants=None):
+    from .role_lifecycle import require_active
+    require_active(db, role_id)
     now = time.time() if created_at is None else created_at
     turn_id = str(uuid.uuid4())
     # ``source`` stays a coarse category (chat/trigger/scheduled/command). The
@@ -152,6 +159,9 @@ def enqueue_turn(db, role_id, source, source_id, users, mode, prompt, payload, c
     # existing rows and callers keep their meaning.
     db.execute("INSERT INTO role_turns(id,role_id,source,source_id,execution_users,mode,prompt,payload,state,created_at,updated_at,caller) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                (turn_id, role_id, source, source_id, json.dumps(users), mode, prompt, json.dumps(payload, ensure_ascii=False), "queued", now, now, caller or source))
+    # Legacy histories remain unmodified/unscoped and are denied at dispatch.
+    if grants is not None:
+        account_grants.snapshot(db, turn_id, grants)
     return turn_id
 
 
@@ -184,6 +194,9 @@ def migrate(db):
 
 
 def set_turn_state(db, turn_id, state, error=None, final=None):
+    if state in TERMINAL:
+        db.execute("UPDATE turn_questions SET state='cancelled' WHERE turn_id=? AND state='pending'", (turn_id,))
+        db.execute("UPDATE account_requests SET state='cancelled' WHERE turn_id=? AND state='pending'", (turn_id,))
     db.execute("UPDATE role_turns SET state=?,error_code=?,final_text=?,updated_at=? WHERE id=?", (state, error, final, time.time(), turn_id))
     db.execute("UPDATE trigger_events SET state=? WHERE turn_id=?", (state, turn_id))
 
@@ -192,22 +205,45 @@ class RoleModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enabled: bool = False
     model: str = Field(default="", max_length=150)
-    max_model_steps: int = Field(default=8, ge=1, le=1000)
+    provider_mode: Literal['inherit', 'independent'] = 'inherit'
+    vision_enabled: bool = False
+    base_url: str = Field(default='', max_length=2000)
+    api_key: SecretStr | None = Field(default=None, max_length=4096)
+    clear_api_key: bool = False
+    max_model_steps: int | None = Field(default=None, ge=1, le=1000)
+
+    @field_validator('api_key')
+    @classmethod
+    def key_single_line(cls, value):
+        if value and any(c in value.get_secret_value() for c in ('\r', '\n', '\x00')):
+            raise ValueError('API Key must be a single line')
+        return value
     max_output_tokens: int = Field(default=2048, ge=64, le=32768)
     max_context_chars: int = Field(default=250000, ge=1000, le=2000000)
 
 
 class Message(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    text: str = Field(min_length=1, max_length=32000)
+    text: str = Field(default='', max_length=32000)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=4)
+
+    @model_validator(mode='after')
+    def nonempty_message(self):
+        if not self.text.strip() and not self.attachment_ids:
+            raise ValueError('Text or an image is required')
+        if len(self.attachment_ids) != len(set(self.attachment_ids)):
+            raise ValueError('Duplicate attachment IDs')
+        return self
+
     execution_users: list[USER] = Field(default_factory=list, max_length=100)
+    execution_grants: list[account_grants.Grant] = Field(default_factory=list, max_length=100)
     mode: Literal["readonly", "confirm", "direct"] = "confirm"
     idempotency_key: str = Field(min_length=8, max_length=128)
 
 
 class Document(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    id: ID
+    id: ID = Field(default_factory=lambda: new_id('doc'))
     name: str = Field(min_length=1, max_length=200)
     content: str = Field(max_length=200000)
     core: bool = True
@@ -234,7 +270,11 @@ MODES = ("readonly", "confirm", "direct")
 
 
 def tool_spec(users, search_provider=None, mode="confirm"):
-    specs = []
+    from .questions import tool_spec as question_tool_spec
+    from .asset_memory import tool_spec as asset_memory_tool_spec
+    specs = [question_tool_spec(), asset_memory_tool_spec()]
+    if mode != 'readonly':
+        specs.append(account_grants.request_spec())
     # readonly turns deliberately withhold the execution tool entirely. This is a
     # real capability boundary: a jailbroken prompt still has nothing to call.
     if users and mode != "readonly":
@@ -311,7 +351,7 @@ class RoleEngine:
                 return False
             turn, settings = chosen
             try:
-                if turn["model_steps"] >= settings["max_model_steps"]:
+                if settings.get('max_model_steps') is not None and turn["model_steps"] >= settings["max_model_steps"]:
                     raise ModelFailure("MODEL_STEP_BUDGET_EXHAUSTED")
                 body = self.request_body(db, turn, settings)
             except ModelFailure as e:
@@ -319,7 +359,8 @@ class RoleEngine:
                 self.audit(db, "turn.failed", turn["id"], "service", {"error": str(e)})
                 return True
             call_id = str(uuid.uuid4())
-            db.execute("INSERT INTO model_calls(id,turn_id,model,request,state,created_at) VALUES(?,?,?,?,?,?)", (call_id, turn["id"], body["model"], json.dumps(body, ensure_ascii=False), "calling", time.time()))
+            from .attachments import compact_request
+            db.execute("INSERT INTO model_calls(id,turn_id,model,request,state,created_at) VALUES(?,?,?,?,?,?)", (call_id, turn["id"], body["model"], json.dumps(compact_request(body), ensure_ascii=False), "calling", time.time()))
             db.execute("UPDATE role_turns SET state='calling',model_steps=model_steps+1,updated_at=? WHERE id=?", (time.time(), turn["id"]))
             db.execute("UPDATE trigger_events SET state='calling' WHERE turn_id=?", (turn["id"],))
             self.audit(db, "model.request", turn["id"], "service", {"call_id": call_id, "model": body["model"]})
@@ -327,7 +368,8 @@ class RoleEngine:
         # the trusted context in editable tool arguments.
         response, error = None, None
         try:
-            response = client.complete(body)
+            selected_client = self.app.state.role_providers.client(settings, client)
+            response = selected_client.complete(body)
         except ModelFailure as e:
             error = str(e)
         except Exception:
@@ -356,18 +398,53 @@ class RoleEngine:
                 if len(calls) != 1:
                     raise ValueError("Unsupported tool")
                 name = calls[0]["function"]["name"]
-                if name not in ("execute_command", "web_search", "fetch_page"):
+                if name not in ("execute_command", "web_search", "fetch_page", "ask_user", "read_asset_memory", "request_execution_account"):
                     raise ValueError("Unsupported tool")
                 arguments = json.loads(calls[0]["function"]["arguments"])
             except Exception:
                 set_turn_state(db, turn["id"], "failed", "MODEL_TOOL_AUTHORIZATION_OR_SCHEMA_REJECTED")
                 self.audit(db, "model.tool_rejected", turn["id"], "service", {"call_id": call_id})
                 return True
+            if name == 'read_asset_memory':
+                from .asset_memory import MemoryRead, read_memory
+                try:
+                    request = MemoryRead.model_validate(arguments)
+                    content = read_memory(db, request.asset_id, active_only=True)
+                except Exception:
+                    content = {'error': 'ASSET_NOT_FOUND_OR_INVALID_ID'}
+                messages.append({'role': 'tool', 'tool_call_id': calls[0]['id'], 'content': json.dumps(content, ensure_ascii=False)})
+                db.execute("UPDATE role_turns SET messages=?,state='ready' WHERE id=?", (json.dumps(messages, ensure_ascii=False), turn['id']))
+                self.audit(db, 'asset.memory_read', turn['id'], 'model-tool', {'asset_id': arguments.get('asset_id') if isinstance(arguments, dict) else None})
+                return True
+            if name == 'request_execution_account':
+                try:
+                    request_id = account_grants.create_request(db, current, calls[0], arguments)
+                except Exception:
+                    set_turn_state(db, turn['id'], 'failed', 'MODEL_TOOL_AUTHORIZATION_OR_SCHEMA_REJECTED')
+                    return True
+                set_turn_state(db, turn['id'], 'waiting_user')
+                self.audit(db, 'authority.requested', turn['id'], 'model-tool', {'request_id': request_id, **arguments})
+                return True
+            if name == 'ask_user':
+                try:
+                    question_id = create_question(db, current, calls[0], arguments)
+                except Exception:
+                    set_turn_state(db, turn['id'], 'failed', 'MODEL_TOOL_AUTHORIZATION_OR_SCHEMA_REJECTED')
+                    self.audit(db, 'model.tool_rejected', turn['id'], 'service', {'call_id': call_id})
+                    return True
+                set_turn_state(db, turn['id'], 'waiting_user')
+                self.audit(db, 'question.created', question_id, 'model-tool', {'turn_id': turn['id'], 'tool_call_id': calls[0]['id']})
+                return True
             if name in ("web_search", "fetch_page"):
                 # Read-only information tools resolved inline. No asset, no
                 # account, no confirmation gate: they cannot change a host.
                 # Result is untrusted data, stored as an ordinary tool message.
                 tool_id = calls[0]["id"]
+                # Commit a durable reservation before external IO. Other workers
+                # skip tool_calling; cancellation can win without waiting on IO.
+                set_turn_state(db, turn['id'], 'tool_calling')
+                self.audit(db, 'tool.reserved', turn['id'], 'service', {'call_id': call_id, 'tool_call_id': tool_id})
+                db.commit()
                 if self.search_provider is None:
                     content = json.dumps({"error": "SEARCH_NOT_CONFIGURED"})
                 else:
@@ -383,8 +460,14 @@ class RoleEngine:
                         else:
                             url = str(arguments.get("url") or "")[:2000]
                             content = json.dumps({"text": fetch_page(url)}, ensure_ascii=False)
-                    except (SearchFailure, ValueError) as e:
-                        content = json.dumps({"error": str(e) or "SEARCH_FAILED"})
+                    except SearchFailure as error:
+                        content = json.dumps({'error': str(error) or 'SEARCH_FAILED'})
+                    except Exception:
+                        content = json.dumps({'error': 'SEARCH_FAILED'})
+                db.execute('BEGIN IMMEDIATE')
+                active = db.execute('SELECT state FROM role_turns WHERE id=?', (turn['id'],)).fetchone()
+                if not active or active['state'] != 'tool_calling':
+                    return True
                 messages.append({"role": "tool", "tool_call_id": tool_id, "content": content})
                 db.execute("UPDATE role_turns SET messages=?,state='ready' WHERE id=?", (json.dumps(messages, ensure_ascii=False), turn["id"]))
                 self.audit(db, "model.search", turn["id"], "service", {"call_id": call_id, "tool": name})
@@ -393,14 +476,14 @@ class RoleEngine:
                 # A readonly turn must never execute. If the model emits the tool
                 # anyway (it should not have it), reject rather than run. Reject
                 # the turn: silently ignoring could let the model keep "trying".
-                if current["mode"] == "readonly":
-                    raise ValueError("Execution tool is not available in readonly mode")
+                if current["mode"] not in ("confirm", "direct"):
+                    raise ValueError("Execution tool requires a valid execution mode")
                 command = ExecuteCommand.model_validate(arguments)
                 users = json.loads(current["execution_users"])
-                if command.run_as not in users:
-                    raise ValueError("Account not selected for turn")
+                if not account_grants.permits(db, current['id'], command.asset_id, command.run_as):
+                    raise ValueError("Asset account not selected for turn")
                 asset = db.execute("SELECT * FROM assets WHERE id=?", (command.asset_id,)).fetchone()
-                if asset is None or command.run_as not in json.loads(asset["allowed_users"]):
+                if asset is None or asset['retired_at'] is not None or command.run_as not in json.loads(asset["allowed_users"]):
                     raise ValueError("Account unavailable on asset")
             except Exception:
                 set_turn_state(db, turn["id"], "failed", "MODEL_TOOL_AUTHORIZATION_OR_SCHEMA_REJECTED")
@@ -411,6 +494,8 @@ class RoleEngine:
             # approve; direct -> queued now. (readonly was rejected above.)
             state = "awaiting_approval" if current["mode"] == "confirm" else "queued"
             payload = {**command.model_dump(), "role_id": current["role_id"], "execution_users": users, "mode": current["mode"], "idempotency_key": "model:" + call_id}
+            payload['authorization_revision'] = account_grants.authority(db, turn['id'])['authorization_revision']
+            payload['execution_grants'] = account_grants.authority(db, turn['id'])['execution_grants']
             db.execute("INSERT INTO tasks(id,role_id,asset_id,payload,state,idempotency_key,created_at,updated_at,turn_id) VALUES(?,?,?,?,?,?,?,?,?)",
                 (task_id, current["role_id"], command.asset_id, json.dumps(payload, ensure_ascii=False), state, payload["idempotency_key"], time.time(), time.time(), turn["id"]))
             db.execute("UPDATE role_turns SET state='waiting_tool',pending_task_id=? WHERE id=?", (task_id, turn["id"]))
@@ -422,66 +507,106 @@ class RoleEngine:
 def install_turns(app, transaction, audit, admin, default_model="", search_provider=None):
     engine = RoleEngine(app, transaction, audit, default_model, search_provider)
     app.state.role_engine = engine
+    install_questions(app, transaction, audit, admin)
+    account_grants.install(app, transaction, audit, admin)
 
     def require_role(db, role_id):
         if not db.execute("SELECT 1 FROM roles WHERE id=?", (role_id,)).fetchone():
             raise HTTPException(404, "Role not found")
 
-    def view(row):
+    def view(db, row):
         data = {**dict(row), "execution_users": json.loads(row["execution_users"]), "payload": json.loads(row["payload"]), "messages": json.loads(row["messages"]), "caller": row["caller"] or row["source"]}
         data["steps"] = derive_steps(data["messages"])
+        data['questions'] = questions_for_turn(db, row['id'])
+        from .attachments import for_turn
+        data['attachments'] = for_turn(db, row['id'])
+        data.update(account_grants.authority(db, row['id']))
+        data['account_requests'] = account_grants.requests(db, row['id'])
+        data['authorization_events'] = [dict(r) for r in db.execute('SELECT * FROM authority_events WHERE turn_id=? ORDER BY seq', (row['id'],))]
         return data
 
     @app.put("/api/v1/roles/{role_id}/model", dependencies=[Depends(admin)])
     def configure_model(role_id: ID, body: RoleModel):
-        with transaction() as db:
-            require_role(db, role_id)
-            db.execute("INSERT INTO role_models VALUES(?,?) ON CONFLICT(role_id) DO UPDATE SET config=excluded.config", (role_id, body.model_dump_json()))
-            audit(db, "role.model_configured", role_id, "admin", body.model_dump())
-        return body
+        providers = app.state.role_providers
+        with providers.mutation() as created:
+            with transaction() as db:
+                require_role(db, role_id)
+                previous = db.execute('SELECT config FROM role_models WHERE role_id=?', (role_id,)).fetchone()
+                settings = providers.prepare(role_id, body, json.loads(previous['config']) if previous else {}, created)
+                db.execute("INSERT INTO role_models VALUES(?,?) ON CONFLICT(role_id) DO UPDATE SET config=excluded.config", (role_id, json.dumps(settings)))
+                audit(db, "role.model_configured", role_id, "admin", {'enabled': settings['enabled'], 'provider_mode': settings['provider_mode'], 'key_changed': bool(created) or body.clear_api_key})
+        return providers.view(settings)
 
     @app.get("/api/v1/roles/{role_id}/model", dependencies=[Depends(admin)])
     def read_model(role_id: ID):
-        with transaction() as db:
+        with app.state.read_transaction() as db:
             require_role(db, role_id)
             row = db.execute("SELECT config FROM role_models WHERE role_id=?", (role_id,)).fetchone()
-            return json.loads(row["config"]) if row else RoleModel().model_dump()
+            return app.state.role_providers.view(json.loads(row["config"]) if row else RoleModel().model_dump(exclude={'api_key', 'clear_api_key'}))
 
     @app.post("/api/v1/roles/{role_id}/messages", dependencies=[Depends(admin)], status_code=202)
     def message(role_id: ID, body: Message):
-        if len(set(body.execution_users)) != len(body.execution_users):
-            raise HTTPException(422, "Duplicate execution users")
         source_id = role_id + ":" + body.idempotency_key
         with transaction() as db:
             require_role(db, role_id)
+            grants = account_grants.resolve_input(db, body.execution_grants, body.execution_users)
+            from .attachments import validate_ids, bind, for_turn
+            validate_ids(db, role_id, body.attachment_ids)
             old = db.execute("SELECT * FROM role_turns WHERE source='chat' AND source_id=?", (source_id,)).fetchone()
             if old:
-                if old["prompt"] != body.text or json.loads(old["execution_users"]) != body.execution_users or old["mode"] != body.mode:
+                if old["prompt"] != body.text or account_grants.authority(db, old['id'])['initial_execution_grants'] != grants or old["mode"] != body.mode or [a['id'] for a in for_turn(db, old['id'])] != body.attachment_ids:
                     raise HTTPException(409, "Message idempotency key reused with different content")
                 return {"turn_id": old["id"], "state": old["state"], "duplicate": True}
-            turn_id = enqueue_turn(db, role_id, "chat", source_id, body.execution_users, body.mode, body.text, {}, caller="web")
+            if body.attachment_ids:
+                configured = db.execute('SELECT config FROM role_models WHERE role_id=?', (role_id,)).fetchone()
+                if not configured or not json.loads(configured['config']).get('vision_enabled'):
+                    raise HTTPException(409, '当前角色未启用图片理解，请在模型设置确认服务商支持视觉后开启')
+            # Enforce readiness for the real service (embedded engines remain usable).
+            if getattr(app.state, 'enforce_model_readiness', False):
+                row = db.execute('SELECT config FROM role_models WHERE role_id=?', (role_id,)).fetchone()
+                settings = json.loads(row['config']) if row else {}
+                from .runtime_status import model_status
+                runtime = model_status(app)
+                if not settings.get('enabled'):
+                    raise HTTPException(409, '模型未启用：请打开角色设置启用模型；本次消息未入队')
+                independent = settings.get('provider_mode') == 'independent'
+                provider_ready = bool(settings.get('credential_ref')) if independent else runtime['provider_configured']
+                if not runtime['worker_running'] or not provider_ready or not (settings.get('model') or default_model):
+                    raise HTTPException(409, '模型服务未就绪：请检查全局服务配置；本次消息未入队')
+            turn_id = enqueue_turn(db, role_id, "chat", source_id, sorted({g['username'] for g in grants}), body.mode, body.text, {}, caller="web", grants=grants)
+            bind(db, turn_id, role_id, body.attachment_ids)
             audit(db, "chat.received", turn_id, "admin", body.model_dump())
-            return {"turn_id": turn_id, "state": "queued", "duplicate": False}
+            return {'turn_id': turn_id, 'state': 'queued', 'duplicate': False, 'execution_grants': grants,
+                    'account_input_warning': 'Deprecated usernames narrowed once to unambiguous registered assets; unmatched names grant nothing' if body.execution_users else None}
 
     @app.get("/api/v1/turns/{turn_id}", dependencies=[Depends(admin)])
     def get_turn(turn_id: str):
-        with transaction() as db:
+        with app.state.read_transaction() as db:
             row = db.execute("SELECT * FROM role_turns WHERE id=?", (turn_id,)).fetchone()
             if row is None:
                 raise HTTPException(404, "Turn not found")
-            return view(row)
+            return view(db, row)
 
     @app.get("/api/v1/roles/{role_id}/turns", dependencies=[Depends(admin)])
-    def list_turns(role_id: ID, after: int = 0, limit: int = 100):
-        if after < 0 or not 1 <= limit <= 500:
+    def list_turns(role_id: ID, after: int = 0, limit: int = 100, latest: bool = False, waiting_user: bool = False, before: int | None = None):
+        if after < 0 or not 1 <= limit <= 500 or (before is not None and before <= after):
             raise HTTPException(422, "Invalid pagination")
-        with transaction() as db:
+        with app.state.read_transaction() as db:
             require_role(db, role_id)
-            return [view(r) for r in db.execute("SELECT * FROM role_turns WHERE role_id=? AND seq>? ORDER BY seq LIMIT ?", (role_id, after, limit))]
+            predicate = " AND state='waiting_user'" if waiting_user else ''
+            params = [role_id, after]
+            if before is not None:
+                predicate += ' AND seq<?'
+                params.append(before)
+            order = 'DESC' if latest else 'ASC'
+            rows = db.execute('SELECT * FROM role_turns WHERE role_id=? AND seq>?' + predicate + ' ORDER BY seq ' + order + ' LIMIT ?', (*params, limit)).fetchall()
+            if latest:
+                rows = list(reversed(rows))
+            return [view(db, r) for r in rows]
 
     @app.get("/api/v1/turns/{turn_id}/model-calls", dependencies=[Depends(admin)])
     def calls(turn_id: str):
-        with transaction() as db:
+        with app.state.read_transaction() as db:
             return [{**dict(r), "request": json.loads(r["request"]), "response": json.loads(r["response"]) if r["response"] else None} for r in db.execute("SELECT * FROM model_calls WHERE turn_id=? ORDER BY created_at", (turn_id,))]
 
     @app.post("/api/v1/turns/{turn_id}/cancel", dependencies=[Depends(admin)])
@@ -490,8 +615,8 @@ def install_turns(app, transaction, audit, admin, default_model="", search_provi
             row = db.execute("SELECT * FROM role_turns WHERE id=?", (turn_id,)).fetchone()
             if row is None:
                 raise HTTPException(404, "Turn not found")
-            if row["state"] not in ("queued", "ready", "waiting_tool"):
-                raise HTTPException(409, "Cannot cancel active model call or unknown/terminal turn in this preview")
+            if row["state"] not in ("queued", "ready", "waiting_tool", "waiting_user", "calling", "tool_calling"):
+                raise HTTPException(409, "Cannot cancel unknown/terminal turn; resolve unknown execution explicitly")
             task = db.execute("SELECT * FROM tasks WHERE id=?", (row["pending_task_id"],)).fetchone()
             if task and task['state'] == 'unknown':
                 raise HTTPException(409, 'Unknown execution cannot be cleared by cancellation')
@@ -504,8 +629,23 @@ def install_turns(app, transaction, audit, admin, default_model="", search_provi
             audit(db, "turn.cancelled", turn_id, "admin", {})
         return {"state": "cancelled"}
 
+    @app.post("/api/v1/documents", dependencies=[Depends(admin)], status_code=201)
+    def create_document(body: Document):
+        from .observability import INVENTORY_ID
+        with transaction() as db:
+            if body.id == INVENTORY_ID or db.execute('SELECT 1 FROM documents WHERE id=?', (body.id,)).fetchone():
+                raise HTTPException(409, 'Document ID already exists')
+            for role in body.role_ids:
+                require_role(db, role)
+            db.execute('INSERT INTO documents VALUES(?,?,?,?,?,1,NULL)', (body.id, body.name, body.content, int(body.core), json.dumps(body.role_ids)))
+            audit(db, 'document.created', body.id, 'admin', {'name': body.name})
+        return body
+
     @app.put("/api/v1/documents/{document_id}", dependencies=[Depends(admin)])
     def save_document(document_id: ID, body: Document):
+        from .observability import INVENTORY_ID
+        if document_id == INVENTORY_ID:
+            raise HTTPException(409, 'System inventory is a read-only derived document')
         if document_id != body.id:
             raise HTTPException(422, "Document ID mismatch")
         with transaction() as db:
@@ -523,6 +663,9 @@ def install_turns(app, transaction, audit, admin, default_model="", search_provi
 
     @app.delete("/api/v1/documents/{document_id}", dependencies=[Depends(admin)])
     def delete_document(document_id: ID):
+        from .observability import INVENTORY_ID
+        if document_id == INVENTORY_ID:
+            raise HTTPException(409, 'System inventory is a read-only derived document')
         with transaction() as db:
             if not db.execute("UPDATE documents SET deleted_at=? WHERE id=? AND deleted_at IS NULL", (time.time(), document_id)).rowcount:
                 raise HTTPException(404, "Document not found")

@@ -141,7 +141,9 @@ def _setup_alarm(client, headers, status_value="firing"):
     client.post("/api/v1/roles", headers=headers, json={"id": "ops", "name": "Ops"})
     created = client.post("/api/v1/custom-tasks", headers=headers, json={
         "id": "alerts", "name": "Alerts", "kind": "trigger", "role_id": "ops",
-        "prompt": "诊断告警", "execution_users": ["ops_read"], "mode": "readonly", "enabled": True})
+        "prompt": "诊断告警", "execution_users": ["ops_read"], "mode": "readonly", "enabled": True,
+        # Legacy global push inheritance is explicit now; new tasks default to closed.
+        "notification": None})
     token = created.json()["trigger_token"]
     body = {"status": status_value, "host": "web1", "title": "Disk full", "severity": "critical"}
     r = client.post("/api/v1/triggers/alerts/invoke",

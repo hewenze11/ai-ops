@@ -15,6 +15,8 @@ import uuid
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter
+from .models import new_id
+from . import account_grants
 from fastapi import Depends, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
@@ -76,18 +78,63 @@ def trigger_path(custom_id):
     return "/api/v1/triggers/" + custom_id + "/invoke"
 
 
+class TaskNotification(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    enabled: bool = False
+    url: str | None = Field(default=None, max_length=2000)
+    channel: Literal['auto', 'feishu', 'dingtalk', 'wecom', 'slack', 'discord', 'generic'] = 'auto'
+    console_url: str | None = Field(default=None, max_length=2000)
+
+
+def prepare_notification(body, before=None):
+    """Preserve write-only secrets on normal edits; validate only on save/send."""
+    from .alert_notify import validate_url, validate_console_url, redact_url
+    if before is not None and 'notification' not in body.model_fields_set:
+        stored = before.get('notification')
+        # Empty objects are disabled overrides, not legacy inheritance.
+        body.notification = TaskNotification.model_validate(stored) if stored is not None else None
+    n = body.notification
+    if n is None:
+        return
+    old = (before or {}).get('notification') or {}
+    if old.get('url') and (n.url is None or n.url == redact_url(old['url'])):
+        n.url = old['url']
+    if n.enabled and not n.url:
+        raise HTTPException(422, 'Enabled notification requires a webhook URL')
+    try:
+        if n.url:
+            validate_url(n.url)
+        if n.console_url:
+            validate_console_url(n.console_url)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+def safe_task_config(config):
+    from .alert_notify import redact_url
+    cfg = json.loads(json.dumps(config))
+    if cfg.get('notification') and cfg['notification'].get('url'):
+        cfg['notification']['url'] = redact_url(cfg['notification']['url'])
+    return cfg
+
+
 class CustomTask(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    id: ID
+    id: ID = Field(default_factory=lambda: new_id('task'))
     name: str = Field(min_length=1, max_length=200)
     kind: Literal["trigger", "scheduled"]
     role_id: ID
     prompt: str = Field(min_length=1, max_length=32000)
-    execution_users: list[USER] = Field(min_length=1, max_length=100)
+    execution_users: list[USER] = Field(default_factory=list, max_length=100)
+    execution_grants: list[account_grants.Grant] = Field(default_factory=list, max_length=100)
     mode: Literal["readonly", "confirm", "direct"] = "confirm"
     enabled: bool = True
     cron: str | None = Field(default=None, max_length=200)
     timezone: str = Field(default="Asia/Shanghai", max_length=100)
+    # A newly created task never silently inherits a global delivery route.
+    # Explicit null remains the legacy API's opt-in inheritance representation.
+    # prepare_notification preserves the stored value on PUT omission.
+    notification: TaskNotification | None = Field(default_factory=TaskNotification)
 
     @model_validator(mode="after")
     def check(self):
@@ -128,8 +175,13 @@ class CustomTaskStore:
 
     @staticmethod
     def view(row):
-        return {**json.loads(row["config"]), "revision": row["revision"], "next_fire_at": row["next_fire_at"],
-                "trigger_path": trigger_path(row["id"])}
+        config = json.loads(row["config"])
+        notification = config.get('notification')
+        mode = ('legacy_inherit' if notification is None else
+                'task_webhook' if notification.get('enabled') else 'disabled')
+        return {**safe_task_config(config), "revision": row["revision"], "next_fire_at": row["next_fire_at"],
+                "trigger_path": trigger_path(row["id"]), "trigger_token_active": bool(row['token_hash']), "notification_mode": mode,
+                'account_input_warning': 'Deprecated usernames are frozen to execution_grants; unmatched usernames grant nothing' if config.get('execution_users') else None}
 
     def materialize(self, now=None):
         now = time.time() if now is None else now
@@ -193,8 +245,8 @@ def install_custom_tasks(app, transaction, audit, admin, admin_token):
     app.state.custom_tasks = store
 
     def require_role(db, role_id):
-        if not db.execute("SELECT 1 FROM roles WHERE id=?", (role_id,)).fetchone():
-            raise HTTPException(404, "Role not found")
+        from .role_lifecycle import require_active
+        require_active(db, role_id)
 
     @app.post("/api/v1/custom-tasks/cron-preview", dependencies=[Depends(admin)])
     def preview(body: CronPreview):
@@ -213,11 +265,13 @@ def install_custom_tasks(app, transaction, audit, admin, admin_token):
 
     @app.post("/api/v1/custom-tasks", dependencies=[Depends(admin)], status_code=201)
     def create(body: CustomTask):
+        prepare_notification(body)
         secret = secrets.token_urlsafe(36)
         now = time.time()
         due = next_fire(body.cron, body.timezone, now) if body.kind == "scheduled" and body.enabled else None
         with transaction() as db:
             require_role(db, body.role_id)
+            body.execution_grants = [account_grants.Grant(**g) for g in account_grants.resolve_input(db, body.execution_grants, body.execution_users)]
             if db.execute("SELECT 1 FROM custom_tasks WHERE id=?", (body.id,)).fetchone():
                 raise HTTPException(409, "Custom task ID already exists, including deleted records")
             db.execute("INSERT INTO custom_tasks VALUES(?,?,?,?,?,?,?,?)", (body.id, body.model_dump_json(), 1, hashlib.sha256(secret.encode()).hexdigest(), due, None, now, now))
@@ -249,6 +303,8 @@ def install_custom_tasks(app, transaction, audit, admin, admin_token):
             if old is None:
                 raise HTTPException(404, "Custom task not found")
             before = json.loads(old["config"])
+            body.execution_grants = [account_grants.Grant(**g) for g in account_grants.resolve_input(db, body.execution_grants, body.execution_users)]
+            prepare_notification(body, before)
             schedule_keys = ("kind", "cron", "timezone", "enabled")
             if all(before[k] == body.model_dump()[k] for k in schedule_keys):
                 due = old["next_fire_at"]
@@ -259,6 +315,24 @@ def install_custom_tasks(app, transaction, audit, admin, admin_token):
                 db.execute("UPDATE schedule_outbox SET state='cancelled',last_error='CUSTOM_TASK_DISABLED' WHERE custom_task_id=? AND state='pending'", (custom_id,))
             audit(db, "custom_task.updated", custom_id, "admin", {"before": before, "after": body.model_dump()})
             return store.view(db.execute("SELECT * FROM custom_tasks WHERE id=?", (custom_id,)).fetchone())
+
+    @app.post('/api/v1/custom-tasks/{custom_id}/trigger-token', dependencies=[Depends(admin)])
+    def issue_trigger_token(custom_id: ID):
+        secret = secrets.token_urlsafe(36)
+        with transaction() as db:
+            if not db.execute('UPDATE custom_tasks SET token_hash=?,updated_at=? WHERE id=? AND deleted_at IS NULL',
+                    (hashlib.sha256(secret.encode()).hexdigest(), time.time(), custom_id)).rowcount:
+                raise HTTPException(404, 'Custom task not found')
+            audit(db, 'custom_task.token_rotated', custom_id, 'admin', {})
+        return {'trigger_token': secret, 'trigger_token_active': True}
+
+    @app.delete('/api/v1/custom-tasks/{custom_id}/trigger-token', dependencies=[Depends(admin)])
+    def revoke_trigger_token(custom_id: ID):
+        with transaction() as db:
+            if not db.execute("UPDATE custom_tasks SET token_hash='',updated_at=? WHERE id=? AND deleted_at IS NULL", (time.time(), custom_id)).rowcount:
+                raise HTTPException(404, 'Custom task not found')
+            audit(db, 'custom_task.token_revoked', custom_id, 'admin', {})
+        return {'trigger_token_active': False, 'accepted_work_unchanged': True, 'schedule_unchanged': True}
 
     @app.delete("/api/v1/custom-tasks/{custom_id}", dependencies=[Depends(admin)])
     def delete(custom_id: ID):
@@ -277,7 +351,7 @@ def install_custom_tasks(app, transaction, audit, admin, admin_token):
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(401, "Bearer authentication required")
         supplied = authorization[7:]
-        internal = hmac.compare_digest(supplied.encode(), store.admin_token_provider().encode())
+        internal = bool(x_schedule_event_id) and hmac.compare_digest(supplied.encode(), store.admin_token_provider().encode())
         # Authenticate before reading an attacker-controlled request body.
         with transaction() as db:
             row = db.execute("SELECT * FROM custom_tasks WHERE id=?", (custom_id,)).fetchone()
@@ -307,6 +381,9 @@ def install_custom_tasks(app, transaction, audit, admin, admin_token):
         answer = None
         with transaction() as db:
             row = db.execute("SELECT * FROM custom_tasks WHERE id=?", (custom_id,)).fetchone()
+            # Revalidate after body read: token revocation/rotation must win the race.
+            if row is None or (not internal and (not row['token_hash'] or not hmac.compare_digest(hashlib.sha256(supplied.encode()).hexdigest(), row['token_hash']))):
+                raise HTTPException(403, 'Invalid trigger credential')
             cfg = json.loads(row["config"])
             from . import alarms
             from .turns import enqueue_turn
@@ -350,7 +427,12 @@ def install_custom_tasks(app, transaction, audit, admin, admin_token):
                 event_id = str(uuid.uuid4())
                 db.execute("INSERT INTO trigger_events(id,custom_task_id,dedupe_key,source,scheduled_for,payload,snapshot,revision,role_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                            (event_id, custom_id, key, source, scheduled_for, json.dumps(payload, ensure_ascii=False), snapshot, revision, template["role_id"], time.time()))
-                turn_id = enqueue_turn(db, template['role_id'], source, event_id, template['execution_users'], template['mode'], template['prompt'], payload)
+                grants = account_grants.validate_grants(db, template.get('execution_grants', []))
+                # Legacy templates carry no asset-scoped authority. Keep accepted
+                # history, but fail closed for legacy unattended execution.
+                if template.get('execution_users') and 'execution_grants' not in template:
+                    raise HTTPException(409, 'Legacy task requires asset-scoped account selection')
+                turn_id = enqueue_turn(db, template['role_id'], source, event_id, sorted({g['username'] for g in grants}), template['mode'], template['prompt'], payload, grants=grants)
                 db.execute("UPDATE trigger_events SET turn_id=? WHERE id=?", (turn_id, event_id))
                 alarms.record(db, audit, alarm_id=str(uuid.uuid4()), custom_task_id=custom_id,
                               source=entry["source"], dedupe_key=key, payload=payload,
@@ -368,7 +450,8 @@ def install_custom_tasks(app, transaction, audit, admin, admin_token):
             raise HTTPException(422, "Invalid pagination")
         with transaction() as db:
             rows = db.execute("SELECT * FROM trigger_events WHERE seq>? AND (? IS NULL OR role_id=?) ORDER BY seq LIMIT ?", (after, role_id, role_id, limit))
-            return [{**dict(r), "payload": json.loads(r["payload"]), "snapshot": json.loads(r["snapshot"])} for r in rows]
+            from .scrubbing import redact_structure
+            return [{**dict(r), "payload": redact_structure(json.loads(r["payload"])), "snapshot": safe_task_config(json.loads(r["snapshot"]))} for r in rows]
 
     @app.get("/api/v1/schedule-deliveries", dependencies=[Depends(admin)])
     def deliveries(limit: int = 100):

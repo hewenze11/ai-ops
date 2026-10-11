@@ -17,7 +17,7 @@ from typing import Literal
 
 import paramiko
 from fastapi import Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 PROTOCOL = "1.1"
 CHUNK = 65536
@@ -74,7 +74,17 @@ def _load_secret(secret_ref):
     """
     try:
         with open(secret_ref, "rb") as handle:
-            return handle.read()
+            data = handle.read()
+        from pathlib import Path
+        import re
+        from .connector_secrets import MAGIC, decrypt_file, InvalidToken
+        if data.startswith(MAGIC) or re.fullmatch(r'[0-9a-f]{32}\.enc', Path(secret_ref).name):
+            try:
+                return decrypt_file(secret_ref, data)
+            except (OSError, ValueError, InvalidToken):
+                raise paramiko.SSHException(
+                    'SECRET_DECRYPT_FAILED: managed SSH credential or master key is unavailable or invalid') from None
+        return data
     except PermissionError as error:
         raise paramiko.SSHException(
             "SECRET_NOT_READABLE: %s is not readable by the service user; "
@@ -123,6 +133,8 @@ def _classify_connect_error(error):
         return 'SECRET_NOT_READABLE'
     if text.startswith('SECRET_NOT_FOUND'):
         return 'SECRET_NOT_FOUND'
+    if text.startswith('SECRET_DECRYPT_FAILED'):
+        return 'SECRET_DECRYPT_FAILED'
     if 'SSH host key is not pinned' in text:
         return 'HOST_KEY_NOT_PINNED'
     if 'pinned SSH host key is not a valid public key' in text:
@@ -156,6 +168,22 @@ class Strict(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
 
+class ConnectionUpdate(Strict):
+    ssh_host: str | None = Field(default=None, max_length=255)
+    ssh_port: int | None = Field(default=None, ge=1, le=65535)
+    ssh_user: str | None = Field(default=None, max_length=64)
+    ssh_auth_kind: str | None = Field(default=None, pattern='^(key|password)$')
+    ssh_secret_ref: str | None = Field(default=None, max_length=512)
+    ssh_secret: SecretStr | None = Field(default=None, min_length=1, max_length=65536)
+    ssh_host_key: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode='after')
+    def one_credential_source(self):
+        if self.ssh_secret is not None and self.ssh_secret_ref:
+            raise ValueError('Provide either a secret or an existing file reference, not both')
+        return self
+
+
 def install_connector(app, transaction, audit, admin):
     @app.get('/api/v1/assets/{asset_id}/connection', dependencies=[Depends(admin)])
     def get_connection(asset_id: str):
@@ -163,6 +191,31 @@ def install_connector(app, transaction, audit, admin):
             if not db.execute('SELECT 1 FROM assets WHERE id=?', (asset_id,)).fetchone():
                 raise HTTPException(404, 'Asset not found')
             # Never include ssh_secret_ref here.
+            return connection_view(db, asset_id)
+
+    @app.put('/api/v1/assets/{asset_id}/connection', dependencies=[Depends(admin)])
+    def update_connection(asset_id: str, body: ConnectionUpdate):
+        from .app import Asset
+        with app.state.connector_secrets.mutation(body) as prepared, transaction() as db:
+            asset = db.execute('SELECT * FROM assets WHERE id=?', (asset_id,)).fetchone()
+            if not asset:
+                raise HTTPException(404, 'Asset not found')
+            if asset['connection_type'] != 'ssh':
+                raise HTTPException(409, 'Only SSH connection settings can be edited; Agent uses token pairing')
+            if db.execute("SELECT 1 FROM tasks WHERE asset_id=? AND state IN ('claimed','unknown')", (asset_id,)).fetchone():
+                raise HTTPException(409, 'An active/unknown execution prevents connection changes')
+            before = db.execute('SELECT * FROM asset_connections WHERE asset_id=?', (asset_id,)).fetchone()
+            values = dict(before) if before else {}
+            for key, value in prepared.model_dump(exclude_unset=True, exclude={'ssh_secret'}).items():
+                if value not in (None, ''):
+                    values[key] = value
+            try:
+                updated = Asset(id=asset_id, name=asset['name'], allowed_users=json.loads(asset['allowed_users']), connection_type='ssh',
+                                **{key: value for key, value in values.items() if key.startswith('ssh_')})
+            except ValueError:
+                raise HTTPException(422, 'SSH host/user/auth/secret file reference/pinned host key are required')
+            save_connection(db, updated)
+            audit(db, 'asset.connection_updated', asset_id, 'admin', {'connection_type': 'ssh'})
             return connection_view(db, asset_id)
 
     @app.post('/api/v1/assets/{asset_id}/ssh/check', dependencies=[Depends(admin)])
@@ -209,7 +262,8 @@ class ConnectorExecutor:
                 AND NOT EXISTS (SELECT 1 FROM tasks prior WHERE prior.turn_id=t.turn_id AND prior.seq<t.seq
                   AND prior.state IN ('queued','awaiting_approval','claimed','unknown'))
                 ORDER BY rt.seq,t.seq LIMIT 1""", (asset_id,)).fetchone()
-            if row is None:
+            from .authority import claim_allowed
+            if row is None or not claim_allowed(db, row):
                 return None
             claim_id = 'connector-' + uuid.uuid4().hex
             db.execute("UPDATE tasks SET state='claimed',claim_id=?,claimed_protocol=?,lease_seconds=?,claim_count=claim_count+1,updated_at=? WHERE id=?",

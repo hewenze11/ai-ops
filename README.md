@@ -4,7 +4,13 @@
 
 > 准备把它真正跑起来、变成“陌生人也能用”的东西？看 **[docs/getting-started-checklist.md](docs/getting-started-checklist.md)** —— 一页写着**你本人**要在真实机器/账号上做的 4 个动作（改 GHCR 包可见性、全新装一遍、配告警外推、填官网内容），每步都有“做完怎么验证”。
 
-## 快速开始（一条命令装主服务）
+## 手工容器部署（当前推荐的从零体验入口）
+
+见 **[docs/docker-manual.md](docs/docker-manual.md)**：自己准备 `.env`、管理员Token与挂载目录，随后 `docker compose pull && docker compose up -d --no-build`。也可直接用仓库Dockerfile构建。
+
+镜像不含旧数据/凭据，不自动登记远程资产。登录后自行配置角色模型，再分别体验 **Agent主动连接** 与 **SSH连接目标机**。Agent容器只控制容器内环境；宿主运维用SSH或手工原生Agent。
+
+## 历史一键安装入口（本轮不调整）
 
 在一台装了 Docker 的 Linux 机器上（root / sudo）：
 
@@ -91,7 +97,7 @@ pytest -q
 要求 Docker / Compose。以下目录均属本项目，不要使用旧服务的数据目录。
 
 ```sh
-mkdir -p state secrets
+mkdir -p state secrets connector
 chmod 700 secrets
 python3 -c 'import secrets; from pathlib import Path; Path("secrets/admin_token").write_text(secrets.token_urlsafe(48))'
 chown -R 10001:10001 state secrets
@@ -99,7 +105,7 @@ chmod 600 secrets/admin_token
 docker compose -p ai-ops-preview up -d --build
 ```
 
-默认仅监听宿主机 `127.0.0.1:18765`。远程测试通过 SSH 隧道，或配置有认证和 TLS 的反向代理；不要直接对公网开放管理接口。管理 Token 使用只读文件挂载；不放在命令行参数、Git 或模型上下文。
+默认仅监听宿主机 `127.0.0.1:8765`。远程测试通过 SSH 隧道，或配置有认证和 TLS 的反向代理；不要直接对公网开放管理接口。管理 Token 使用只读文件挂载；不放在命令行参数、Git 或模型上下文。
 
 `GET /healthz` 为健康检查。`/docs` 为临时 API 联调界面，不是产品前端。
 
@@ -108,7 +114,7 @@ docker compose -p ai-ops-preview up -d --build
 ## 安全与恢复边界
 
 1. 管理端任务入口是受信任的授权边界，未来模型不能直接控制它的本轮授权名单。此版本没有提供模型工具。
-2. 同一资产仅有 Agent 接入，本预览未实现 Connector，未来二选一而非双路执行。
+2. 远程资产可选 Agent 或 SSH Connector；不要无意将同一执行对象登记成两个并行控制路径。
 3. 只读与可修改由原生账号权限实现，账号名字不提供权限保证。
 4. 任务领取与审计在事务内完成后才响应。响应丢失会留在 claimed，不会自动回到队列。
 5. Agent 崩溃恢复报告 unknown，阻塞同角色后续任务，防止未经确认继续修改。当前需人工调查，不能通过删数据库解除。

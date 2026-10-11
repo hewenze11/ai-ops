@@ -1,9 +1,11 @@
 """Backup and restore for the control database.
 
-Everything durable in this service lives in one SQLite database (the same file
-carries roles, assets with hashed tokens, tasks, audit, output archives, leases
-and turns). Secrets are mounted read-only and are deliberately *not* part of a
-backup: a snapshot must never embed an admin token or an SSH private key.
+SQLite carries roles, assets, tasks, audit, output archives, leases and turns.
+Role-provider credentials are copied to a protected .role-secrets sibling
+folder; never embedded in SQLite or API metadata. Managed SSH credentials use
+protected .connector-secrets ciphertext and .connector-keys key sidecars; both
+must be protected and retained with the snapshot. Legacy SSH file references,
+admin and global model credentials remain external and are NOT included.
 
 Backups use SQLite's online backup API, which produces a transactionally
 consistent snapshot even while the service is running under WAL, without
@@ -16,6 +18,7 @@ import json
 import os
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 
 # Highest schema version this build understands. Restoring a backup written by a
@@ -119,9 +122,27 @@ def create_backup(db_path, out_path):
     finally:
         flush.close()
     report = inspect(tmp)
+    refs = _credential_refs(tmp)
+    secret_source = Path(os.environ.get('AI_OPS_ROLE_SECRET_DIR') or source.parent / 'role-secrets')
+    _copy_role_secrets(refs, secret_source, Path(str(out) + '.role-secrets'))
+    from .attachments import backup_files, copy_files, root_for
+    attachment_files = backup_files(tmp)
+    try:
+        copy_files(attachment_files, root_for(source), Path(str(out) + '.attachments'))
+    except (ValueError, OSError) as error:
+        raise BackupError('Attachment backup incomplete: ' + type(error).__name__) from None
+    from .connector_secrets import backup_managed, InvalidToken
+    try:
+        connector_secret_count = backup_managed(tmp, out)
+    except (ValueError, OSError, sqlite3.Error, InvalidToken) as error:
+        raise BackupError('Managed SSH credential backup incomplete: ' + type(error).__name__) from None
     os.replace(tmp, out)
     meta = {"created_at": time.time(), "source": str(source), "schema_version": report["schema_version"],
-            "size": report["size"], "sha256": _sha256(out), "counts": report["counts"]}
+            "size": report["size"], "sha256": _sha256(out), "counts": report["counts"],
+            "role_secrets_included": bool(refs), "role_secret_count": len(refs),
+            "attachment_file_count": len(attachment_files),
+            "connector_secret_count": connector_secret_count,
+            "connector_secrets_included": bool(connector_secret_count)}
     sidecar = Path(str(out) + META_SUFFIX)
     with open(sidecar, "w", encoding="utf-8") as handle:
         json.dump(meta, handle, ensure_ascii=False, indent=2)
@@ -146,6 +167,24 @@ def verify_backup(path):
             raise BackupError("Backup digest does not match its metadata")
         if meta.get("schema_version") != report["schema_version"]:
             raise BackupError("Backup metadata schema version disagrees with the file")
+    refs = _credential_refs(out)
+    folder = Path(str(out) + '.role-secrets')
+    if any(not (folder / (ref + '.key')).is_file() for ref in refs):
+        raise BackupError('Role credential backup is missing; keep the .role-secrets sibling folder with this snapshot')
+    _enforce_secret_permissions(folder)
+    from .attachments import backup_files, verify_files
+    try:
+        verify_files(backup_files(out), Path(str(out) + '.attachments'))
+    except (ValueError, OSError):
+        raise BackupError('Keep the complete, unmodified .attachments folder with this snapshot') from None
+    from .connector_secrets import verify_managed, InvalidToken
+    try:
+        verify_managed(out)
+        for suffix in ('.connector-secrets', '.connector-keys'):
+            _enforce_secret_permissions(Path(str(out) + suffix))
+    except (ValueError, OSError, sqlite3.Error, InvalidToken):
+        raise BackupError('Managed SSH credential backup is incomplete or invalid; keep both '
+                          '.connector-secrets and .connector-keys folders with this snapshot') from None
     return {"report": report, "meta": meta}
 
 
@@ -161,6 +200,14 @@ def restore_backup(backup_path, db_path):
     verify_backup(backup_path)
     live = Path(db_path)
     live.parent.mkdir(parents=True, exist_ok=True)
+    refs = _credential_refs(backup_path)
+    target_secrets = Path(os.environ.get('AI_OPS_ROLE_SECRET_DIR') or live.parent / 'role-secrets')
+    _copy_role_secrets(refs, Path(str(backup_path) + '.role-secrets'), target_secrets)
+    from .attachments import backup_files, copy_files, root_for
+    try:
+        copy_files(backup_files(backup_path), Path(str(backup_path) + '.attachments'), root_for(live))
+    except (ValueError, OSError):
+        raise BackupError('Attachment restore failed; live database was not replaced') from None
     # Stage the validated copy next to the live DB so the final rename is atomic.
     staged = live.with_name(live.name + ".restore-incoming")
     if staged.exists():
@@ -174,43 +221,112 @@ def restore_backup(backup_path, db_path):
         dest.flush()
         os.fsync(dest.fileno())
     os.chmod(staged, 0o600)
-    # Re-verify the staged copy: what we are about to install must be the same
-    # healthy snapshot we validated.
-    inspect(staged)
-
+    from .connector_secrets import restore_managed, InvalidToken
+    import uuid
     safety = None
-    if live.exists():
-        # Fold the live database's WAL back into the main file first: in WAL mode
-        # recent commits live in the -wal file, so a raw rename of just the main
-        # file would silently drop them and leave an unusable safety copy. Also
-        # leave WAL mode: the service is stopped for a restore, and dropping the
-        # -wal/-shm sidecars makes the rename reliable on platforms that refuse
-        # to rename a file they already have open.
-        try:
+    old_moved = False
+    created_secrets = []
+    try:
+        inspect(staged)
+        # Only the staged DB is rewritten. Existing destination credentials and
+        # master key are retained, so the safety DB keeps its usable references.
+        created_secrets = restore_managed(backup_path, staged, live)
+        _checkpoint(staged)
+        _leave_wal_mode(staged)
+        inspect(staged)
+        with open(staged, 'rb+') as handle:
+            os.fsync(handle.fileno())
+        if live.exists():
+            # Restore requires a stopped service; preserve committed WAL data.
             _checkpoint(live)
             _leave_wal_mode(live)
-        except sqlite3.Error as error:
-            raise BackupError("Cannot checkpoint the live database before restore: %s" % type(error).__name__)
-        safety = live.with_name(live.name + ".pre-restore-%d" % int(time.time()))
-        # On Windows a leftover connection can hold the main file briefly; retry
-        # the rename so a transient handle does not abort an already-validated
-        # restore.
-        for attempt in range(20):
-            try:
-                os.replace(live, safety)
-                break
-            except PermissionError:
-                if attempt == 19:
-                    raise BackupError("Cannot take the live database offline for restore")
-                time.sleep(0.25)
-    # Remove old WAL/SHM so the restored file is not shadowed by stale journal.
-    for suffix in ("-wal", "-shm"):
-        stale = Path(str(live) + suffix)
-        if stale.exists():
-            stale.unlink()
-    os.replace(staged, live)
+            safety = live.with_name(live.name + '.pre-restore-%d-%s' %
+                                    (int(time.time()), uuid.uuid4().hex[:8]))
+            for attempt in range(20):
+                try:
+                    os.replace(live, safety)
+                    old_moved = True
+                    break
+                except PermissionError:
+                    if attempt == 19:
+                        raise BackupError('Cannot take the live database offline for restore')
+                    time.sleep(0.25)
+        for suffix in ('-wal', '-shm'):
+            Path(str(live) + suffix).unlink(missing_ok=True)
+        os.replace(staged, live)
+    except BaseException as error:
+        try:
+            if old_moved:
+                os.replace(safety, live)
+        except OSError:
+            raise BackupError('Restore installation and rollback failed; previous database is '
+                              'preserved in the .pre-restore sibling; service must remain stopped') from None
+        finally:
+            for secret in created_secrets:
+                Path(secret).unlink(missing_ok=True)
+            for suffix in ('', '-wal', '-shm', '-journal'):
+                Path(str(staged) + suffix).unlink(missing_ok=True)
+        if isinstance(error, (ValueError, OSError, sqlite3.Error, InvalidToken)):
+            raise BackupError('Restore failed; live database was not replaced: ' + type(error).__name__) from None
+        raise
     return {"restored_from": str(backup_path), "database": str(live),
             "previous_kept_at": str(safety) if safety else None}
+
+
+def _credential_refs(path):
+    from .role_provider import RoleProviders
+    refs = set()
+    with closing(sqlite3.connect('file:' + Path(path).as_posix() + '?mode=ro', uri=True)) as db:
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='role_models'").fetchone():
+            for row in db.execute('SELECT config FROM role_models'):
+                ref = json.loads(row[0]).get('credential_ref')
+                if ref:
+                    try:
+                        RoleProviders('.').path(ref)
+                    except Exception:
+                        raise BackupError('Invalid role credential reference') from None
+                    refs.add(ref)
+    return refs
+
+
+def _copy_role_secrets(refs, source, destination):
+    if not refs:
+        return
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(destination, 0o700)
+    for ref in refs:
+        origin, target = source / (ref + '.key'), destination / (ref + '.key')
+        if not origin.is_file() or origin.is_symlink():
+            raise BackupError('Referenced role credential is unavailable')
+        if target.exists():
+            if target.is_symlink() or target.read_bytes() != origin.read_bytes():
+                raise BackupError('Role credential revision conflict')
+            continue
+        temporary = target.with_suffix('.partial')
+        try:
+            with open(temporary, 'xb') as output:
+                os.chmod(temporary, 0o600)
+                output.write(origin.read_bytes())
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, target)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
+
+def _enforce_secret_permissions(folder):
+    """A role-secret folder must not be world/group readable. Best effort on
+    POSIX; a no-op on platforms without POSIX modes (Windows test hosts)."""
+    if not folder.exists() or os.name == 'nt':
+        return
+    try:
+        os.chmod(folder, 0o700)
+        for entry in folder.iterdir():
+            if entry.is_file():
+                os.chmod(entry, 0o600)
+    except OSError:
+        raise BackupError('Role credential backup permissions cannot be enforced')
 
 
 def _leave_wal_mode(path):

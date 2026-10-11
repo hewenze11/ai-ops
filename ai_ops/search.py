@@ -172,8 +172,11 @@ class _TextExtractor(HTMLParser):
 def fetch_page(url, max_chars=8000):
     """Fetch a URL and return readable text. No credentials, GET only."""
     parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
         raise SearchFailure("FETCH_URL_INVALID")
+    # Internal documentation endpoints remain compatible. This is NOT a full
+    # SSRF boundary: deployment egress policy must block metadata/control APIs.
+    # A default public-only policy would silently break existing intranet use.
     raw = _http_get(url, {"Accept": "text/html,application/xhtml+xml", "User-Agent": "AI-Ops-Search"}, 20)
     charset = "utf-8"
     match = re.search(rb'charset=["\']?([\w-]+)', raw[:4096], re.I)

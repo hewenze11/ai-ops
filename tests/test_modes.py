@@ -64,16 +64,16 @@ def names_in_request(body):
 
 
 def test_tool_spec_omits_execution_tool_in_readonly():
-    assert names_in_request({"tools": tool_spec(["ops_read"], None, "readonly")}) == []
-    assert names_in_request({"tools": tool_spec(["ops_read"], None, "confirm")}) == ["execute_command"]
-    assert names_in_request({"tools": tool_spec(["ops_read"], None, "direct")}) == ["execute_command"]
+    assert names_in_request({"tools": tool_spec(["ops_read"], None, "readonly")}) == ["ask_user", "read_asset_memory"]
+    assert names_in_request({"tools": tool_spec(["ops_read"], None, "confirm")}) == ["ask_user", "read_asset_memory", "request_execution_account", "execute_command"]
+    assert names_in_request({"tools": tool_spec(["ops_read"], None, "direct")}) == ["ask_user", "read_asset_memory", "request_execution_account", "execute_command"]
 
 
 def test_tools_for_turn_defaults_unknown_mode_to_confirm():
     turn = {"execution_users": json.dumps(["ops_read"]), "mode": "totally-unknown"}
     names = [t["function"]["name"] for t in tools_for_turn(turn, {}, None)]
     # Unknown mode must not silently become direct; it behaves like confirm.
-    assert names == ["execute_command"]
+    assert names == ["ask_user", "read_asset_memory", "request_execution_account", "execute_command"]
 
 
 def test_readonly_model_request_has_no_execution_tool():

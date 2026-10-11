@@ -25,6 +25,14 @@ sudo chmod 600 secrets/admin_token
 
 ## 2. 拉取并启动
 
+当前GHCR镜像需要授权拉取（公开代码仓库不等于镜像包公开）。先在这台Linux登录一次：
+
+```sh
+docker login ghcr.io -u YOUR_GITHUB_USERNAME
+```
+
+在密码提示中输入你自己的、具有 `read:packages` 且能访问该包的GitHub Token，不是GitHub登录密码，不要把Token粘在命令行或发给助手。然后：
+
 ```sh
 docker compose pull && docker compose up -d --no-build
 docker compose ps

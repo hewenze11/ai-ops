@@ -5,9 +5,9 @@
 每个阶段独立可验收（单测 + 本地回归 + 真机 smoke），完成后在本文件勾选并写验证证据，再进入下一阶段。任何阶段中断，从本文件状态恢复。
 
 ## 阶段 0：现状盘点与接口冻结（半天）
-- [ ] 跑通两仓全量测试，记录基线通过数。
-- [ ] 冻结协议扩展字段：任务 `kind`（`shell`|`readonly`|`change`），旧任务无 `kind` 视为 `shell`，Agent 老版本遇到未知 `kind` 必须拒绝（fail closed）。
-- 验收：基线测试全绿；协议文档 `protocol-v12.md` 草案。
+- [x] 跑通两仓全量测试，记录基线通过数。
+- [x] 冻结协议扩展字段：任务 `kind`（`shell`|`readonly`|`change`），旧任务无 `kind` 视为 `shell`，Agent 老版本遇到未知 `kind` 必须拒绝（fail closed）。
+- 验收：基线测试全绿；协议文档 `protocol-v13.md` 草案（1.2 已被联邦占用）。
 
 ## 阶段 1：闸1/闸2 只读通道（主服务 + Agent）
 对应 §4、§39.2、§45、§48。
@@ -52,3 +52,5 @@
 
 ## 进度记录
 （每阶段完成时追加：日期 / 改动文件 / 测试结果 / 真机证据 / 遗留）
+
+- 2026-10-22 阶段 0 完成。基线：ai-ops 488 passed（3m50s）；ai-ops-agent 30 passed / 13 skipped（Linux-only 用例，Windows 跳过）。新增 `docs/protocol-v13.md`。本地仓与 GitHub 对齐（两仓此前落后远端 install.sh/CI 提交，已取回；本地未提交的 docs 已推送）。遗留：Agent Linux 用例须在 .94 真机跑。

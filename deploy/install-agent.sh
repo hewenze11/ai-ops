@@ -7,8 +7,8 @@
 #
 # What it does:
 #   1. creates two native execution accounts with least privilege:
-#        aiops_read  — for read-only work (no sudo, no docker, no shell poking)
-#        aiops_ops   — for change work (limited sudo for service restarts)
+#        aiops_read  — for read-only work (no sudo, no docker, journal+log groups only)
+#        aiops_ops   — for change work (sudo only for the units you name, no wildcards)
 #   2. installs the agent into its own venv under /opt/ai-ops-agent;
 #   3. writes a 0600 config and a hardened systemd unit, and starts it;
 #   4. prints the verified status.
@@ -22,13 +22,18 @@
 #   --read-user  <name>     read-only account name (default aiops_read)
 #   --ops-user   <name>     change account name (default aiops_ops)
 #   --no-sudo               do NOT grant aiops_ops any sudo (strictest)
+#   --ops-units "a.service b.service"   units aiops_ops may restart/reload
+#                           (no wildcard; without this the account has no sudo)
 #   --journal-dir <path>    agent journal dir (default /var/lib/ai-ops-agent)
+#   --ops-units "a.service b"   exact units aiops_ops may restart/reload/start/stop
+#                           (no wildcard; without it the account gets no sudo)
 set -euo pipefail
 
 PAIRING=""
 READ_USER="aiops_read"
 OPS_USER="aiops_ops"
 GRANT_SUDO=1
+OPS_UNITS=""
 JOURNAL="/var/lib/ai-ops-agent"
 REPO_PIP="git+https://github.com/hewenze11/ai-ops-agent.git"
 
@@ -38,7 +43,10 @@ while [ $# -gt 0 ]; do
     --read-user) READ_USER="$2"; shift 2;;
     --ops-user) OPS_USER="$2"; shift 2;;
     --no-sudo) GRANT_SUDO=0; shift;;
+    --ops-units) OPS_UNITS="$2"; shift 2;;
+    --ops-units=*) OPS_UNITS="${1#*=}"; shift;;
     --journal-dir) JOURNAL="$2"; shift 2;;
+    --allow-root-readonly) ALLOW_ROOT_READONLY=1; shift;;
     *) echo "unknown option: $1" >&2; exit 2;;
   esac
 done
@@ -123,16 +131,59 @@ fi
 
 if [ "$GRANT_SUDO" = "1" ]; then
   SUDOERS="/etc/sudoers.d/ai-ops-agent"
-  say "Granting $OPS_USER limited sudo (service restarts only); $READ_USER gets none"
-  cat >"$SUDOERS" <<EOF
-# Managed by install-agent.sh. Least privilege: only service control, no shells.
-${OPS_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl restart *, /usr/bin/systemctl start *, /usr/bin/systemctl stop *, /usr/bin/systemctl status *
-EOF
+  say "Granting $OPS_USER exact sudo commands (no wildcards); $READ_USER gets none"
+  # Why no `systemctl restart *`: the wildcard also matches
+  # `restart foo.service --option`, and more importantly it matches units whose
+  # ExecStart is an arbitrary program — i.e. root code execution by a second
+  # route. The install grants nothing until an operator names the units this
+  # host actually runs, and the file is regenerated on every run (idempotent).
+  OPS_UNITS="${OPS_UNITS:-}"
+  {
+    echo "# Managed by install-agent.sh. Only these exact commands, no wildcards."
+    echo "# Read-only account gets no sudo at all: the read channel must not be able to escalate."
+    if [ -n "$OPS_UNITS" ]; then
+      for unit in $OPS_UNITS; do
+        case "$unit" in
+          *[!A-Za-z0-9@._-]*|'') warn "ignoring invalid unit name: $unit"; continue;;
+        esac
+        for verb in restart reload start stop; do
+          echo "$OPS_USER ALL=(root) NOPASSWD: /usr/bin/systemctl $verb $unit"
+        done
+        echo "$OPS_USER ALL=(root) NOPASSWD: /usr/bin/systemctl status $unit"
+      done
+    else
+      echo "# No units configured yet: $OPS_USER has no sudo until you re-run with --ops-units."
+    fi
+  } >"$SUDOERS"
   chmod 440 "$SUDOERS"
   visudo -cf "$SUDOERS" >/dev/null || { rm -f "$SUDOERS"; die "generated sudoers rule is invalid; removed"; }
+  [ -n "$OPS_UNITS" ] || warn "No --ops-units given: the change account cannot restart anything yet."
 else
   warn "--no-sudo: $OPS_USER will have no sudo at all"
 fi
+
+# --- 1b. read grants for the read-only account ---------------------------
+# The read channel runs as $READ_USER (§7), so without grants it can read almost
+# nothing an operator cares about -- and the tempting fix is to hand it root,
+# which destroys the floor. Grant read access to the paths the AI is actually
+# meant to look at, nothing more (journal, logs, /proc, service configs).
+say "Granting $READ_USER read access to logs and service configuration"
+READ_GROUPS="${READ_GROUPS:-systemd-journal adm}"
+for group in $READ_GROUPS; do
+  if getent group "$group" >/dev/null 2>&1; then
+    usermod -aG "$group" "$READ_USER" || warn "could not add $READ_USER to $group"
+  fi
+done
+READ_PATHS="${READ_PATHS:-/var/log /etc/nginx /etc/systemd/system /etc/ai-ops-agent}"
+for path in $READ_PATHS; do
+  [ -e "$path" ] || continue
+  # Read + traverse only: no write bit changed, and no owner change. `setfacl`
+  # is not required; chmod on a group is too broad, so use the ACL if present,
+  # otherwise fall back to read-only group membership that already applies.
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m "u:$READ_USER:rX" -R "$path" 2>/dev/null || warn "could not grant read ACL on $path"
+  fi
+done
 
 # --- 2. agent venv -------------------------------------------------------
 say "Installing the agent into /opt/ai-ops-agent"
@@ -146,6 +197,12 @@ python3 -m venv /opt/ai-ops-agent/venv
 # --- 3. config + unit + start -------------------------------------------
 say "Writing config and systemd unit"
 install -d -m 700 /etc/ai-ops-agent "$JOURNAL"
+# Core files are 0600 and owned by the agent's run user. The read channel runs
+# as an unprivileged account, so it cannot read the agent token or the
+# encrypted credential store even if a prompt injection gets it to try (§43.4).
+install -d -m 700 /var/lib/ai-ops-agent-credentials
+chown -R root:root "$JOURNAL" /var/lib/ai-ops-agent-credentials
+chmod 700 "$JOURNAL" /var/lib/ai-ops-agent-credentials
 CFG="/etc/ai-ops-agent/config.json"
 SERVER_URL="$SERVER_URL" ASSET_ID="$ASSET_ID" AGENT_TOKEN="$AGENT_TOKEN" \
 READ_USER="$READ_USER" OPS_USER="$OPS_USER" JOURNAL="$JOURNAL" ALLOW_LOOPBACK="$ALLOW_LOOPBACK" python3 - <<'PY'
@@ -173,9 +230,11 @@ export PATH="/opt/ai-ops-agent/venv/bin:$PATH"
 if command -v /opt/ai-ops-agent/venv/bin/ai-ops-agent-install >/dev/null 2>&1; then
   LOOP_FLAG=""
   [ "$ALLOW_LOOPBACK" = "1" ] && LOOP_FLAG="--allow-loopback-http"
+  ROOT_FLAG=""
+  [ "${ALLOW_ROOT_READONLY:-0}" = "1" ] && ROOT_FLAG="--allow-root-readonly"
   /opt/ai-ops-agent/venv/bin/ai-ops-agent-install \
     --server-url "$SERVER_URL" --asset-id "$ASSET_ID" --token "$AGENT_TOKEN" \
-    --user "$READ_USER" --user "$OPS_USER" --journal-dir "$JOURNAL" $LOOP_FLAG >/dev/null
+    --user "$READ_USER" --user "$OPS_USER" --journal-dir "$JOURNAL" $LOOP_FLAG $ROOT_FLAG >/dev/null
 else
   cat >/etc/systemd/system/ai-ops-agent.service <<EOF
 [Unit]
@@ -213,7 +272,8 @@ cat <<EOF
 
    asset id   : $ASSET_ID
    control    : $SERVER_URL
-   accounts   : $READ_USER (read-only), $OPS_USER (change$([ "$GRANT_SUDO" = "1" ] && echo ", limited sudo" || echo ", no sudo"))
+   accounts   : $READ_USER (read-only, no sudo), $OPS_USER (change, sudo: ${OPS_UNITS:-none configured})
+   read root  : ${ALLOW_ROOT_READONLY:-0} (0 = the read channel refuses root)
    config     : $CFG (0600)
    journal    : $JOURNAL
    service    : systemctl status ai-ops-agent

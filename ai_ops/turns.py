@@ -314,6 +314,27 @@ READONLY_TOOLS = ('read_file', 'list_dir', 'file_stat', 'disk_usage', 'memory_in
 from .readonly_tools import ReadonlyRejected  # noqa: E402  (named in except below)
 
 
+def _tool_output(task):
+    """What the model sees of a finished task.
+
+    Credential handles are reported as a count plus names, never as a value: the
+    handle is exactly the form the model should use later (``cred:<id>``), and
+    the whole point of the design is that it never has anything else to show
+    (§42). The rest of the result passes through unchanged.
+    """
+    raw = task['result'] or json.dumps({'status': task['state']})
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return raw
+    handles = body.pop('credentials', None) if isinstance(body, dict) else None
+    if handles:
+        body['credentials_found'] = [{'id': h.get('id'), 'name': h.get('name')} for h in handles]
+        body['credential_notice'] = ('%d secret(s) found and stored on the managed host; '
+                                     'reference them as cred:<id>. The value was never sent here.' % len(handles))
+    return json.dumps(body, ensure_ascii=False) if isinstance(body, dict) else raw
+
+
 def name_rules(db, turn):
     """Actions the turn's frozen write list allows, and their host scopes.
 
@@ -436,7 +457,7 @@ class RoleEngine:
                         continue
                     messages = json.loads(row["messages"])
                     tool_id = messages[-1]["tool_calls"][0]["id"]
-                    messages.append({"role": "tool", "tool_call_id": tool_id, "content": task["result"] or json.dumps({"status": task["state"]})})
+                    messages.append({"role": "tool", "tool_call_id": tool_id, "content": _tool_output(task)})
                     db.execute("UPDATE role_turns SET messages=?,state='ready',pending_task_id=NULL WHERE id=?", (json.dumps(messages, ensure_ascii=False), row["id"]))
                     row = db.execute("SELECT * FROM role_turns WHERE id=?", (row["id"],)).fetchone()
                 chosen = (dict(row), settings)

@@ -94,6 +94,20 @@ class RotateToken(StrictModel):
     grace_seconds: int = Field(default=0, ge=0, le=86400)
 
 
+class CredentialHandle(StrictModel):
+    """A handle an Agent reports after a read discovered a secret (§42).
+
+    Strict on purpose: a client that tries to include ``value`` is told it is
+    wrong, rather than having the field quietly dropped. A schema that accepts
+    and ignores a value field invites someone to trust that it is stored.
+    """
+    id: str = Field(min_length=1, max_length=200)
+    name: str = Field(default='', max_length=200)
+    note: str = Field(default='', max_length=2000)
+    source: str = Field(default='', max_length=1000)
+    kind: Literal['pattern', 'path', 'file', 'connector'] = 'pattern'
+
+
 class Result(StrictModel):
     claim_id: str = Field(min_length=16, max_length=128)
     status: Literal["succeeded", "failed", "unknown", "cancelled"]
@@ -103,6 +117,10 @@ class Result(StrictModel):
     error_code: str | None = Field(default=None, max_length=100)
     output_truncated: bool = False
     output_archives: dict | None = None
+    # Handles the Agent registered while running this task (§42). Ids and names
+    # only: a value in this field would be a leak, and the field is unknown to
+    # the model, which sees a short notice instead.
+    credentials: list[CredentialHandle] = Field(default_factory=list, max_length=50)
 
     @model_validator(mode="after")
     def success_requires_zero(self):
@@ -585,6 +603,17 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
             # same redacted value. The raw archive (digest-verified) is left
             # byte-exact on purpose.
             body = Result(**scrubbing.redact_result(body.model_dump()))
+            # A credential handle the Agent reported becomes an inventory entry
+            # here, next to the host that found it (§42, §46.3). Values never
+            # travel: the result schema has no field for one.
+            if body.credentials:
+                from .credential_handles import register as register_handles
+                register_handles(db, asset_id, [{'id': str(c.id)[:200],
+                                                 'name': str(c.name or c.id)[:200],
+                                                 'note': c.note[:2000],
+                                                 'source': c.source[:1000],
+                                                 'kind': c.kind}
+                                                for c in body.credentials if c.id])
             result = body.model_dump_json()
             if row["result"] is not None:
                 if Result.model_validate_json(row['result']).model_dump() == body.model_dump():
@@ -598,6 +627,12 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
             close_lease(db, task_id)
             db.execute("UPDATE tasks SET state=?,result=?,updated_at=? WHERE id=?", (body.status, result, time.time(), task_id))
             parent = db.execute("SELECT * FROM role_turns WHERE id=?", (row['turn_id'],)).fetchone()
+            if parent is None:
+                # A task not created by a turn (legacy import or a direct admin
+                # command) still records its result; only turn bookkeeping is
+                # skipped.
+                audit(db, "task.result", task_id, "agent:" + asset_id, body.model_dump())
+                return {"accepted": True, "duplicate": False}
             if body.status == 'unknown':
                 set_turn_state(db, parent['id'], 'blocked_unknown', 'EXECUTION_UNKNOWN')
             elif body.status == 'cancelled' or row['cancel_requested_at'] is not None:

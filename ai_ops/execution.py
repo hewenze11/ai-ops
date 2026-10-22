@@ -12,7 +12,16 @@ from pydantic import BaseModel, ConfigDict, Field
 CHUNK_BYTES = 65536
 ARCHIVE_BYTES = 64 * 1024 * 1024
 # Wire protocols whose agents support telemetry, cancellation and archives.
-TELEMETRY_PROTOCOLS = ('1.1', '1.2')
+# Protocol 1.3 adds structured task kinds (readonly / change). Older agents
+# must never receive them: they would either misread or ignore the kind.
+TELEMETRY_PROTOCOLS = ('1.1', '1.2', '1.3')
+KIND_PROTOCOLS = ('1.3',)
+# An old agent re-polling must not spam one audit row per second.
+KIND_BLOCKED_SCHEMA = """
+CREATE TABLE IF NOT EXISTS blocked_kinds(
+ asset_id TEXT NOT NULL, protocol TEXT NOT NULL, task_ids TEXT NOT NULL,
+ reported_at REAL NOT NULL, PRIMARY KEY(asset_id,protocol));
+"""
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agent_presence(
  asset_id TEXT PRIMARY KEY REFERENCES assets(id), instance_id TEXT NOT NULL,
@@ -29,6 +38,8 @@ CREATE TABLE IF NOT EXISTS output_chunks(
 
 
 def migrate(db):
+    db.executescript(SCHEMA)
+    db.executescript(KIND_BLOCKED_SCHEMA)
     columns = {r[1] for r in db.execute('PRAGMA table_info(tasks)')}
     for name, kind in [('claimed_protocol', 'TEXT'), ('cancel_requested_at', 'REAL')]:
         if name not in columns:
@@ -66,7 +77,7 @@ class Heartbeat(Strict):
     heartbeat_telemetry: Telemetry | None = None
     instance_id: str = Field(min_length=1, max_length=100)
     agent_version: str = Field(min_length=1, max_length=100)
-    protocol_version: Literal['1.1', '1.2']
+    protocol_version: Literal['1.1', '1.2', '1.3']
     # Protocol 1.2: the agent reports which controller currently owns the
     # machine's single execution slot, so every other controller can queue
     # instead of racing. Absent on 1.0/1.1 agents (treated as idle).

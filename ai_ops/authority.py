@@ -15,7 +15,11 @@ def claim_allowed(db, task):
     from .account_grants import permits
     if not permits(db, task['turn_id'], task['asset_id'], payload.get('run_as')):
         return False
-    return bool(parent and parent['mode'] in ('confirm', 'direct') and
+    kind = payload.get('kind', 'shell')
+    # Readonly tasks are non-mutating and need no approval, but they still run
+    # under an immutable mode: a readonly turn only ever claims readonly work.
+    mode_ok = parent['mode'] == 'readonly' if kind == 'readonly' else parent['mode'] in ('confirm', 'direct')
+    return bool(parent and mode_ok and
                 payload.get('mode') == parent['mode'] and
                 payload.get('run_as') in json.loads(parent['execution_users']) and
                 payload.get('run_as') in json.loads(asset['allowed_users']))

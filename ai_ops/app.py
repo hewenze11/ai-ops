@@ -499,7 +499,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     def claim(asset_id: Identifier, body: Claim, authorization: str | None = Header(default=None)):
         with transaction() as db:
             asset = agent_auth(db, asset_id, authorization)
-            if body.protocol_version not in ('1.0', '1.1', '1.2'):
+            if body.protocol_version not in ('1.0', '1.1', '1.2', '1.3'):
                 raise HTTPException(409, "Unsupported protocol version")
             # Protocol 1.2 multi-controller: if a DIFFERENT live controller is
             # executing on this asset, decline so each control plane queues its
@@ -521,6 +521,24 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
                 AND NOT EXISTS (SELECT 1 FROM tasks prior WHERE prior.turn_id=t.turn_id AND prior.seq<t.seq
                   AND prior.state IN ('queued','awaiting_approval','claimed','unknown'))
                 ORDER BY rt.seq,t.seq LIMIT 1""", (asset_id,)).fetchone()
+            # Protocol 1.3 kinds (readonly/change) carry structured payloads an
+            # older agent would misread. Leave the task queued and tell the
+            # console which agent needs upgrading instead of shipping it.
+            if row is not None and body.protocol_version not in ('1.3',):
+                head = json.loads(row['payload'])
+                if head.get('kind', 'shell') != 'shell':
+                    blockers = [r[0] for r in db.execute(
+                        "SELECT id, payload FROM tasks WHERE asset_id=? AND state='queued' ORDER BY seq LIMIT 5", (asset_id,))
+                        if json.loads(r[1]).get('kind', 'shell') != 'shell']
+                    self_blocked = db.execute('SELECT 1 FROM blocked_kinds WHERE asset_id=? AND protocol=? AND reported_at>?',
+                                              (asset_id, body.protocol_version, time.time() - 300)).fetchone()
+                    if self_blocked is None:
+                        db.execute('INSERT INTO blocked_kinds(asset_id,protocol,task_ids,reported_at) VALUES(?,?,?,?)',
+                                   (asset_id, body.protocol_version, json.dumps(blockers), time.time()))
+                        audit(db, 'task.kind_blocked', asset_id, 'agent:' + asset_id,
+                              {'protocol': body.protocol_version, 'task_ids': blockers})
+                    return {"task": None, "protocol_version": body.protocol_version,
+                            "blocked_kind": True, "blocked_task_ids": blockers}
             if row is None:
                 return {"task": None, "protocol_version": body.protocol_version}
             payload = json.loads(row["payload"])

@@ -29,9 +29,14 @@ def final(text="Verified result"):
     return {"message": {"role": "assistant", "content": text}, "usage": {"total_tokens": 10}}
 
 
-def tool(user="reader", **extra):
-    args = {"asset_id": "host", "run_as": user, "command": "id -un", "timeout_seconds": 30, **extra}
-    return {"message": {"role": "assistant", "content": None, "tool_calls": [{"id": "call-test", "type": "function", "function": {"name": "execute_command", "arguments": json.dumps(args)}}]}, "usage": {"total_tokens": 10}}
+def tool(user="reader", params=None, **extra):
+    # Writes go through the change set (§39.1): a typed action, not a command
+    # string. service.reload is the cheapest action that still needs a real
+    # account on a real asset.
+    action_params = params if params is not None else {"unit": "nginx"}
+    args = {"asset_id": "host", "run_as": user,
+            "actions": [{"action": "service.reload", "params": action_params}], **extra}
+    return {"message": {"role": "assistant", "content": None, "tool_calls": [{"id": "call-test", "type": "function", "function": {"name": "propose_change", "arguments": json.dumps(args)}}]}, "usage": {"total_tokens": 10}}
 
 
 @pytest.fixture
@@ -54,7 +59,7 @@ def send(env, role="ops", key="message-001", **kwargs):
 
 
 def claim(env):
-    return env[0].post("/api/v1/agents/host/claim", headers=env[3], json={"protocol_version": "1.0"}).json()["task"]
+    return env[0].post("/api/v1/agents/host/claim", headers=env[3], json={"protocol_version": "1.3"}).json()["task"]
 
 
 def complete(env, task, status="succeeded"):
@@ -84,7 +89,7 @@ def test_entire_multistep_turn_precedes_later_manual_command(env):
     c, h, engine, _, _ = env
     first = send(env).json()["turn_id"]
     later = c.post("/api/v1/tasks", headers=h, json={"role_id": "ops", "asset_id": "host", "execution_users": ["operator"], "run_as": "operator", "command": "echo later", "idempotency_key": "later-manual"}).json()
-    model = FakeModel([tool(), tool(command="uname -s"), final()])
+    model = FakeModel([tool(), tool(params={"unit": "redis"}), final()])
     engine.advance(model)
     first_command = claim(env)
     assert first_command["id"] != later["id"]
@@ -92,7 +97,10 @@ def test_entire_multistep_turn_precedes_later_manual_command(env):
     assert claim(env) is None
     engine.advance(model)
     second_command = claim(env)
-    assert second_command["command"] == "uname -s"
+    # The turn's own second step runs before the later manual task: one turn is
+    # an atomic unit of work (§ tests above). A change set, not a command.
+    assert second_command["kind"] == "change"
+    assert second_command["steps"][0]["params"]["unit"] == "redis"
     complete(env, second_command)
     engine.advance(model)
     assert get(env, first)["state"] == "completed"
@@ -238,6 +246,7 @@ def test_self_description_does_not_grant_anything_to_readonly(env):
     engine.advance(model)
     tools = model.requests[0].get("tools") or []
     names = [t["function"]["name"] for t in tools]
+    assert "propose_change" not in names
     assert "execute_command" not in names
     assert "SYSTEM_SELF_DESCRIPTION" in model.requests[0]["messages"][0]["content"]
 

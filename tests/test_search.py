@@ -116,7 +116,7 @@ def test_web_search_tool_spec_exposed_only_when_provider_configured():
     assert [t['function']['name'] for t in tool_spec([], None)] == ['ask_user', 'read_asset_memory', 'request_execution_account']
     # Decision tool never grants execution authority.
     with_user = [t["function"]["name"] for t in tool_spec(["ops_read"], FakeProvider())]
-    assert with_user == ["ask_user", "read_asset_memory", "request_execution_account", "execute_command", "web_search", "fetch_page"]
+    assert with_user == ["ask_user", "read_asset_memory", "request_execution_account", "propose_change", "web_search", "fetch_page"]
 
 
 def test_search_failure_is_returned_as_tool_error_not_a_crash():

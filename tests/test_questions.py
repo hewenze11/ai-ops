@@ -43,7 +43,7 @@ def test_roundtrip_pause_fifo_and_exact_tool_result(env, mode, selection, text):
     assert len(model.requests) == 1 and get(env, tid)['model_steps'] == 1
     assert get(env, later)['state'] == 'queued'
     names = [t['function']['name'] for t in model.requests[0]['tools']]
-    assert 'ask_user' in names and ('execute_command' in names) == (mode != 'readonly')
+    assert 'ask_user' in names and ('propose_change' in names) == (mode != 'readonly')
     assert q['turn_id'] == tid and q['role_id'] == 'ops' and q['tool_call_id'] == 'decision-1'
     assert answer(env, tid, q, selection, text).status_code == 200
     assert get(env, tid)['state'] == 'ready'

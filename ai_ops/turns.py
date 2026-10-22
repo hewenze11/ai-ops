@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 from fastapi import Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
-from . import account_grants
+from . import account_grants, actions
 from .context import SYSTEM, build_body
 from .model_client import ModelFailure
 from .models import Identifier as ID, UserName as USER, new_id
@@ -56,6 +56,14 @@ def derive_steps(messages):
                     step = {"kind": "command", "status": "proposed",
                             "command": args.get("command"), "run_as": args.get("run_as"),
                             "asset_id": args.get("asset_id"), "output_excerpt": None,
+                            "exit_code": None, "truncated": False}
+                elif name == "propose_change":
+                    # Writes are a change set, not a command string: show the
+                    # actions a human is being asked to approve (§45.5).
+                    step = {"kind": "change", "status": "proposed",
+                            "run_as": args.get("run_as"), "asset_id": args.get("asset_id"),
+                            "actions": [a.get("action") for a in (args.get("actions") or []) if isinstance(a, dict)],
+                            "reason": args.get("reason"), "output_excerpt": None,
                             "exit_code": None, "truncated": False}
                 elif name == "web_search":
                     step = {"kind": "search", "status": "proposed", "query": args.get("query")}
@@ -266,7 +274,26 @@ SYSTEM_TEXT = SYSTEM
 #   confirm  - every command the model proposes enters awaiting_approval; a human
 #              approves it before it is queued. Default.
 #   direct   - commands are queued for execution immediately.
+# Modes are a capability boundary, not prompt advice.
 MODES = ("readonly", "confirm", "direct")
+
+# The only write tool the model has. It proposes; the server policy engine
+# decides. The model is never told which mode it is in (docs §43.2).
+PROPOSE_CHANGE = 'propose_change'
+
+PROPOSE_CHANGE_SPEC = {'type': 'function', 'function': {'name': 'propose_change',
+    'description': 'Propose one or more changes to run on a host. The service validates every action, '
+                   'decides whether it runs immediately or needs human approval, and reports the outcome. '
+                   'You cannot execute directly. Use only the listed action kinds and their exact parameters.',
+    'parameters': {'type': 'object', 'additionalProperties': False, 'properties': {
+        'asset_id': {'type': 'string', 'description': 'Registered asset id.'},
+        'run_as': {'type': 'string', 'description': 'Native account selected for this turn.'},
+        'reason': {'type': 'string', 'description': 'One sentence on why this change is needed.'},
+        'actions': {'type': 'array', 'minItems': 1, 'maxItems': 10, 'items': {
+            'type': 'object', 'additionalProperties': False,
+            'properties': {'action': {'type': 'string', 'enum': sorted(actions.ACTIONS)}, 'params': {'type': 'object'}},
+            'required': ['action', 'params']}}},
+        'required': ['asset_id', 'run_as', 'actions']}}}
 
 
 # Tools whose result comes from the read-only channel (gate 1). They are a
@@ -276,6 +303,33 @@ READONLY_TOOLS = ('read_file', 'list_dir', 'file_stat', 'disk_usage', 'memory_in
                   'process_list', 'service_status', 'journal_logs', 'k8s_get', 'k8s_logs')
 
 from .readonly_tools import ReadonlyRejected  # noqa: E402  (named in except below)
+
+
+def _trigger_of(db, turn):
+    """Resolve the trigger context that narrows what an unattended turn may do.
+
+    A turn started by a custom task / alarm carries a trigger row with the
+    action subset it was configured for (§43.5). Interactive turns have none,
+    which is what separates "a human is watching" from "nobody is".
+    """
+    row = db.execute('SELECT source, source_id FROM role_turns WHERE id=?', (turn['id'],)).fetchone()
+    if row is None or row['source'] not in ('trigger', 'alarm', 'schedule', 'command'):
+        return {'source': None, 'policy': {}}
+    config = db.execute(
+        'SELECT trigger_actions, host_scope FROM trigger_policy WHERE source_id=?',
+        (row['source_id'] or '',)).fetchone() if _table_exists(db, 'trigger_policy') else None
+    asset_id = None
+    if row['source'] == 'command':
+        return {'source': None, 'policy': {}}
+    actions_allowed = json.loads(config['trigger_actions']) if config and config['trigger_actions'] else []
+    hosts = json.loads(config['host_scope']) if config and config['host_scope'] else {}
+    return {'source': row['source'], 'policy': {'trigger_source': row['source'],
+                                               'trigger_actions': actions_allowed,
+                                               'action_hosts': hosts}}
+
+
+def _table_exists(db, name):
+    return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
 
 
 def tool_spec(users, search_provider=None, mode="confirm"):
@@ -292,11 +346,9 @@ def tool_spec(users, search_provider=None, mode="confirm"):
     # readonly turns deliberately withhold the execution tool entirely. This is a
     # real capability boundary: a jailbroken prompt still has nothing to call.
     if users and mode != "readonly":
-        specs.append({"type": "function", "function": {"name": "execute_command", "description": "Execute one command on a registered asset using a selected native account. The service owns authorization and confirmation; never change them.",
-            "parameters": {"type": "object", "additionalProperties": False, "properties": {
-                "asset_id": {"type": "string"}, "run_as": {"type": "string", "enum": users},
-                "command": {"type": "string"}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600}},
-                "required": ["asset_id", "run_as", "command"]}}})
+        # Writes only ever go through propose_change; there is no tool that takes
+        # a raw command string any more (docs §39.1).
+        specs.append(PROPOSE_CHANGE_SPEC)
     if search_provider is not None:
         from .search import search_tool_spec, fetch_tool_spec
         specs.append(search_tool_spec())
@@ -412,7 +464,7 @@ class RoleEngine:
                 if len(calls) != 1:
                     raise ValueError("Unsupported tool")
                 name = calls[0]["function"]["name"]
-                if name not in ("execute_command", "web_search", "fetch_page", "ask_user", "read_asset_memory", "request_execution_account", *READONLY_TOOLS):
+                if name not in ("web_search", "fetch_page", "ask_user", "read_asset_memory", "request_execution_account", PROPOSE_CHANGE, *READONLY_TOOLS):
                     raise ValueError("Unsupported tool")
                 arguments = json.loads(calls[0]["function"]["arguments"])
             except Exception:
@@ -488,6 +540,82 @@ class RoleEngine:
                      'queued', payload['idempotency_key'], time.time(), time.time(), turn['id']))
                 db.execute("UPDATE role_turns SET state='waiting_tool',pending_task_id=? WHERE id=?", (task_id, turn['id']))
                 self.audit(db, 'task.submitted', task_id, 'model-tool', {'turn_id': turn['id'], 'kind': 'readonly', 'program': program, 'args': argv})
+                return True
+            if name == PROPOSE_CHANGE:
+                # Gate 3/4: the model proposes, the policy engine decides.
+                # The change set is expanded to concrete argv here and never
+                # reaches a shell unless the action itself is `shell.run`
+                # (human-only, never unattended).
+                try:
+                    if current['mode'] not in ('confirm', 'direct'):
+                        raise ValueError('change set outside a write mode')
+                    # The model may not smuggle authority in extra keys; only
+                    # these four are meaningful, anything else is a rejection.
+                    if not isinstance(arguments, dict) or set(arguments) - {'asset_id', 'run_as', 'reason', 'actions'}:
+                        raise ValueError('unexpected arguments')
+                    asset_id = str((arguments or {}).get('asset_id') or '')
+                    run_as = str((arguments or {}).get('run_as') or '')
+                    steps = actions.normalize((arguments or {}).get('actions'))
+                    users_now = json.loads(current['execution_users'])
+                    if not account_grants.permits(db, current['id'], asset_id, run_as):
+                        raise ValueError('Asset account not selected for turn')
+                    asset = db.execute('SELECT * FROM assets WHERE id=?', (asset_id,)).fetchone()
+                    if asset is None or asset['retired_at'] is not None \
+                            or run_as not in json.loads(asset['allowed_users']) or run_as not in users_now:
+                        raise ValueError('Account unavailable on asset')
+                    trigger = _trigger_of(db, current)
+                except actions.ChangeRejected as error:
+                    # The change set itself is malformed or uses a denied path.
+                    # Report it as a refused proposal, not as a schema breach: the
+                    # model should see the reason and can try a different action.
+                    content = {'status': 'rejected', 'reason': str(error) or 'CHANGE_REJECTED'}
+                    messages.append({'role': 'tool', 'tool_call_id': calls[0]['id'],
+                                     'content': json.dumps(content, ensure_ascii=False)})
+                    db.execute("UPDATE role_turns SET messages=?,state='ready' WHERE id=?",
+                               (json.dumps(messages, ensure_ascii=False), turn['id']))
+                    self.audit(db, 'change.rejected', turn['id'], 'policy-engine',
+                               {'reason': str(error), 'asset_id': str((arguments or {}).get('asset_id') or '')})
+                    return True
+                except (ValueError, TypeError):
+                    set_turn_state(db, turn['id'], 'failed', 'MODEL_TOOL_AUTHORIZATION_OR_SCHEMA_REJECTED')
+                    self.audit(db, 'model.tool_rejected', turn['id'], 'service', {'call_id': call_id, 'tool': name})
+                    return True
+                verdicts = actions.plan(current['mode'], steps, **trigger['policy'])
+                codes = [reason for _, verdict, reason in verdicts if verdict == 'reject']
+                digest = actions.payload_hash(steps, asset_id, run_as)
+                if codes:
+                    # A change set is atomic: one refused step refuses all, so a
+                    # prompt cannot smuggle a permitted action alongside a
+                    # refused one.
+                    content = {'status': 'rejected', 'reason': codes[0], 'reasons': codes}
+                    messages.append({'role': 'tool', 'tool_call_id': calls[0]['id'],
+                                     'content': json.dumps(content, ensure_ascii=False)})
+                    db.execute("UPDATE role_turns SET messages=?,state='ready' WHERE id=?",
+                               (json.dumps(messages, ensure_ascii=False), turn['id']))
+                    self.audit(db, 'change.rejected', turn['id'], 'policy-engine',
+                               {'reasons': codes, 'asset_id': asset_id, 'actions': [s['action'] for s in steps]})
+                    return True
+                needs_human = any(verdict == 'approve' for _, verdict, _ in verdicts)
+                task_id = str(uuid.uuid4())
+                auth = account_grants.authority(db, turn['id'])
+                payload = {'kind': 'change', 'asset_id': asset_id, 'run_as': run_as,
+                           'execution_users': users_now, 'role_id': current['role_id'],
+                           'mode': current['mode'], 'steps': steps,
+                           'approval': {'payload_sha256': digest},
+                           'reason': str((arguments or {}).get('reason') or '')[:1000],
+                           'timeout_seconds': max(s['timeout_seconds'] for s in steps),
+                           'idempotency_key': 'change:' + call_id,
+                           'authorization_revision': auth['authorization_revision'],
+                           'execution_grants': auth['execution_grants']}
+                db.execute('INSERT INTO tasks(id,role_id,asset_id,payload,state,idempotency_key,created_at,updated_at,turn_id) VALUES(?,?,?,?,?,?,?,?,?)',
+                    (task_id, current['role_id'], asset_id, json.dumps(payload, ensure_ascii=False),
+                     'awaiting_approval' if needs_human else 'queued',
+                     payload['idempotency_key'], time.time(), time.time(), turn['id']))
+                db.execute("UPDATE role_turns SET state='waiting_tool',pending_task_id=? WHERE id=?", (task_id, turn['id']))
+                self.audit(db, 'change.proposed', task_id, 'model-tool',
+                           {'turn_id': turn['id'], 'payload_sha256': digest,
+                            'gating': 'approval' if needs_human else 'auto',
+                            'steps': [[s['action'], s['program'], s['args']] for s in steps]})
                 return True
             if name in ("web_search", "fetch_page"):
                 # Read-only information tools resolved inline. No asset, no

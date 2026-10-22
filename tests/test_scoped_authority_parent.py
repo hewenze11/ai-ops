@@ -78,7 +78,7 @@ def test_grant_approval_preserves_initial_and_command_confirmation(env):
     assert task['state'] == 'awaiting_approval'
     assert task['payload']['authorization_revision'] == 1
     assert task['payload']['execution_grants'] == t['execution_grants']
-    assert env[0].post('/api/v1/agents/host/claim', headers=env[3], json={'protocol_version': '1.2'}).json()['task'] is None
+    assert env[0].post('/api/v1/agents/host/claim', headers=env[3], json={'protocol_version': '1.3'}).json()['task'] is None
     later = submit(env, key='new-turn-no-inherit')
     assert get(env, later)['execution_grants'] == []
 
@@ -148,7 +148,7 @@ def test_claim_rechecks_frozen_asset_scope(env):
     env[2].advance(FakeModel([tool()]))
     with env[2].transaction() as db:
         db.execute("UPDATE turn_authority SET grants='[]', revision=revision+1 WHERE turn_id=?", (tid,))
-    r = env[0].post('/api/v1/agents/host/claim', headers=env[3], json={'protocol_version': '1.2'})
+    r = env[0].post('/api/v1/agents/host/claim', headers=env[3], json={'protocol_version': '1.3'})
     assert r.status_code == 403
     t = get(env, tid)
     task = env[0].get('/api/v1/tasks/' + t['pending_task_id'], headers=env[1]).json()

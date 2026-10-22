@@ -71,8 +71,8 @@ def test_tool_spec_omits_execution_tool_in_readonly():
     # Readonly turns get the narrow readonly channel instead of the execution
     # tool: they can look, but there is no command string to inject into.
     assert names_in_request({"tools": tool_spec(["ops_read"], None, "readonly")}) == ["ask_user", "read_asset_memory"] + READONLY_CHANNEL
-    assert names_in_request({"tools": tool_spec(["ops_read"], None, "confirm")}) == ["ask_user", "read_asset_memory", "request_execution_account", "execute_command"]
-    assert names_in_request({"tools": tool_spec(["ops_read"], None, "direct")}) == ["ask_user", "read_asset_memory", "request_execution_account", "execute_command"]
+    assert names_in_request({"tools": tool_spec(["ops_read"], None, "confirm")}) == ["ask_user", "read_asset_memory", "request_execution_account", "propose_change"]
+    assert names_in_request({"tools": tool_spec(["ops_read"], None, "direct")}) == ["ask_user", "read_asset_memory", "request_execution_account", "propose_change"]
 
 
 def test_readonly_channel_tool_becomes_structured_task():
@@ -112,7 +112,7 @@ def test_tools_for_turn_defaults_unknown_mode_to_confirm():
     turn = {"execution_users": json.dumps(["ops_read"]), "mode": "totally-unknown"}
     names = [t["function"]["name"] for t in tools_for_turn(turn, {}, None)]
     # Unknown mode must not silently become direct; it behaves like confirm.
-    assert names == ["ask_user", "read_asset_memory", "request_execution_account", "execute_command"]
+    assert names == ["ask_user", "read_asset_memory", "request_execution_account", "propose_change"]
 
 
 def test_readonly_model_request_has_no_execution_tool():
@@ -124,7 +124,7 @@ def test_readonly_model_request_has_no_execution_tool():
     engine = client.app.state.role_engine
     engine.advance(model)
     sent = model.requests[0]
-    assert "execute_command" not in names_in_request(sent)
+    assert "propose_change" not in names_in_request(sent)
 
 
 def test_direct_mode_queues_without_approval():
@@ -133,7 +133,7 @@ def test_direct_mode_queues_without_approval():
     setup_role_with_asset(client, headers)
     turn_id = send(client, headers, "direct")["turn_id"]
     model = FakeModel([
-        call_tool("execute_command", {"asset_id": "web1", "run_as": "ops_read", "command": "uptime"}),
+        call_tool("propose_change", {"asset_id": "web1", "run_as": "ops_read", "actions": [{"action": "service.reload", "params": {"unit": "nginx"}}]}),
         final("queued it")])
     engine = client.app.state.role_engine
     engine.advance(model)
@@ -150,7 +150,7 @@ def test_confirm_mode_gates_each_command():
     setup_role_with_asset(client, headers)
     turn_id = send(client, headers, "confirm")["turn_id"]
     model = FakeModel([
-        call_tool("execute_command", {"asset_id": "web1", "run_as": "ops_read", "command": "uptime"}),
+        call_tool("propose_change", {"asset_id": "web1", "run_as": "ops_read", "actions": [{"action": "service.reload", "params": {"unit": "nginx"}}]}),
         final("waiting")])
     engine = client.app.state.role_engine
     engine.advance(model)
@@ -168,7 +168,7 @@ def test_readonly_turn_rejects_a_smuggled_execute_command():
     setup_role_with_asset(client, headers)
     turn_id = send(client, headers, "readonly")["turn_id"]
     model = FakeModel([
-        call_tool("execute_command", {"asset_id": "web1", "run_as": "ops_read", "command": "rm -rf /"}),
+        call_tool("propose_change", {"asset_id": "web1", "run_as": "ops_read", "actions": [{"action": "shell.run", "params": {"command": "rm -rf /"}}]}),
         final("nope")])
     engine = client.app.state.role_engine
     engine.advance(model)

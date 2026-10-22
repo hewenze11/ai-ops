@@ -57,7 +57,8 @@ def request(env, username='root', grants=None):
     return tid, req, f"/api/v1/turns/{tid}/account-requests/{req['id']}/answer"
 
 def command(asset='asset-a'):
-    return Model('execute_command', {'asset_id': asset, 'run_as': 'root', 'command': 'id', 'timeout_seconds': 10})
+    return Model('propose_change', {'asset_id': asset, 'run_as': 'root',
+        'actions': [{'action': 'service.reload', 'params': {'unit': 'nginx'}}]})
 
 def test_same_name_cross_asset_tool_and_legacy_ambiguity(env):
     c = env[1]
@@ -83,7 +84,7 @@ def test_claim_last_mile_revalidates_exact_asset_and_registered_user(env):
         db.execute('UPDATE tasks SET asset_id=?,payload=? WHERE id=?', ('asset-b', json.dumps(payload), task_id))
         from ai_ops.authority import claim_allowed
         assert not claim_allowed(db, db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone())
-    r = c.post('/api/v1/agents/asset-b/claim', headers={'Authorization': 'Bearer ' + tokens['asset-b']}, json={'protocol_version': '1.2'})
+    r = c.post('/api/v1/agents/asset-b/claim', headers={'Authorization': 'Bearer ' + tokens['asset-b']}, json={'protocol_version': '1.3'})
     assert r.status_code == 403
     assert c.get('/api/v1/tasks/' + task_id).json()['state'] == 'queued'
 

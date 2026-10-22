@@ -63,10 +63,49 @@ def names_in_request(body):
     return [t["function"]["name"] for t in (body.get("tools") or [])]
 
 
+READONLY_CHANNEL = ['read_file', 'list_dir', 'file_stat', 'disk_usage', 'memory_info',
+                    'process_list', 'service_status', 'journal_logs', 'k8s_get', 'k8s_logs']
+
+
 def test_tool_spec_omits_execution_tool_in_readonly():
-    assert names_in_request({"tools": tool_spec(["ops_read"], None, "readonly")}) == ["ask_user", "read_asset_memory"]
+    # Readonly turns get the narrow readonly channel instead of the execution
+    # tool: they can look, but there is no command string to inject into.
+    assert names_in_request({"tools": tool_spec(["ops_read"], None, "readonly")}) == ["ask_user", "read_asset_memory"] + READONLY_CHANNEL
     assert names_in_request({"tools": tool_spec(["ops_read"], None, "confirm")}) == ["ask_user", "read_asset_memory", "request_execution_account", "execute_command"]
     assert names_in_request({"tools": tool_spec(["ops_read"], None, "direct")}) == ["ask_user", "read_asset_memory", "request_execution_account", "execute_command"]
+
+
+def test_readonly_channel_tool_becomes_structured_task():
+    client, _ = make_client()
+    headers = {"Authorization": "Bearer " + ADMIN}
+    setup_role_with_asset(client, headers)
+    turn_id = send(client, headers, "readonly")["turn_id"]
+    model = FakeModel([
+        call_tool("read_file", {"asset_id": "web1", "run_as": "ops_read", "path": "/etc/nginx/nginx.conf"}),
+        final("read it")])
+    client.app.state.role_engine.advance(model)
+    turn = client.get(f"/api/v1/turns/{turn_id}", headers=headers).json()
+    assert turn["state"] == "waiting_tool"
+    task = client.get(f"/api/v1/tasks/{turn['pending_task_id']}", headers=headers).json()
+    # Structured program+argv, queued without approval, never a shell string.
+    assert task["state"] == "queued"
+    assert task["payload"]["kind"] == "readonly"
+    assert task["payload"]["program"] == "/usr/bin/cat"
+    assert task["payload"]["args"] == ["--number", "--", "/etc/nginx/nginx.conf"]
+    assert "command" not in task["payload"]
+
+
+def test_readonly_tool_is_refused_outside_readonly_mode():
+    # A prompt-injected model must not reach the readonly channel from a
+    # write-mode turn (it would be an unapproved read the user never granted).
+    client, _ = make_client()
+    headers = {"Authorization": "Bearer " + ADMIN}
+    setup_role_with_asset(client, headers)
+    turn_id = send(client, headers, "direct")["turn_id"]
+    model = FakeModel([call_tool("read_file", {"asset_id": "web1", "run_as": "ops_read", "path": "/etc/passwd"})])
+    client.app.state.role_engine.advance(model)
+    turn = client.get(f"/api/v1/turns/{turn_id}", headers=headers).json()
+    assert turn["state"] == "failed"
 
 
 def test_tools_for_turn_defaults_unknown_mode_to_confirm():

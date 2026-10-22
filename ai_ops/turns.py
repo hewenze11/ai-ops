@@ -269,12 +269,26 @@ SYSTEM_TEXT = SYSTEM
 MODES = ("readonly", "confirm", "direct")
 
 
+# Tools whose result comes from the read-only channel (gate 1). They are a
+# closed set: the model picks a tool and structured parameters, and never sees
+# a free-form command string. Shared with the Agent's independent check.
+READONLY_TOOLS = ('read_file', 'list_dir', 'file_stat', 'disk_usage', 'memory_info',
+                  'process_list', 'service_status', 'journal_logs', 'k8s_get', 'k8s_logs')
+
+from .readonly_tools import ReadonlyRejected  # noqa: E402  (named in except below)
+
+
 def tool_spec(users, search_provider=None, mode="confirm"):
     from .questions import tool_spec as question_tool_spec
     from .asset_memory import tool_spec as asset_memory_tool_spec
     specs = [question_tool_spec(), asset_memory_tool_spec()]
     if mode != 'readonly':
         specs.append(account_grants.request_spec())
+    else:
+        # Read-only turns get the narrow readonly surface instead of the
+        # execution tool. This is a real capability boundary (gate 1).
+        from .readonly_tools import tool_spec as readonly_tool_spec
+        specs.extend(readonly_tool_spec())
     # readonly turns deliberately withhold the execution tool entirely. This is a
     # real capability boundary: a jailbroken prompt still has nothing to call.
     if users and mode != "readonly":
@@ -398,7 +412,7 @@ class RoleEngine:
                 if len(calls) != 1:
                     raise ValueError("Unsupported tool")
                 name = calls[0]["function"]["name"]
-                if name not in ("execute_command", "web_search", "fetch_page", "ask_user", "read_asset_memory", "request_execution_account"):
+                if name not in ("execute_command", "web_search", "fetch_page", "ask_user", "read_asset_memory", "request_execution_account", *READONLY_TOOLS):
                     raise ValueError("Unsupported tool")
                 arguments = json.loads(calls[0]["function"]["arguments"])
             except Exception:
@@ -434,6 +448,46 @@ class RoleEngine:
                     return True
                 set_turn_state(db, turn['id'], 'waiting_user')
                 self.audit(db, 'question.created', question_id, 'model-tool', {'turn_id': turn['id'], 'tool_call_id': calls[0]['id']})
+                return True
+            if name in READONLY_TOOLS:
+                # Gate 1/2 (readonly channel): a tool choice becomes a
+                # structured program+argv task. No shell, no free-form command.
+                # Unlike confirm/direct there is no approval prompt: these are
+                # provably non-mutating argv, so they can run inline like a
+                # search. The Agent re-validates independently at execve.
+                try:
+                    if current['mode'] != 'readonly':
+                        raise ValueError('readonly tool outside readonly mode')
+                    from .readonly_tools import build
+                    asset_id = str((arguments or {}).get('asset_id') or '')
+                    run_as = str((arguments or {}).get('run_as') or '')
+                    options = [k for k in (arguments or {}) if k not in ('asset_id', 'run_as')]
+                    program, argv = build(name, {k: arguments.get(k) for k in options})
+                    users_now = json.loads(current['execution_users'])
+                    if not account_grants.permits(db, current['id'], asset_id, run_as):
+                        raise ValueError('Asset account not selected for turn')
+                    asset = db.execute('SELECT * FROM assets WHERE id=?', (asset_id,)).fetchone()
+                    if asset is None or asset['retired_at'] is not None \
+                            or run_as not in json.loads(asset['allowed_users']) or run_as not in users_now:
+                        raise ValueError('Account unavailable on asset')
+                except (ValueError, ReadonlyRejected):
+                    set_turn_state(db, turn['id'], 'failed', 'MODEL_TOOL_AUTHORIZATION_OR_SCHEMA_REJECTED')
+                    self.audit(db, 'model.tool_rejected', turn['id'], 'service', {'call_id': call_id, 'tool': name})
+                    return True
+                task_id = str(uuid.uuid4())
+                payload = {'kind': 'readonly', 'tool': name, 'program': program, 'args': argv,
+                           'run_as': run_as, 'asset_id': asset_id, 'timeout_seconds': 60,
+                           'execution_users': json.loads(current['execution_users']),
+                           'role_id': current['role_id'], 'mode': current['mode'],
+                           'idempotency_key': 'readonly:' + call_id}
+                auth = account_grants.authority(db, turn['id'])
+                payload['authorization_revision'] = auth['authorization_revision']
+                payload['execution_grants'] = auth['execution_grants']
+                db.execute('INSERT INTO tasks(id,role_id,asset_id,payload,state,idempotency_key,created_at,updated_at,turn_id) VALUES(?,?,?,?,?,?,?,?,?)',
+                    (task_id, current['role_id'], asset_id, json.dumps(payload, ensure_ascii=False),
+                     'queued', payload['idempotency_key'], time.time(), time.time(), turn['id']))
+                db.execute("UPDATE role_turns SET state='waiting_tool',pending_task_id=? WHERE id=?", (task_id, turn['id']))
+                self.audit(db, 'task.submitted', task_id, 'model-tool', {'turn_id': turn['id'], 'kind': 'readonly', 'program': program, 'args': argv})
                 return True
             if name in ("web_search", "fetch_page"):
                 # Read-only information tools resolved inline. No asset, no

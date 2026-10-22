@@ -18,7 +18,7 @@ from croniter import croniter
 from .models import new_id
 from . import account_grants
 from fastapi import Depends, Header, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator, StringConstraints, model_validator
 
 ID = Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")]
 USER = Annotated[str, StringConstraints(pattern=r"^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}\$?$")]
@@ -128,6 +128,11 @@ class CustomTask(BaseModel):
     execution_users: list[USER] = Field(default_factory=list, max_length=100)
     execution_grants: list[account_grants.Grant] = Field(default_factory=list, max_length=100)
     mode: Literal["readonly", "confirm", "direct"] = "confirm"
+    # An unattended task never relies on inheritance (§44.3). A trigger/schedule
+    # that writes must say so explicitly; a default would mean a write-capable
+    # task is created by someone who never saw a mode picker. The check lives in
+    # the route, where the request body's keys are still visible.
+    mode_explicit: bool = Field(default=False, exclude=True, description='Set by the API when the caller supplied a mode')
     enabled: bool = True
     cron: str | None = Field(default=None, max_length=200)
     timezone: str = Field(default="Asia/Shanghai", max_length=100)
@@ -265,6 +270,9 @@ def install_custom_tasks(app, transaction, audit, admin, admin_token):
 
     @app.post("/api/v1/custom-tasks", dependencies=[Depends(admin)], status_code=201)
     def create(body: CustomTask):
+        body.mode_explicit = 'mode' in body.model_fields_set
+        if not body.mode_explicit:
+            raise HTTPException(422, 'mode is required: an unattended task never inherits one')
         prepare_notification(body)
         secret = secrets.token_urlsafe(36)
         now = time.time()
@@ -296,6 +304,9 @@ def install_custom_tasks(app, transaction, audit, admin, admin_token):
     def edit(custom_id: ID, body: CustomTask):
         if custom_id != body.id:
             raise HTTPException(422, "ID must match path")
+        body.mode_explicit = 'mode' in body.model_fields_set
+        if not body.mode_explicit:
+            raise HTTPException(422, 'mode is required: an unattended task never inherits one')
         now = time.time()
         with transaction() as db:
             require_role(db, body.role_id)

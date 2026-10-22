@@ -18,6 +18,8 @@ not let low-privilege users read the database.
 """
 import re
 
+from . import baseline
+
 MASK = "[REDACTED]"
 
 # Each entry: (pattern, replacement function). Keeping the field name or the
@@ -57,6 +59,10 @@ _PATTERNS = [
 
 def _redact_pattern(text):
     result = text
+    # The platform baseline runs first (docs §45.2 item 6): it always applies,
+    # is versioned, and arrives with the platform rather than with a frozen user
+    # list, so a new secret shape is masked on upgrade without touching config.
+    result, _matched = baseline.apply(result)
     for pattern, replacement in _PATTERNS:
         result = pattern.sub(replacement, result)
     return result
@@ -142,3 +148,17 @@ def find_secret_kinds(text):
         if pattern.search(text):
             found.append(name)
     return found
+
+
+def secret_kinds(text):
+    """Compatibility helper: baseline rule ids found in ``text``.
+
+    Storage of the baseline version and of the matched rule ids is what makes
+    "which rules were in force when this leaked" answerable later. Only the
+    rule ids are kept, never the matched value.
+    """
+    if not text:
+        return []
+    _masked, matched = baseline.apply(text)
+    return matched
+

@@ -250,6 +250,6 @@ def test_archived_role_rejects_new_custom_configuration(env):
     c, h, _, _, _ = env
     assert c.delete('/api/v1/roles/other', headers=h).status_code == 200
     r = c.post('/api/v1/custom-tasks', headers=h, json={
-        'name': 'Must not resurrect role', 'kind': 'trigger', 'role_id': 'other',
+        'name': 'Must not resurrect role', 'kind': 'trigger', 'mode': 'confirm', 'role_id': 'other',
         'prompt': 'Do nothing', 'execution_grants': []})
     assert r.status_code == 409

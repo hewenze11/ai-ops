@@ -147,7 +147,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     with sqlite3.connect(path) as db:
         db.row_factory = sqlite3.Row
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9):
+        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
             raise ValueError("Unsupported database schema; refusing to modify it")
         from .custom_tasks import SCHEMA as CUSTOM_SCHEMA
         from .turns import SCHEMA as TURN_SCHEMA, migrate, enqueue_turn, set_turn_state
@@ -158,6 +158,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         from .channels import SCHEMA as CHANNEL_SCHEMA
         from .alert_notify import SCHEMA as ALERT_NOTIFY_SCHEMA
         from .management import SCHEMA as MANAGEMENT_SCHEMA
+        from .namelists import SCHEMA as NAMELISTS_SCHEMA
         db.execute("PRAGMA journal_mode=WAL")
         from .execution import SCHEMA as EXEC_SCHEMA, migrate as migrate_execution
         from .leases import SCHEMA as LEASE_SCHEMA, migrate as migrate_leases
@@ -167,7 +168,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA + LEASE_SCHEMA + CONNECTOR_SCHEMA + LOCAL_SCHEMA + LIFECYCLE_SCHEMA + MEMORY_SCHEMA + ASSET_MEMORY_SCHEMA + ALARM_SCHEMA + CHANNEL_SCHEMA + ALERT_NOTIFY_SCHEMA + MANAGEMENT_SCHEMA)
         from .observability import SCHEMA as OBSERVABILITY_SCHEMA
         from .role_lifecycle import SCHEMA as ROLE_LIFECYCLE_SCHEMA
-        db.executescript(OBSERVABILITY_SCHEMA + ROLE_LIFECYCLE_SCHEMA + ATTACHMENT_SCHEMA)
+        db.executescript(OBSERVABILITY_SCHEMA + ROLE_LIFECYCLE_SCHEMA + ATTACHMENT_SCHEMA + NAMELISTS_SCHEMA)
         migrate(db)
         migrate_execution(db)
         migrate_leases(db)
@@ -188,6 +189,20 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         if "console_url" not in notify_columns:
             db.execute("ALTER TABLE alert_notify_config ADD COLUMN console_url TEXT")
         db.execute("PRAGMA user_version=9")
+        # Schema 10 (§43.1, §44.3): a turn freezes the mode and the name-list
+        # ids it started under, so rebinding a list or switching a mode never
+        # rewrites the history of a task that already ran. NULL means the turn
+        # predates name lists and keeps platform defaults.
+        turn_columns = {r[1] for r in db.execute("PRAGMA table_info(role_turns)")}
+        for name in ("readonly_list", "write_list", "deny_list", "baseline_version"):
+            if name not in turn_columns:
+                db.execute("ALTER TABLE role_turns ADD COLUMN " + name + " TEXT")
+        db.execute("PRAGMA user_version=10")
+        # Seed the platform default lists once so a fresh install is never in a
+        # state where a mode has no list (a missing list must not silently mean
+        # "anything goes").
+        from . import namelists as _namelists, baseline as _baseline
+        _namelists.ensure_defaults(db, _baseline.BASELINE_VERSION)
         # Register the control host itself once. It is a normal asset with a
         # 'local' transport: no credential, no agent, but the same task, lease
         # and audit path as everything else. Disable with
@@ -293,6 +308,8 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     install_unified_logs(app, transaction, admin)
     from .log_groups import install as install_log_groups
     install_log_groups(app, admin)
+    from .namelists import routes as name_list_routes
+    name_list_routes(app, transaction, audit, admin)
     install_custom_tasks(app, transaction, audit, admin, current_admin_token)
     install_turns(app, transaction, audit, admin, default_model, search_provider)
     from .runtime_status import install as install_runtime_status

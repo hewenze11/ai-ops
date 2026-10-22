@@ -30,10 +30,15 @@
 - **真机发现并修复一个严重漏洞**：原 `payload_hash` 只哈希 action/program/args/identity，**不包含 params**。`file.write` 的内容全在 `params.content` 里，argv 只有路径——所以批准“写 A 内容”后换成恶意内容，哈希不变、校验通过。已在服务端与 Agent 侧同步修正并加回归测试。
 
 ## 阶段 3：模式固化与名单快照（主服务）
-对应 §43.1、§44、§45。
-- [ ] 任务启动固化模式，切模式=新任务；trigger 必填模式；放权不继承。
-- [ ] 名单不可变快照：被引用即冻结，编辑 fork 新 ID 带 `parent_id`；禁止优先于允许；机械检查（死规则/相交/回溯）。
-- 验收：现有 `test_modes.py` 扩展；快照 fork 与绑定 diff 提示测试。
+对应 §43.1、§44、§45.2 第 6 条。**已完成，单测 538 passed（新增 12）。**
+- [x] 模式与名单在 `enqueue_turn` 时**一起固化**到 `role_turns`（`mode` + `readonly_list`/`write_list`/`deny_list` + `baseline_version`）；改绑只影响新任务。
+- [x] 名单不可变快照：编辑=`fork` 新 ID 带 `parent_id` + `version+1`，父版本原样保留；`ensure_defaults` 幂等播种平台默认名单（只读工具一份、写动作一份），绑定三模式。
+- [x] 规则带 `hosts` 标签作用域；`host_tags` 表 + `PUT /api/v1/assets/{id}/tags`。`propose_change` 先按名单过滤（`ACTION_NOT_IN_NAME_LIST`），再按标签作用域裁决（`HOST_OUT_OF_SCOPE`）。
+- [x] 名单只能**收窄**不能放宽：命中名单仍要走动作表与策略引擎。
+- [x] trigger/定时任务的 `mode` **必填**（缺失 422），保存时校验，不靠默认继承。
+- [x] 平台基线黑名单 `ai_ops/baseline.py`：独立版本号 `2026-10-22.1`，15 类形态（PEM/OpenSSH 私钥、AWS、GitHub、Slack、OpenAI、Google、JWT、URL 内嵌凭据、YAML/JSON/键值命名密钥、Basic blob），接在 `scrubbing._redact_pattern` 最前面，**无需配置即生效**。
+- 验收：`tests/test_stage3_modes_and_lists.py` 12 项（含“改绑不动已入队任务”“fork 不动父版本”“无标签主机不吃 tag 规则”“trigger 无 mode 被拒”）。
+- 升级影响：schema 9→10（`backup.SUPPORTED_SCHEMA` 同步），迁移测试已更新。
 
 ## 阶段 4：凭证两档与 Agent 侧凭证存储
 对应 §42、§46、§47。
@@ -57,4 +62,4 @@
 
 - 2026-10-22 阶段 0 完成。基线：ai-ops 488 passed（3m50s）；ai-ops-agent 30 passed / 13 skipped（Linux-only 用例，Windows 跳过）。新增 `docs/protocol-v13.md`。本地仓与 GitHub 对齐（两仓此前落后远端 install.sh/CI 提交，已取回；本地未提交的 docs 已推送）。遗留：Agent Linux 用例须在 .94 真机跑。
 - 2026-10-22 阶段 1 代码完成、单测全绿，**真机 smoke 未做**。主服务 508 passed（+20）；Agent 42 passed / 14 skipped。改动：新增 `ai_ops/readonly_tools.py`（主服务侧封闭只读工具集）、`ai_ops_agent/readonly.py`（Agent 侧独立复验 + execve 无 shell + 本机脱敏），`turns.py` 接上 readonly 工具分支，`authority.py` 允许 readonly 轮次的 claim，`execution.py`/`app.py` 支持协议 1.3 且不向旧 Agent 下发新 kind（审计去重）。遗留：③`cred:` 字面量注入属阶段 4；④**真机发现：低权限账号默认读不到 journal**，需 `usermod -aG adm`（已在 .94 建 aiops-ro 并加组，安装脚本必须包含这一步，否则 `journal_logs` 形同虚设）；⑤该主机非交互执行 PATH 为空且 `cat/mkdir/rm` 不在 /usr/bin，脚本一律用绝对路径并自行 export PATH；⑥`aiops-ro` 无 sudoers，所以 service.* 动作在真机上会被 OS 拒——这正确，sudoers 单条授权属阶段 5。
-- 2026-10-22 阶段 2 完成。主服务 **526 passed**（新增 18）；Agent **52 passed / 14 skipped**（新增 10）。真机 `scripts/smoke_change_host.py` **7/7**。新增 `ai_ops/actions.py`、`ai_ops_agent/changes.py`、`tests/test_actions.py`、`tests/test_changes.py`。`execute_command` 已从模型工具面移除，系统提示词同步重写。
+- 2026-10-22 阶段 3 完成。主服务 **538 passed**（新增 12）。新增 `ai_ops/namelists.py`（不可变名单/fork/绑定/主机标签）、`ai_ops/baseline.py`（平台基线黑名单，独立版本号 2026-10-22.1）。`enqueue_turn` 固化 `(mode, readonly_list, write_list, deny_list, baseline_version)`；schema 9→10，`backup.SUPPORTED_SCHEMA=10`。trigger/定时任务 `mode` 改为必填（缺失 422）。遗留：§44.2 的机械检查（死规则/相交/灾难性回溯干跑）与“默认名单有新版本”提示尚未实现，属阶段 6 控制台范围。

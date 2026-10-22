@@ -21,7 +21,7 @@ def test_generated_ids_atomic_model_and_compatibility(tmp_path):
     for route, body, key in [('/api/v1/assets', {'name':'资产','allowed_users':['reader']},'asset_id'),
                              ('/api/v1/skills', {'name':'Skill','content':'text'},'id'),
                              ('/api/v1/documents', {'name':'文档','content':'text'},'id'),
-                             ('/api/v1/custom-tasks', {'name':'任务','kind':'trigger','role_id':rid,'prompt':'test','execution_grants':[]},'id')]:
+                             ('/api/v1/custom-tasks', {'name':'任务','kind':'trigger','mode':'confirm','role_id':rid,'prompt':'test','execution_grants':[]},'id')]:
         one, two = c.post(route,json=body), c.post(route,json=body)
         assert one.status_code == two.status_code == 201, one.text
         assert one.json()[key] != two.json()[key]

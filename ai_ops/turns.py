@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 from fastapi import Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
-from . import account_grants, actions
+from . import account_grants, actions, namelists
 from .context import SYSTEM, build_body
 from .model_client import ModelFailure
 from .models import Identifier as ID, UserName as USER, new_id
@@ -157,16 +157,22 @@ SCHEMA += QUESTION_SCHEMA + account_grants.SCHEMA
 
 def enqueue_turn(db, role_id, source, source_id, users, mode, prompt, payload, created_at=None, caller=None, grants=None):
     from .role_lifecycle import require_active
+    from . import namelists, baseline
     require_active(db, role_id)
     now = time.time() if created_at is None else created_at
     turn_id = str(uuid.uuid4())
+    # Mode and the name-list ids are frozen at enqueue time (§43.1, §44.3):
+    # switching a mode means a new turn, and rebinding a list never rewrites
+    # what an already-queued task was allowed to do.
+    binding = namelists.snapshot_binding(db, mode)
     # ``source`` stays a coarse category (chat/trigger/scheduled/command). The
     # optional ``caller`` records WHICH surface produced it (web, feishu, weixin,
     # an alarm source, ...) so a channel can read back only its own turns' replies
     # and never sees another channel's conversation. Defaults to the source so
     # existing rows and callers keep their meaning.
-    db.execute("INSERT INTO role_turns(id,role_id,source,source_id,execution_users,mode,prompt,payload,state,created_at,updated_at,caller) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-               (turn_id, role_id, source, source_id, json.dumps(users), mode, prompt, json.dumps(payload, ensure_ascii=False), "queued", now, now, caller or source))
+    db.execute("INSERT INTO role_turns(id,role_id,source,source_id,execution_users,mode,prompt,payload,state,created_at,updated_at,caller,readonly_list,write_list,deny_list,baseline_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+               (turn_id, role_id, source, source_id, json.dumps(users), mode, prompt, json.dumps(payload, ensure_ascii=False), "queued", now, now, caller or source,
+                binding['readonly_list'], binding['write_list'], binding['deny_list'], baseline.BASELINE_VERSION))
     # Legacy histories remain unmodified/unscoped and are denied at dispatch.
     if grants is not None:
         account_grants.snapshot(db, turn_id, grants)
@@ -181,6 +187,9 @@ def migrate(db):
     # Schema 8: record which calling surface produced each turn so channels can
     # read back only their own conversation. Backfill old rows with the source.
     columns = {r[1] for r in db.execute("PRAGMA table_info(role_turns)")}
+    for name in ("readonly_list", "write_list", "deny_list", "baseline_version"):
+        if name not in columns:
+            db.execute("ALTER TABLE role_turns ADD COLUMN " + name + " TEXT")
     if "caller" not in columns:
         db.execute("ALTER TABLE role_turns ADD COLUMN caller TEXT")
         db.execute("UPDATE role_turns SET caller=source WHERE caller IS NULL")
@@ -303,6 +312,25 @@ READONLY_TOOLS = ('read_file', 'list_dir', 'file_stat', 'disk_usage', 'memory_in
                   'process_list', 'service_status', 'journal_logs', 'k8s_get', 'k8s_logs')
 
 from .readonly_tools import ReadonlyRejected  # noqa: E402  (named in except below)
+
+
+def name_rules(db, turn):
+    """Actions the turn's frozen write list allows, and their host scopes.
+
+    The list ids were written onto the turn when it was queued, so rebinding a
+    list later cannot widen an in-flight task. A turn predating name lists, or a
+    deployment that never seeded them, falls back to the platform default list
+    resolved live: the alternative — treating a missing list as "allow all" —
+    would turn a configuration gap into an authorization hole.
+    """
+    list_id = turn['write_list'] if 'write_list' in turn.keys() else None
+    if not list_id:
+        seeded = db.execute("SELECT list_id FROM platform_defaults WHERE name='lists'").fetchone()
+        if seeded:
+            list_id = (json.loads(seeded['list_id']) or {}).get('write')
+    if not list_id:
+        return set(actions.ACTIONS), {}
+    return namelists.rule_actions(db, list_id)
 
 
 def _trigger_of(db, turn):
@@ -580,8 +608,23 @@ class RoleEngine:
                     set_turn_state(db, turn['id'], 'failed', 'MODEL_TOOL_AUTHORIZATION_OR_SCHEMA_REJECTED')
                     self.audit(db, 'model.tool_rejected', turn['id'], 'service', {'call_id': call_id, 'tool': name})
                     return True
+                # The write list frozen at turn start decides which actions
+                # exist for this task at all (§44.3). Name rules can only narrow
+                # what the action table already allows, never widen it.
+                allowed, scope = name_rules(db, current)
                 verdicts = actions.plan(current['mode'], steps, **trigger['policy'])
                 codes = [reason for _, verdict, reason in verdicts if verdict == 'reject']
+                for step in steps:
+                    if step['action'] not in allowed:
+                        codes.append('ACTION_NOT_IN_NAME_LIST')
+                if scope:
+                    # Host tags come from the asset, so a rule scoped to tag:prod
+                    # simply does not exist on a host without that tag.
+                    codes.extend(reason for _, verdict, reason in actions.plan(
+                        current['mode'], steps,
+                        **{**trigger['policy'], 'action_hosts': scope,
+                           'asset_tags': namelists.tags_for(db, asset_id)})
+                        if verdict == 'reject')
                 digest = actions.payload_hash(steps, asset_id, run_as)
                 if codes:
                     # A change set is atomic: one refused step refuses all, so a

@@ -52,6 +52,31 @@ class Handle(BaseModel):
     kind: str = Field(default='pattern', pattern='^(pattern|path|file|connector)$')
 
 
+class Annotation(BaseModel):
+    """Operator-editable metadata (§42 item two). id, source and kind are not here
+    on purpose: where a secret was found and what matched are evidence, not
+    opinion, and renaming must not be able to rewrite them."""
+    model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+def annotate(db, asset_id, credential_id, name=None, note=None, actor='admin'):
+    row = db.execute('SELECT name,note FROM credential_handles WHERE asset_id=? AND id=?',
+                     (asset_id, credential_id)).fetchone()
+    if row is None:
+        raise HTTPException(404, 'Credential handle not found')
+    new_name = name if name is not None else row['name']
+    new_note = note if note is not None else row['note']
+    db.execute('UPDATE credential_handles SET name=?,note=? WHERE asset_id=? AND id=?',
+               (new_name, new_note, asset_id, credential_id))
+    db.execute('INSERT INTO credential_events(asset_id,credential_id,event,actor,detail,created_at) '
+               "VALUES(?,?,'annotated',?,?,?)",
+               (asset_id, credential_id, actor,
+                json.dumps({'name': [row['name'], new_name], 'note_changed': new_note != row['note']}, ensure_ascii=False),
+                time.time()))
+
+
 def register(db, asset_id, handles, actor='agent'):
     """Record what an agent discovered. Idempotent: re-discovery refreshes.
 
@@ -143,6 +168,13 @@ def install(app, transaction, audit, admin):
             dismiss(db, asset_id, credential_id, str(body.get('reason') or 'not a secret'))
             audit(db, 'credential.dismissed', asset_id, 'admin', {'credential_id': credential_id})
             return {'dismissed': True}
+
+    @app.put('/api/v1/assets/{asset_id}/credentials/{credential_id}', dependencies=[Depends(admin)])
+    def rename(asset_id: str, credential_id: str, body: Annotation):
+        with transaction() as db:
+            annotate(db, asset_id, credential_id, body.name, body.note)
+            audit(db, 'credential.annotated', asset_id, 'admin', {'credential_id': credential_id})
+            return next(h for h in listing(db, asset_id, include_dismissed=True) if h['id'] == credential_id)
 
     @app.get('/api/v1/assets/{asset_id}/credentials/{credential_id}/history', dependencies=[Depends(admin)])
     def history(asset_id: str, credential_id: str):

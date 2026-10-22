@@ -351,6 +351,8 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     install_backup(app, transaction, audit, admin, str(path))
     from .leases import install_leases
     install_leases(app, transaction, audit, admin)
+    from .inbox import install as install_inbox
+    install_inbox(app, transaction, audit, admin)
     from .connector_ssh import install_connector, start_connector_workers
     install_connector(app, transaction, audit, admin)
     from .connector_local import install_local_connector, start_local_connector_workers
@@ -423,10 +425,12 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
             # default inventory; they remain reachable by id and via lifecycle.
             rows = [r for r in rows if include_retired or r["retired_at"] is None]
             rows.sort(key=lambda r: (r["id"] == local_id, r["id"]))
+            from .namelists import tags_for
             return [{"id": r["id"], "name": r["name"], "allowed_users": json.loads(r["allowed_users"]), "notes": r["notes"],
                      "connection_type": connection_view(db, r["id"])["connection_type"],
                      "retired_at": r["retired_at"],
                      "account_notes": notes_view(db, r['id']),
+                     "tags": tags_for(db, r['id']),
                      "local_enabled": bool(local['enabled']) if r['id'] == local_id else None,
                      "health": health_view(db, r, app)}
                     for r in rows]
@@ -511,12 +515,13 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
             return view(row, db)
 
     @app.post("/api/v1/tasks/{task_id}/approve", dependencies=[Depends(admin)])
-    def approve(task_id: str):
+    def approve(task_id: str, body: dict | None = None):
+        note = str((body or {}).get('reason') or '')[:2000]
         with transaction() as db:
             changed = db.execute("UPDATE tasks SET state='queued',updated_at=? WHERE id=? AND state='awaiting_approval'", (time.time(), task_id)).rowcount
             if not changed:
                 raise HTTPException(409, "Task is not awaiting approval")
-            audit(db, "task.approved", task_id, "admin", {})
+            audit(db, "task.approved", task_id, "admin", {'reason': note} if note else {})
         return {"state": "queued"}
 
     @app.post("/api/v1/tasks/{task_id}/cancel", dependencies=[Depends(admin)])
@@ -645,10 +650,32 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         return {"accepted": True, "duplicate": False}
 
     @app.get("/api/v1/audit", dependencies=[Depends(admin)])
-    def get_audit(after: int = 0, limit: int = 100):
+    def get_audit(after: int = 0, limit: int = 100, entity_id: str | None = None,
+                  event_prefix: str | None = None, actor: str | None = None, before: int | None = None):
+        """Audit stream. Filters are plain equality / prefix so the console can
+        show one host's or one turn's timeline without a second endpoint.
+        ``before`` pages backwards (newest first) for a timeline view."""
         if not 1 <= limit <= 500 or after < 0:
             raise HTTPException(422, "Invalid pagination")
+        clauses, args = [], []
+        if before is not None:
+            clauses.append('seq<?')
+            args.append(before)
+        else:
+            clauses.append('seq>?')
+            args.append(after)
+        if entity_id:
+            clauses.append('entity_id=?')
+            args.append(entity_id[:200])
+        if event_prefix:
+            clauses.append("event LIKE ? ESCAPE '\\'")
+            args.append(event_prefix[:100].replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%')
+        if actor:
+            clauses.append('actor=?')
+            args.append(actor[:100])
+        order = 'DESC' if before is not None else 'ASC'
         with transaction() as db:
-            return [{**dict(r), "details": json.loads(r["details"])} for r in db.execute("SELECT * FROM audit WHERE seq>? ORDER BY seq LIMIT ?", (after, limit))]
+            return [{**dict(r), "details": json.loads(r["details"])} for r in db.execute(
+                "SELECT * FROM audit WHERE " + ' AND '.join(clauses) + " ORDER BY seq " + order + " LIMIT ?", (*args, limit))]
 
     return app

@@ -58,7 +58,9 @@
 - 验收：.94 真机从零安装，验收清单跑通。
 
 ## 阶段 6：控制台对接（Opus 5.5 子代理，主助手只给接口）
-- [ ] 审批卡片（动作主体、diff、哈希）、模式选择、名单编辑/快照 diff、凭证页。
+- [x] 后端补齐：`GET /api/v1/inbox`（审批/问题/账号申请三合一）、`POST /tasks/{id}/reject`（理由回给模型）、`PUT credentials/{id}`（改名/注释，证据字段不可改）、`/audit` 加 entity_id/event_prefix/actor/before 过滤、assets 列表带 tags。接口文档 `docs/governance-console-api.md`。
+- [ ] 前端（Opus 5.5）：收件箱 / 名单与模式 / 凭证库 / 审计时间线，产物 `ai_ops/console/governance/`。
+- [ ] 后端托管 `/governance` 路由。
 - 验收：用户亲自审。
 
 ## 进度记录
@@ -71,3 +73,4 @@
 - 2026-10-22 阶段 4.1 完成。主服务 **548 passed**；真机 `scripts/smoke_discovery_host.py` **14/14**（掩码、句柄不含值、source 取实际路径、二次读取不重复建条目、无密钥文件不产生句柄、清单文件无明文）。新增 `tests/test_credential_discovery.py`、`scripts/smoke_discovery_host.py`。
 - 2026-10-22 阶段 5 主体完成。Agent **53 passed**（新增 test_service/test_readonly_identity，真机执行类测试 Linux 跳过）；真机 `scripts/smoke_stage5_host.py` **14/14**。①只读通道拒绝 root：`READONLY_USER_ROOT`，配置项 `allow_root_readonly`（默认关，装出无 root 账号的 allowed_users 会打警告）；②install-agent.sh sudoers 去通配符改为 `--ops-units` 精确单位列表，只读账号无 sudo、加 systemd-journal/adm 组；③真机验证不重启真实服务，sudoers 测试用一次性 oneshot unit。遗留：审计表独立 DB 角色（一行 GRANT，SQLite 无角色概念，仅 PG 企业版适用，已记入文档备注）；外联默认关闭自由 fetch 需与 §41 联动核对。
 - 2026-10-22 阶段 5 收尾。主服务 **551 passed**（新增 3）。§41 自由 fetch 默认关落地。阶段 5 完成，进入阶段 6。
+- 2026-10-22 阶段 6 后端完成。主服务 **558 passed**（新增 7，tests/test_inbox.py）。范围定稿：只做权限体系四个人工触点+审计视图，不做对话/资产/RBAC/在线编辑名单。前端已派 Opus。

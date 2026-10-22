@@ -110,6 +110,10 @@ services:
       - "${BIND}:${PORT}:8765"
     environment:
       AI_OPS_ADMIN_TOKEN_FILE: /run/secrets/admin_token
+      # Free web fetch is OFF unless the operator opts in (§41). Set these in
+      # $DIR/.env: AI_OPS_FETCH_ALLOW=1 and AI_OPS_FETCH_HOSTS=a.com,b.com.
+      AI_OPS_FETCH_ALLOW: \${AI_OPS_FETCH_ALLOW:-0}
+      AI_OPS_FETCH_HOSTS: \${AI_OPS_FETCH_HOSTS:-}
     volumes:
       - ./state:/data
       - ./secrets/admin_token:/run/secrets/admin_token:ro

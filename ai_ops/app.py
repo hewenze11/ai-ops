@@ -142,7 +142,7 @@ CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, event TE
 """
 
 
-def create_app(db_path: str, admin_token: str, default_model: str = "", admin_token_file: str | None = None, search_provider=None) -> FastAPI:
+def create_app(db_path: str, admin_token: str, default_model: str = "", admin_token_file: str | None = None, search_provider=None, egress=None) -> FastAPI:
     if len(admin_token) < 32:
         raise ValueError("A random admin token of at least 32 characters is required")
     path = Path(db_path)
@@ -332,7 +332,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     from .credential_handles import install as install_credential_handles
     install_credential_handles(app, transaction, audit, admin)
     install_custom_tasks(app, transaction, audit, admin, current_admin_token)
-    install_turns(app, transaction, audit, admin, default_model, search_provider)
+    install_turns(app, transaction, audit, admin, default_model, search_provider, egress)
     from .runtime_status import install as install_runtime_status
     install_runtime_status(app, admin)
     from .memory import install_memory

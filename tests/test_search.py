@@ -110,13 +110,55 @@ def test_web_search_tool_runs_inline_without_assets():
 
 
 def test_web_search_tool_spec_exposed_only_when_provider_configured():
+    from ai_ops.search import EgressPolicy
     from ai_ops.turns import tool_spec
+    # fetch_page is NOT advertised without an egress policy: a tool that always
+    # fails teaches the model to retry and promises what the service refuses.
     names = [t["function"]["name"] for t in tool_spec([], FakeProvider())]
-    assert names == ["ask_user", "read_asset_memory", "request_execution_account", "web_search", "fetch_page"]
+    assert names == ["ask_user", "read_asset_memory", "request_execution_account", "web_search"]
     assert [t['function']['name'] for t in tool_spec([], None)] == ['ask_user', 'read_asset_memory', 'request_execution_account']
+    # Opted-in fetch appears only with an allowing policy.
+    opting_in = EgressPolicy(allow_fetch=True)
+    assert [t['function']['name'] for t in tool_spec([], FakeProvider(), 'confirm', opting_in)][-2:] == ['web_search', 'fetch_page']
     # Decision tool never grants execution authority.
     with_user = [t["function"]["name"] for t in tool_spec(["ops_read"], FakeProvider())]
-    assert with_user == ["ask_user", "read_asset_memory", "request_execution_account", "propose_change", "web_search", "fetch_page"]
+    assert with_user == ["ask_user", "read_asset_memory", "request_execution_account", "propose_change", "web_search"]
+
+
+def test_fetch_is_refused_without_an_egress_policy():
+    """A URL is a data pipe: default-closed, no exceptions (§41)."""
+    from ai_ops.search import EgressPolicy
+    with pytest.raises(search.SearchFailure) as error:
+        search.fetch_page("https://example.test/")
+    assert "FETCH_BLOCKED_BY_EGRESS_POLICY" in str(error.value)
+    off = EgressPolicy(allow_fetch=False)
+    with pytest.raises(search.SearchFailure):
+        search.fetch_page("https://example.test/", policy=off)
+
+
+def test_egress_policy_blocks_metadata_and_matches_hosts_exactly():
+    from ai_ops.search import EgressPolicy
+    open_policy = EgressPolicy(allow_fetch=True)
+    assert open_policy.allows("https://example.com/a") is True
+    assert open_policy.allows("http://169.254.169.254/latest/meta-data/") is False
+    assert open_policy.allows("http://metadata.google.internal/") is False
+    assert open_policy.allows("http://127.0.0.1:8765/api") is False
+    assert open_policy.allows("http://localhost/") is False
+    listed = EgressPolicy(allow_fetch=True, hosts=["docs.example.com"])
+    assert listed.allows("https://docs.example.com/x") is True
+    assert listed.allows("https://a.docs.example.com/x") is True
+    assert listed.allows("https://evil-example.com/") is False
+    assert listed.allows("https://docs.example.com.evil.net/") is False
+
+
+def test_egress_policy_from_env_defaults_to_off():
+    from ai_ops.search import EgressPolicy
+    assert EgressPolicy.from_env({}).allow_fetch is False
+    assert EgressPolicy.from_env({"AI_OPS_FETCH_ALLOW": "1"}).allow_fetch is True
+    policy = EgressPolicy.from_env({"AI_OPS_FETCH_ALLOW": "true", "AI_OPS_FETCH_HOSTS": "a.com, b.com"})
+    assert policy.hosts == ("a.com", "b.com")
+    assert policy.allows("https://b.com/x") is True
+    assert policy.allows("https://c.com/x") is False
 
 
 def test_search_failure_is_returned_as_tool_error_not_a_crash():
@@ -146,7 +188,7 @@ def test_fetch_page_extracts_text(monkeypatch):
         def open(self, *a, **k): return Resp()
 
     monkeypatch.setattr(search, "_opener", lambda: Opener())
-    text = search.fetch_page("https://example.test/")
+    text = search.fetch_page("https://example.test/", policy=search.EgressPolicy(allow_fetch=True))
     assert "Title" in text and "Body text" in text
     assert "bad()" not in text and "x{}" not in text
 

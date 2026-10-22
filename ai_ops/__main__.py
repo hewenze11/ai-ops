@@ -8,11 +8,14 @@ def main():
     secret_file = os.environ.get("AI_OPS_ADMIN_TOKEN_FILE")
     token = Path(secret_file).read_text().strip() if secret_file else os.environ.get("AI_OPS_ADMIN_TOKEN", "")
     from .app import create_app
-    from .search import provider_from_env
+    from .search import EgressPolicy, provider_from_env
     search_provider = provider_from_env(os.environ)
+    # Free fetch is off unless the operator opted in (§41). A URL is a data
+    # pipe: leaving it open undoes every read-side gate with one request.
+    egress = EgressPolicy.from_env(os.environ)
     app = create_app(os.environ.get("AI_OPS_DB", "data/control.db"), token,
                      os.environ.get("AI_OPS_MODEL", ""), admin_token_file=secret_file,
-                     search_provider=search_provider)
+                     search_provider=search_provider, egress=egress)
     app.state.enforce_model_readiness = True
     port = int(os.environ.get("AI_OPS_PORT", "8765"))
     background = []

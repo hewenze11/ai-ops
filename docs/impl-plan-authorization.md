@@ -53,8 +53,8 @@
 
 ## 阶段 5：兜底与安装
 对应 §7、§10、§43.4。
-- [ ] `install.sh`：建只读账号 + sudoers 仅放具体命令；核心文件 600 属服务账号；审计表独立 DB 角色仅 INSERT/SELECT。
-- [ ] 外联出口说明与默认关闭自由 fetch（§41）。
+- [x] `install-agent.sh`：建只读账号 + sudoers 仅放具体命令（--ops-units，无通配）；核心文件 600 属服务账号。审计表独立 DB 角色：SQLite 无角色概念，仅企业版 PG 部署清单项，不在开源版实现。
+- [x] 外联出口说明与默认关闭自由 fetch（§41）：`search.EgressPolicy`，默认关且不向模型暴露 fetch_page；元数据/loopback 永久封；AI_OPS_FETCH_ALLOW/HOSTS。
 - 验收：.94 真机从零安装，验收清单跑通。
 
 ## 阶段 6：控制台对接（Opus 5.5 子代理，主助手只给接口）
@@ -70,3 +70,4 @@
 - 2026-10-22 阶段 4 完成。主服务 **544 passed**（新增 6）；Agent **52 passed / 25 skipped**（新增 11，Linux-only）。真机 `scripts/smoke_credential_host.py` **15/15**。新增 `ai_ops_agent/credentials.py`、`ai_ops/credential_handles.py`、`tests/test_credentials.py`、`tests/test_credential_handles.py`。依赖：Agent 仓新增 `cryptography`（pyproject 已需补上）。
 - 2026-10-22 阶段 4.1 完成。主服务 **548 passed**；真机 `scripts/smoke_discovery_host.py` **14/14**（掩码、句柄不含值、source 取实际路径、二次读取不重复建条目、无密钥文件不产生句柄、清单文件无明文）。新增 `tests/test_credential_discovery.py`、`scripts/smoke_discovery_host.py`。
 - 2026-10-22 阶段 5 主体完成。Agent **53 passed**（新增 test_service/test_readonly_identity，真机执行类测试 Linux 跳过）；真机 `scripts/smoke_stage5_host.py` **14/14**。①只读通道拒绝 root：`READONLY_USER_ROOT`，配置项 `allow_root_readonly`（默认关，装出无 root 账号的 allowed_users 会打警告）；②install-agent.sh sudoers 去通配符改为 `--ops-units` 精确单位列表，只读账号无 sudo、加 systemd-journal/adm 组；③真机验证不重启真实服务，sudoers 测试用一次性 oneshot unit。遗留：审计表独立 DB 角色（一行 GRANT，SQLite 无角色概念，仅 PG 企业版适用，已记入文档备注）；外联默认关闭自由 fetch 需与 §41 联动核对。
+- 2026-10-22 阶段 5 收尾。主服务 **551 passed**（新增 3）。§41 自由 fetch 默认关落地。阶段 5 完成，进入阶段 6。

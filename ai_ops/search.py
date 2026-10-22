@@ -169,14 +169,20 @@ class _TextExtractor(HTMLParser):
         return re.sub(r"\n{3,}", "\n\n", "".join(self.parts)).strip()
 
 
-def fetch_page(url, max_chars=8000):
-    """Fetch a URL and return readable text. No credentials, GET only."""
+def fetch_page(url, max_chars=8000, policy=None):
+    """Fetch a URL and return readable text. No credentials, GET only.
+
+    Outbound freedom is the one thing that turns "read a log" into "send it
+    somewhere" (§41). ``policy`` is the operator's egress decision: when it is
+    missing the read is refused outright, because a default-open fetch makes
+    every other gate moot -- the model can exfiltrate anything it just read by
+    putting it in the query string.
+    """
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
         raise SearchFailure("FETCH_URL_INVALID")
-    # Internal documentation endpoints remain compatible. This is NOT a full
-    # SSRF boundary: deployment egress policy must block metadata/control APIs.
-    # A default public-only policy would silently break existing intranet use.
+    if policy is None or not policy.allows(url):
+        raise SearchFailure("FETCH_BLOCKED_BY_EGRESS_POLICY")
     raw = _http_get(url, {"Accept": "text/html,application/xhtml+xml", "User-Agent": "AI-Ops-Search"}, 20)
     charset = "utf-8"
     match = re.search(rb'charset=["\']?([\w-]+)', raw[:4096], re.I)
@@ -189,6 +195,56 @@ def fetch_page(url, max_chars=8000):
     parser = _TextExtractor()
     parser.feed(html)
     return parser.text()[:max_chars]
+
+
+class EgressPolicy:
+    """Which hosts web_search/fetch_page may reach (§41).
+
+    Default: search only, no free fetch. Free fetch is a deliberate opt-in: a
+    URL is a data pipe, so allowing arbitrary URLs lets the model exfiltrate
+    whatever it just read. Host matching is exact or dot-suffix, never a
+    substring test (`evil-example.com` must not match `example.com`).
+
+    Refused regardless of configuration: cloud metadata addresses, and loopback
+    unless explicitly allowed -- these are the SSRF targets that turn a
+    "harmless read" into credential theft.
+    """
+
+    METADATA = ("169.254.169.254", "metadata.google.internal", "100.100.100.200",
+                "metadata.azure.com", "metadata.tencentyun.com")
+
+    def __init__(self, allow_fetch=False, hosts=(), allow_loopback=False):
+        self.allow_fetch = bool(allow_fetch)
+        self.hosts = tuple(h.strip().lower().lstrip(".") for h in hosts if h and h.strip())
+        self.allow_loopback = bool(allow_loopback)
+
+    def allows(self, url):
+        if not self.allow_fetch:
+            return False
+        parsed = urllib.parse.urlsplit(url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if not host:
+            return False
+        if host in self.METADATA:
+            return False
+        if not self.allow_loopback and (host == "localhost" or host.startswith("127.")
+                                        or host in ("::1", "0.0.0.0")):
+            return False
+        if not self.hosts:
+            return True
+        return any(host == h or host.endswith("." + h) for h in self.hosts)
+
+    @classmethod
+    def from_env(cls, environ):
+        """AI_OPS_FETCH_ALLOW=0|1, AI_OPS_FETCH_HOSTS=a.com,b.com, AI_OPS_FETCH_LOOPBACK=0|1."""
+        def flag(name, default=False):
+            value = (environ.get(name) or "").strip().lower()
+            if not value:
+                return default
+            return value in ("1", "true", "yes", "on")
+        hosts = (environ.get("AI_OPS_FETCH_HOSTS") or "").split(",")
+        return cls(allow_fetch=flag("AI_OPS_FETCH_ALLOW"), hosts=hosts,
+                   allow_loopback=flag("AI_OPS_FETCH_LOOPBACK"))
 
 
 def search_tool_spec():

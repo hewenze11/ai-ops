@@ -381,7 +381,7 @@ def _table_exists(db, name):
     return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
 
 
-def tool_spec(users, search_provider=None, mode="confirm"):
+def tool_spec(users, search_provider=None, mode="confirm", egress=None):
     from .questions import tool_spec as question_tool_spec
     from .asset_memory import tool_spec as asset_memory_tool_spec
     specs = [question_tool_spec(), asset_memory_tool_spec()]
@@ -401,11 +401,15 @@ def tool_spec(users, search_provider=None, mode="confirm"):
     if search_provider is not None:
         from .search import search_tool_spec, fetch_tool_spec
         specs.append(search_tool_spec())
-        specs.append(fetch_tool_spec())
+        # fetch_page is only advertised when an egress policy actually permits
+        # it. Handing the model a tool that always fails teaches it to retry,
+        # and the description promises something the service will not do.
+        if egress is not None and egress.allow_fetch:
+            specs.append(fetch_tool_spec())
     return specs
 
 
-def tools_for_turn(turn, settings, search_provider):
+def tools_for_turn(turn, settings, search_provider, egress=None):
     """Expose tools according to the turn's immutable mode + selected accounts."""
     users = json.loads(turn["execution_users"])
     mode = turn["mode"]
@@ -413,17 +417,19 @@ def tools_for_turn(turn, settings, search_provider):
     # value blindly. An unknown mode must not silently become "direct".
     if mode not in MODES:
         mode = "confirm"
-    return tool_spec(users, search_provider, mode) or None
+    return tool_spec(users, search_provider, mode, egress) or None
 
 
 class RoleEngine:
-    def __init__(self, app, transaction, audit, default_model="", search_provider=None):
+    def __init__(self, app, transaction, audit, default_model="", search_provider=None, egress=None):
         self.app, self.transaction, self.audit = app, transaction, audit
         self.default_model = default_model
         self.search_provider = search_provider
+        # None means "free fetch is off"; see search.EgressPolicy (§41).
+        self.egress = egress
 
     def request_body(self, db, turn, settings):
-        tools = tools_for_turn(turn, settings, self.search_provider)
+        tools = tools_for_turn(turn, settings, self.search_provider, self.egress)
         return build_body(self.app, db, turn, settings, self.default_model, tools)
 
     def advance(self, client):
@@ -705,7 +711,7 @@ class RoleEngine:
                             content = json.dumps({"results": self.search_provider.search(query, count)}, ensure_ascii=False)
                         else:
                             url = str(arguments.get("url") or "")[:2000]
-                            content = json.dumps({"text": fetch_page(url)}, ensure_ascii=False)
+                            content = json.dumps({"text": fetch_page(url, policy=self.egress)}, ensure_ascii=False)
                     except SearchFailure as error:
                         content = json.dumps({'error': str(error) or 'SEARCH_FAILED'})
                     except Exception:
@@ -750,8 +756,8 @@ class RoleEngine:
         return True
 
 
-def install_turns(app, transaction, audit, admin, default_model="", search_provider=None):
-    engine = RoleEngine(app, transaction, audit, default_model, search_provider)
+def install_turns(app, transaction, audit, admin, default_model="", search_provider=None, egress=None):
+    engine = RoleEngine(app, transaction, audit, default_model, search_provider, egress)
     app.state.role_engine = engine
     install_questions(app, transaction, audit, admin)
     account_grants.install(app, transaction, audit, admin)

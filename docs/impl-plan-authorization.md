@@ -20,13 +20,14 @@
 - 验收：单测已覆盖绕过用例；**真机 smoke 已完成**（`scripts/smoke_readonly_host.py`，11/11）：读 hostname 成功且带行号、`/bin/cat` 冒充被拒、`;id` 只是文件名、`-fprintf` 被拒、符号链接被拒、密钥样式与本地凭据字面量都打码、`/etc/shadow` 被 OS 权限拒绝、未授权账号拒绝、journal 可读。
 
 ## 阶段 2：闸3 变更集 `propose_change`（主服务）
-对应 §5、§39.1、§43.2、§43.5。
-- [ ] 动作表 `ai_ops/actions.py`：有限结构化动作（restart_service / edit_file_patch / k8s_patch / run_shell[仅人工] …），每条带 `auto_approvable`、主机范围、参数校验。
-- [ ] 新工具 `propose_change(变更集)` 替代 `execute_command` 的裸 shell（`execute_command` 降级为 `run_shell` 动作，只能走人工审批）。
-- [ ] 策略引擎 `ai_ops/policy.py`：输入（模式, 动作, 触发源, 主机）→ 直接执行 / 发审批 / 拒绝。`direct` 禁止用于告警/webhook 触发轮次。
-- [ ] 审批绑定载荷哈希（§39.3），执行前重校验。
-- [ ] Agent：`kind=change` 任务按动作模板展开为 argv 执行，`cred:xxx` 引用在 Agent 侧替换（§42）。
-- 验收：confirm 模式动作进 awaiting_approval 且哈希一致才入队；direct 模式仅 auto_approvable 直过；触发源收窄生效。
+对应 §5、§39.1、§43.2、§43.5。**已完成，单元测试 + 真机 7/7。**
+- [x] 动作表 `ai_ops/actions.py`：10 个结构化动作（service.restart/reload/start/stop、file.write/append、log.rotate、disk.clean_temp、k8s.rollout_restart、shell.run），每条带 `auto_approvable`、风险等级、参数校验、基线拒绝路径。
+- [x] 新工具 `propose_change(变更集)` 已**完全取代** `execute_command`（模型工具面已无命令字符串选项）。
+- [x] 策略引擎 `decide(mode, step, trigger, host)` → 直接执行/发审批/拒绝；`direct` 只直过 `auto_approvable`；trigger 收窄到自己配置的动作且必须 direct；主机标签作用域。
+- [x] 审批绑定载荷哈希，**含 params**；一组中任一步被拒则整组拒绝（原子性）。
+- [x] Agent 侧 `changes.py`：独立重算 argv（与仓上 payload 不一致即拒）、重验哈希、基线路径拒绝、失败即停后续步骤。
+- 真机验证（`scripts/smoke_change_host.py`，7/7）：写入真实文件成功；低权限 reload 失败如实上报；篡改载荷被拒且**未写入**；`/etc/shadow` 被拒；失败后后续步骤 skipped；k8s argv 形状正确。
+- **真机发现并修复一个严重漏洞**：原 `payload_hash` 只哈希 action/program/args/identity，**不包含 params**。`file.write` 的内容全在 `params.content` 里，argv 只有路径——所以批准“写 A 内容”后换成恶意内容，哈希不变、校验通过。已在服务端与 Agent 侧同步修正并加回归测试。
 
 ## 阶段 3：模式固化与名单快照（主服务）
 对应 §43.1、§44、§45。
@@ -55,4 +56,5 @@
 （每阶段完成时追加：日期 / 改动文件 / 测试结果 / 真机证据 / 遗留）
 
 - 2026-10-22 阶段 0 完成。基线：ai-ops 488 passed（3m50s）；ai-ops-agent 30 passed / 13 skipped（Linux-only 用例，Windows 跳过）。新增 `docs/protocol-v13.md`。本地仓与 GitHub 对齐（两仓此前落后远端 install.sh/CI 提交，已取回；本地未提交的 docs 已推送）。遗留：Agent Linux 用例须在 .94 真机跑。
-- 2026-10-22 阶段 1 代码完成、单测全绿，**真机 smoke 未做**。主服务 508 passed（+20）；Agent 42 passed / 14 skipped。改动：新增 `ai_ops/readonly_tools.py`（主服务侧封闭只读工具集）、`ai_ops_agent/readonly.py`（Agent 侧独立复验 + execve 无 shell + 本机脱敏），`turns.py` 接上 readonly 工具分支，`authority.py` 允许 readonly 轮次的 claim，`execution.py`/`app.py` 支持协议 1.3 且不向旧 Agent 下发新 kind（审计去重）。遗留：③`cred:` 字面量注入属阶段 4；④**真机发现：低权限账号默认读不到 journal**，需 `usermod -aG adm`（已在 .94 建 aiops-ro 并加组，安装脚本必须包含这一步，否则 `journal_logs` 形同虚设）；⑤该主机非交互执行 PATH 为空且 `cat/mkdir/rm` 不在 /usr/bin，脚本一律用绝对路径并自行 export PATH。
+- 2026-10-22 阶段 1 代码完成、单测全绿，**真机 smoke 未做**。主服务 508 passed（+20）；Agent 42 passed / 14 skipped。改动：新增 `ai_ops/readonly_tools.py`（主服务侧封闭只读工具集）、`ai_ops_agent/readonly.py`（Agent 侧独立复验 + execve 无 shell + 本机脱敏），`turns.py` 接上 readonly 工具分支，`authority.py` 允许 readonly 轮次的 claim，`execution.py`/`app.py` 支持协议 1.3 且不向旧 Agent 下发新 kind（审计去重）。遗留：③`cred:` 字面量注入属阶段 4；④**真机发现：低权限账号默认读不到 journal**，需 `usermod -aG adm`（已在 .94 建 aiops-ro 并加组，安装脚本必须包含这一步，否则 `journal_logs` 形同虚设）；⑤该主机非交互执行 PATH 为空且 `cat/mkdir/rm` 不在 /usr/bin，脚本一律用绝对路径并自行 export PATH；⑥`aiops-ro` 无 sudoers，所以 service.* 动作在真机上会被 OS 拒——这正确，sudoers 单条授权属阶段 5。
+- 2026-10-22 阶段 2 完成。主服务 **526 passed**（新增 18）；Agent **52 passed / 14 skipped**（新增 10）。真机 `scripts/smoke_change_host.py` **7/7**。新增 `ai_ops/actions.py`、`ai_ops_agent/changes.py`、`tests/test_actions.py`、`tests/test_changes.py`。`execute_command` 已从模型工具面移除，系统提示词同步重写。

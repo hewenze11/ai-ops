@@ -17,3 +17,7 @@ connector/
 *.db-wal
 *.db-shm
 *.log
+
+# local scratch scripts
+scratch_*.py
+

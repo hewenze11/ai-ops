@@ -41,11 +41,15 @@
 - 升级影响：schema 9→10（`backup.SUPPORTED_SCHEMA` 同步），迁移测试已更新。
 
 ## 阶段 4：凭证两档与 Agent 侧凭证存储
-对应 §42、§46、§47。
-- [ ] 密钥发现即凭证化：脱敏命中生成凭证句柄，卡片询问是否解开（§42.2）。
-- [ ] Agent 侧 `credentials.json`（600）、`aiops-agent cred list|share|revoke|destroy`、`register --mode own|cooperative`。
-- [ ] 主服务只存句柄；connector 模式降级路径存主服务（复用 `connector_secrets.py`）。
-- 验收：对话永不出现明文；凭证页为唯一展示面；own 模式自动上行测试。
+对应 §42、§46、§47。**已完成，单测 544 passed（新增 6）；真机 15/15。**
+- [x] Agent 侧 `ai_ops_agent/credentials.py`：`credentials.json` + `credentials.key` 均 0600，AES-GCM（32 字节本机密钥，永不上行），原子写 + flock 互斥；句柄 `id` 由值 sha256 派生，重复发现不产生重复条目。
+- [x] own/cooperative 按 **Agent↔主服务配对**（config 里 `own` 字段），不是 Agent 全局；`master_id` 唯一，重绑需显式解绑（`OWNER_ALREADY_BOUND`）；`share` 按 controller id 逐条放行；`revoke_controller` 一并清 ownership 与所有 share（被管方否决权，§46.2）。
+- [x] 注入卡口：只有 `SINKS = {content, line}` 可放行，其余参数出现 `cred:` 直接 `CREDENTIAL_SINK_NOT_DECLARED`；未共享则 `CREDENTIAL_NOT_SHARED`——防止“把 cred 注进 curl”= 换名外泄。
+- [x] 注入后二次脱敏：readonly 与 change 两条路径都用**凭证明文本地精确匹配**打码，不再依赖正则（§42.1 第 2 条）。
+- [x] Agent CLI：`ai-ops-agent cred list|reveal|share|unshare|revoke|destroy`，全部只读本机配置、不需要主服务在线。
+- [x] 主服务 `ai_ops/credential_handles.py`：只存句柄（id/name/note/source/kind/所属资产），**模型层无 value 字段**（多一字段直接 422）；误报否决 `dismissed` 永久生效，重扫不再冒头；句柄限本机可用（跨主机不授权）；`/api/v1/credentials|assets/{id}/credentials|history`。
+- 真机（`scripts/smoke_credential_host.py`，15/15）：句柄不含值、双 0600、落盘无明文、reveal 可回、**另一账号 cat 被拒**、own/cooperative 流转、注入只走 sink、非 sink 参数被拒、输出里凭证明文被精确打码且非敏感行保留、flock 跨进程串行化（2.31s）。
+- 遗留：①connector 模式（无 Agent）仍走 `connector_secrets.py` 旧路径，尚未接入句柄表；②“密钥发现即自动凭证化”（扫描命中就生成句柄卡片）尚未接入 readonly 读取流程——目前句柄靠显式注册/Agent 上报；③解密卡片逃生口（§42.1 第 4 条）待控制台。
 
 ## 阶段 5：兜底与安装
 对应 §7、§10、§43.4。
@@ -63,3 +67,4 @@
 - 2026-10-22 阶段 0 完成。基线：ai-ops 488 passed（3m50s）；ai-ops-agent 30 passed / 13 skipped（Linux-only 用例，Windows 跳过）。新增 `docs/protocol-v13.md`。本地仓与 GitHub 对齐（两仓此前落后远端 install.sh/CI 提交，已取回；本地未提交的 docs 已推送）。遗留：Agent Linux 用例须在 .94 真机跑。
 - 2026-10-22 阶段 1 代码完成、单测全绿，**真机 smoke 未做**。主服务 508 passed（+20）；Agent 42 passed / 14 skipped。改动：新增 `ai_ops/readonly_tools.py`（主服务侧封闭只读工具集）、`ai_ops_agent/readonly.py`（Agent 侧独立复验 + execve 无 shell + 本机脱敏），`turns.py` 接上 readonly 工具分支，`authority.py` 允许 readonly 轮次的 claim，`execution.py`/`app.py` 支持协议 1.3 且不向旧 Agent 下发新 kind（审计去重）。遗留：③`cred:` 字面量注入属阶段 4；④**真机发现：低权限账号默认读不到 journal**，需 `usermod -aG adm`（已在 .94 建 aiops-ro 并加组，安装脚本必须包含这一步，否则 `journal_logs` 形同虚设）；⑤该主机非交互执行 PATH 为空且 `cat/mkdir/rm` 不在 /usr/bin，脚本一律用绝对路径并自行 export PATH；⑥`aiops-ro` 无 sudoers，所以 service.* 动作在真机上会被 OS 拒——这正确，sudoers 单条授权属阶段 5。
 - 2026-10-22 阶段 3 完成。主服务 **538 passed**（新增 12）。新增 `ai_ops/namelists.py`（不可变名单/fork/绑定/主机标签）、`ai_ops/baseline.py`（平台基线黑名单，独立版本号 2026-10-22.1）。`enqueue_turn` 固化 `(mode, readonly_list, write_list, deny_list, baseline_version)`；schema 9→10，`backup.SUPPORTED_SCHEMA=10`。trigger/定时任务 `mode` 改为必填（缺失 422）。遗留：§44.2 的机械检查（死规则/相交/灾难性回溯干跑）与“默认名单有新版本”提示尚未实现，属阶段 6 控制台范围。
+- 2026-10-22 阶段 4 完成。主服务 **544 passed**（新增 6）；Agent **52 passed / 25 skipped**（新增 11，Linux-only）。真机 `scripts/smoke_credential_host.py` **15/15**。新增 `ai_ops_agent/credentials.py`、`ai_ops/credential_handles.py`、`tests/test_credentials.py`、`tests/test_credential_handles.py`。依赖：Agent 仓新增 `cryptography`（pyproject 已需补上）。

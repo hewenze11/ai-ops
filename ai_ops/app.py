@@ -159,6 +159,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         from .alert_notify import SCHEMA as ALERT_NOTIFY_SCHEMA
         from .management import SCHEMA as MANAGEMENT_SCHEMA
         from .namelists import SCHEMA as NAMELISTS_SCHEMA
+        from .credential_handles import SCHEMA as CREDENTIAL_SCHEMA
         db.execute("PRAGMA journal_mode=WAL")
         from .execution import SCHEMA as EXEC_SCHEMA, migrate as migrate_execution
         from .leases import SCHEMA as LEASE_SCHEMA, migrate as migrate_leases
@@ -168,7 +169,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA + LEASE_SCHEMA + CONNECTOR_SCHEMA + LOCAL_SCHEMA + LIFECYCLE_SCHEMA + MEMORY_SCHEMA + ASSET_MEMORY_SCHEMA + ALARM_SCHEMA + CHANNEL_SCHEMA + ALERT_NOTIFY_SCHEMA + MANAGEMENT_SCHEMA)
         from .observability import SCHEMA as OBSERVABILITY_SCHEMA
         from .role_lifecycle import SCHEMA as ROLE_LIFECYCLE_SCHEMA
-        db.executescript(OBSERVABILITY_SCHEMA + ROLE_LIFECYCLE_SCHEMA + ATTACHMENT_SCHEMA + NAMELISTS_SCHEMA)
+        db.executescript(OBSERVABILITY_SCHEMA + ROLE_LIFECYCLE_SCHEMA + ATTACHMENT_SCHEMA + NAMELISTS_SCHEMA + CREDENTIAL_SCHEMA)
         migrate(db)
         migrate_execution(db)
         migrate_leases(db)
@@ -310,6 +311,8 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     install_log_groups(app, admin)
     from .namelists import routes as name_list_routes
     name_list_routes(app, transaction, audit, admin)
+    from .credential_handles import install as install_credential_handles
+    install_credential_handles(app, transaction, audit, admin)
     install_custom_tasks(app, transaction, audit, admin, current_admin_token)
     install_turns(app, transaction, audit, admin, default_model, search_provider)
     from .runtime_status import install as install_runtime_status

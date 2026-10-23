@@ -873,7 +873,7 @@
     const bar = el("div", "row wrap");
     const save = el("button", "small", "保存为新快照");
     save.onclick = () => saveDrafts(save);
-    const check = el("button", "ghost small", "校验");
+    const check = el("button", "small", "校验");
     check.onclick = () => { permState.trouble = validateDraft(); renderPermissions(host); };
     bar.appendChild(check); bar.appendChild(save);
     if (permState.dirty) bar.appendChild(el("span", "muted small", "有未保存的改动"));
@@ -920,7 +920,7 @@
       row.appendChild(sel);
       box.appendChild(row);
     });
-    box.appendChild(el("p", "muted small", "进行中的任务冻结着各自开始时的名单。"));
+    box.appendChild(el("p", "muted small", "模式在每轮对话里选，不分高低、不互相继承；进行中的任务冻结着它开始时的名单。"));
     return box;
   }
 

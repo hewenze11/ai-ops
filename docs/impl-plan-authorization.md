@@ -85,4 +85,10 @@
   新增 `tests/test_cross_repo_parity.py`：15 个用例 + 程序表必须两仓逐一相等，找不到主服务源码时 skip 而非 fail。**验证过它真会咬人**：把 Agent 的 `df` 路径改成 `/bin/df`，立刻 2 条断言红。
   顺手钉死一个容易改坏的顺序依赖：`changes.py` 里**凭证注入必须发生在审批哈希校验之后**（哈希要盖住人批准的占位符，而不是注入后的明文），已加测试。
   核对通过无需改动的：①`change` 的 params 本就参与重展开与哈希；②`redact` 只作用于 stdout/stderr，不会误伤 `credentials` 键；③Agent 把整个 result 原样上报，句柄能到主服务。
-- 2026-10-23 待办：①`GET .../revealed` 真回显（需 Agent 新增“二次读取”入口，跳仓）；②`read_sanitized` 中间层（前置条件：先加谓词工具就要先做这个）；③前端最后统一由用户重做。
+- 2026-10-23 阶段 6.10 解锁真回显打通（跨两仓，原待办①完成）。之前的 `revealed` 只能返回打码副本，根本原因是 `report_result` 对**所有**结果调 `redact_result`，reveal 的明文在入口就被抹掉了。
+  修法（四处，缺一不可）：①Agent 新增独立 kind `reveal`（**不是** readonly 上加 flag——flag 会被构造 readonly payload 的那一方决定，而那方是模型）；②`report_result` 对 reveal 开唯一例外不做脱敏，但**不写 `tasks.result`**，改写 `reveal_secret` 独立表（`tasks.result` 就是模型看到的工具输出，写进去等于把明文塞给模型）；③`revealed` 改成两态：首次请求派发 clone 任务返回 202，授权**不**消耗；拿到字节才销（删 stash + 改状态）；④`authority.claim_allowed` 给 reveal 单开分支（它 `turn_id IS NULL`，走不了原 turn 校验，改用 `source_turn_id` 复核 + 15 分钟新鲜度）。
+  排队规则：reveal **不插队**——只在 `row is None`（没有模型任务可领）且无在飞任务时才领。
+  Agent 侧额外收紧：reveal **只允许 `read_file`**（目录列表/journal 流全量解锁是另一个功能、另一个威胁模型）；**root 一律拒绝**，不提供 `allow_root_readonly` 旁路；输出上限 256KB；不回传 credentials 句柄（看一眼就入库等于副作用）。
+  测试：主服务 652（+3），Agent 111（+5）。新增 `test_reveal_bytes_never_land_in_the_task_result` 直接断言明文不在 `tasks.result` 里、且在 `reveal_secret` 里、取回后行被删。
+- 2026-10-23 顺手堵一洞：`turns.py` 的 `clean_params` 原样拷贝模型传入的**任意**键进 payload。`kind` 目前硬编码所以不可利用，但“模型能写的 payload 字段”与“派发器写的字段”同名，一次「合并 payload」重构就能把 kind 变成模型可选。已加 `_RESERVED` 黑名单。
+- 2026-10-23 待办：①`read_sanitized` 中间层（前置条件：先加谓词工具就要先做这个）；②前端最后统一由用户重做。

@@ -570,7 +570,16 @@ class RoleEngine:
                     run_as = str((arguments or {}).get('run_as') or '')
                     options = [k for k in (arguments or {}) if k not in ('asset_id', 'run_as')]
                     program, argv = build(name, {k: arguments.get(k) for k in options})
-                    clean_params = {k: arguments.get(k) for k in options}
+                    # ``params`` is copied from model arguments, so it is model-
+                    # controlled. Drop the names that carry protocol meaning:
+                    # ``kind`` is hardcoded above today, but a payload field
+                    # that both the model and the dispatcher can write is one
+                    # refactor away from the model choosing its own task kind.
+                    _RESERVED = ('kind', 'reveal', 'hit_id', 'source_turn_id',
+                                 'idempotency_key', 'authorization_revision',
+                                 'execution_grants', 'role_id', 'mode', 'asset_id')
+                    clean_params = {k: arguments.get(k) for k in options
+                                    if k not in _RESERVED}
                     users_now = json.loads(current['execution_users'])
                     if not account_grants.permits(db, current['id'], asset_id, run_as):
                         raise ValueError('Asset account not selected for turn')

@@ -40,6 +40,7 @@ from __future__ import annotations
 import json
 import secrets
 import time
+import uuid
 
 from fastapi import Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -48,6 +49,10 @@ from pydantic import BaseModel, ConfigDict
 # value, done. A long window turns a one-shot into a standing exemption.
 UNLOCK_TTL_SECONDS = 900
 MAX_REVEAL_CHARS = 20000
+# How many bytes of unmasked output are held after a reveal. Bigger than
+# MAX_REVEAL_CHARS on purpose: the response is truncated for display, the
+# stored copy is what was actually returned.
+MAX_STASH = 262144
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sensitive_hits(
@@ -68,6 +73,15 @@ CREATE TABLE IF NOT EXISTS sensitive_hits(
  created_at REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS sensitive_hits_turn ON sensitive_hits(turn_id);
 CREATE INDEX IF NOT EXISTS sensitive_hits_state ON sensitive_hits(reveal_state);
+-- Unmasked reveal output. Kept out of tasks.result on purpose: that column is
+-- what becomes model-visible tool output, and a reveal must never go there.
+-- One row per task, overwritten if the same task somehow reports twice.
+CREATE TABLE IF NOT EXISTS reveal_secret(
+ task_id TEXT PRIMARY KEY,
+ hit_id TEXT,
+ stdout TEXT NOT NULL DEFAULT '',
+ stderr TEXT NOT NULL DEFAULT '',
+ created_at REAL NOT NULL);
 """
 
 
@@ -134,6 +148,21 @@ def pending(db, turn_id=None):
     return out
 
 
+def stash_reveal(db, *, task_id, hit_id, stdout='', stderr=''):
+    """Park unmasked reveal output where the model cannot reach it.
+
+    Deliberately a separate table rather than a column on ``tasks``: every
+    reader of a task result (the model's tool-output builder, the audit view,
+    the console) walks ``tasks``, and a secret sitting in that row would leak
+    the first time someone added a field to a view. A separate table has to be
+    joined on purpose, which is the property we want.
+    """
+    db.execute('INSERT INTO reveal_secret(task_id,hit_id,stdout,stderr,created_at) '
+               'VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET '
+               'hit_id=excluded.hit_id,stdout=excluded.stdout,stderr=excluded.stderr,created_at=excluded.created_at',
+               (task_id, hit_id, stdout, stderr, time.time()))
+
+
 def model_notice(rule_ids, path):
     """What the model is told instead of the value.
 
@@ -197,19 +226,24 @@ def install(app, transaction, audit, admin):
     def revealed(hit_id: str, token: str = ''):
         """Return the unmasked text for one unlocked hit, then burn the grant.
 
-        The bytes are re-read from the stored task result, which on the Agent
-        path is the already-masked text -- so this endpoint can only return
-        what the control plane actually holds. When the control plane holds
-        only the masked copy (always, today), the operator is told so plainly
-        rather than being shown a fake reveal.
+        Two states, because the control plane cannot read the host itself:
+
+        * The reveal task already completed -> return the stashed bytes.
+        * It has not been dispatched yet -> dispatch it and answer 202. The
+          operator polls the same URL with the same token; the token survives
+          until the bytes are actually handed over, because the *grant* is what
+          one use consumes, not the request.
+
+        The value never touches ``tasks.result``: it is parked in
+        ``reveal_secret`` by the result endpoint so the model cannot reach it.
         """
         with transaction() as db:
             row = db.execute('SELECT * FROM sensitive_hits WHERE id=?', (hit_id,)).fetchone()
             if row is None:
                 raise HTTPException(404, 'Sensitive hit not found')
-            if row['reveal_state'] != 'unlocked' or not row['reveal_token']:
+            if row['reveal_state'] not in ('unlocked', 'revealing'):
                 raise HTTPException(409, 'Hit is not unlocked')
-            if not secrets.compare_digest(row['reveal_token'], token or ''):
+            if not secrets.compare_digest(row['reveal_token'] or '', token or ''):
                 audit(db, 'sensitive.reveal_refused', hit_id, 'admin',
                       {'reason': 'TOKEN_MISMATCH'})
                 raise HTTPException(403, 'Reveal token invalid')
@@ -218,26 +252,56 @@ def install(app, transaction, audit, admin):
                            "WHERE id=?", (hit_id,))
                 audit(db, 'sensitive.unlock_expired', hit_id, 'admin', {})
                 raise HTTPException(410, 'Unlock window expired; unlock again')
-            # One use only: burn the token whether or not the read succeeds.
+
+            task = db.execute('SELECT * FROM tasks WHERE id=?', (row['task_id'],)).fetchone()
+            if task is None:
+                raise HTTPException(409, 'The read this hit came from is gone')
+
+            # Fresh dispatch: queue one reveal task cloned from the original
+            # read, then answer 202. The clone keeps the same tool/params/args/account,
+            # so the Agent revalidates it against the same whitelist as the read
+            # that produced the hit -- a reveal cannot widen what is readable.
+            if row['reveal_state'] == 'unlocked':
+                payload = json.loads(task['payload']) if task['payload'] else {}
+                if payload.get('kind') != 'readonly':
+                    raise HTTPException(409, 'Only a file read can be revealed')
+                reveal_id = str(uuid.uuid4())
+                clone = {k: v for k, v in payload.items()
+                         if k in ('tool', 'params', 'program', 'args', 'run_as', 'asset_id',
+                                  'execution_users', 'timeout_seconds', 'role_id', 'mode',
+                                  'execution_grants', 'authorization_revision')}
+                clone.update({'kind': 'reveal', 'hit_id': hit_id, 'source_turn_id': task['turn_id'],
+                              'idempotency_key': 'reveal:' + hit_id})
+                db.execute('INSERT INTO tasks(id,role_id,asset_id,payload,state,idempotency_key,'
+                           'created_at,updated_at,turn_id) VALUES(?,?,?,?,?,?,?,?,?)',
+                           (reveal_id, task['role_id'], task['asset_id'],
+                            json.dumps(clone, ensure_ascii=False), 'queued',
+                            clone['idempotency_key'], time.time(), time.time(), None))
+                db.execute("UPDATE sensitive_hits SET reveal_state='revealing' WHERE id=?", (hit_id,))
+                audit(db, 'sensitive.reveal_dispatched', hit_id, 'admin',
+                      {'task_id': reveal_id, 'path': row['path'],
+                       'rule_ids': json.loads(row['rule_ids']),
+                       'scope': 'operator view only; model context unchanged'})
+                return {'hit_id': hit_id, 'path': row['path'], 'revealed': False,
+                        'pending': True, 'task_id': reveal_id,
+                        'note': 'Re-read dispatched to the host. Poll this URL with the same '
+                                'token; the grant is spent when the bytes are returned.'}
+
+            stash = db.execute('SELECT * FROM reveal_secret WHERE hit_id=? ORDER BY created_at DESC',
+                               (hit_id,)).fetchone()
+            if stash is None:
+                # Dispatched but no result yet -- still pending, not an error.
+                return {'hit_id': hit_id, 'path': row['path'], 'revealed': False,
+                        'pending': True,
+                        'note': 'Waiting for the host to re-read the file.'}
+            # One use only: burn the token and drop the stashed plaintext.
             db.execute("UPDATE sensitive_hits SET reveal_state='revealed',reveal_token=NULL "
                        "WHERE id=?", (hit_id,))
-            task = db.execute('SELECT result FROM tasks WHERE id=?', (row['task_id'],)).fetchone()
+            db.execute('DELETE FROM reveal_secret WHERE hit_id=?', (hit_id,))
             audit(db, 'sensitive.revealed', hit_id, 'admin',
-                  {'path': row['path'], 'rule_ids': json.loads(row['rule_ids'])})
-            text = ''
-            if task and task['result']:
-                try:
-                    text = (json.loads(task['result']) or {}).get('stdout') or ''
-                except (TypeError, ValueError):
-                    text = ''
-            # The stored stdout is already masked on every path we have. Say
-            # that instead of pretending otherwise: a "reveal" that returns
-            # [REDACTED] with no explanation looks like a bug.
-            from .scrubbing import MASK
-            if MASK in text:
-                return {'hit_id': hit_id, 'path': row['path'], 'revealed': False,
-                        'text': text[:MAX_REVEAL_CHARS],
-                        'note': 'The control plane stores only the masked copy. Re-read the '
-                                'file on the host to see the value; this grant is now spent.'}
+                  {'path': row['path'], 'rule_ids': json.loads(row['rule_ids']),
+                   'bytes': len(stash['stdout'] or '')})
             return {'hit_id': hit_id, 'path': row['path'], 'revealed': True,
-                    'text': text[:MAX_REVEAL_CHARS], 'note': 'Grant spent.'}
+                    'text': (stash['stdout'] or '')[:MAX_REVEAL_CHARS],
+                    'truncated': len(stash['stdout'] or '') > MAX_REVEAL_CHARS,
+                    'note': 'Grant spent; the stored copy is now deleted.'}

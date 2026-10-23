@@ -571,6 +571,20 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
                 AND NOT EXISTS (SELECT 1 FROM tasks prior WHERE prior.turn_id=t.turn_id AND prior.seq<t.seq
                   AND prior.state IN ('queued','awaiting_approval','claimed','unknown'))
                 ORDER BY rt.seq,t.seq LIMIT 1""", (asset_id,)).fetchone()
+            # A reveal task has no parent turn: it is dispatched by an operator
+            # looking at a completed read, not by the model. It is never queued
+            # ahead of model work, and it is claimed only when nothing else is
+            # waiting -- a human staring at a card must not jump the queue in
+            # front of the turn that is actually being diagnosed.
+            if row is None:
+                reveal_row = db.execute(
+                    "SELECT * FROM tasks WHERE state='queued' AND asset_id=? AND turn_id IS NULL "
+                    "AND idempotency_key LIKE 'reveal:%' ORDER BY seq LIMIT 1", (asset_id,)).fetchone()
+                if reveal_row is not None:
+                    busy = db.execute("SELECT 1 FROM tasks WHERE asset_id=? AND state IN "
+                                      "('awaiting_approval','claimed','unknown') LIMIT 1", (asset_id,)).fetchone()
+                    if busy is None:
+                        row = reveal_row
             # Protocol 1.3 kinds (readonly/change) carry structured payloads an
             # older agent would misread. Leave the task queued and tell the
             # console which agent needs upgrading instead of shipping it.
@@ -614,7 +628,24 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
             # step (duplicate comparison, stored result, audit) then sees the
             # same redacted value. The raw archive (digest-verified) is left
             # byte-exact on purpose.
-            body = Result(**scrubbing.redact_result(body.model_dump()))
+            #
+            # Exception, and it is the only one: a `reveal` task is dispatched by
+            # an operator, not by the model, and its whole purpose is to show
+            # unmasked bytes to the operator. Scrubbing it here would make the
+            # feature a no-op (that was the bug in the first cut). The bytes do
+            # not go where model output goes: see `reveal_secret` below. Every
+            # other kind is scrubbed exactly as before.
+            task_kind = 'shell'
+            task_payload = {}
+            _payload_row = db.execute('SELECT payload FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if _payload_row and _payload_row['payload']:
+                try:
+                    task_payload = json.loads(_payload_row['payload']) or {}
+                    task_kind = task_payload.get('kind', 'shell')
+                except ValueError:
+                    task_payload, task_kind = {}, 'shell'
+            if task_kind != 'reveal':
+                body = Result(**scrubbing.redact_result(body.model_dump()))
             # A credential handle the Agent reported becomes an inventory entry
             # here, next to the host that found it (§42, §46.3). Values never
             # travel: the result schema has no field for one.
@@ -642,9 +673,8 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
             # path -- so unlocking has to re-read the host.
             if body.status in ('succeeded', 'failed'):
                 from . import sensitive
-                task_payload = json.loads(row['payload']) if row['payload'] else {}
+                from .scrubbing import MASK, secret_kinds
                 if task_payload.get('kind') == 'readonly':
-                    from .scrubbing import MASK, secret_kinds
                     text = (body.stdout or '') + '\n' + (body.stderr or '')
                     if MASK in text:
                         rules = secret_kinds(text)
@@ -658,6 +688,23 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
                             audit(db, 'sensitive.hit', hit, 'service',
                                   {'turn_id': row['turn_id'], 'path': source,
                                    'rule_ids': rules, 'task_id': task_id})
+            # A reveal result is unmasked, so it must not land in tasks.result:
+            # that column is what the model is handed as tool output and what
+            # audit views read. Park the bytes in reveal_secret instead and store
+            # a stub here, so nothing downstream can pick them up by accident.
+            if task_kind == 'reveal':
+                sensitive.stash_reveal(db, task_id=task_id, hit_id=(task_payload or {}).get('hit_id'),
+                                       stdout=(body.stdout or '')[:sensitive.MAX_STASH],
+                                       stderr=(body.stderr or '')[:sensitive.MAX_STASH])
+                audit(db, 'sensitive.reveal_completed', task_id, 'agent:' + asset_id,
+                      {'hit_id': (task_payload or {}).get('hit_id'),
+                       'status': body.status, 'bytes': len(body.stdout or ''),
+                       'note': 'operator view only; not model-visible'})
+                body = Result(claim_id=body.claim_id, status=body.status, exit_code=body.exit_code,
+                              stdout='[operator view only -- see the unlock card]',
+                              stderr='', error_code=body.error_code,
+                              output_truncated=body.output_truncated)
+                result = body.model_dump_json()
             db.execute("UPDATE tasks SET state=?,result=?,updated_at=? WHERE id=?", (body.status, result, time.time(), task_id))
             parent = db.execute("SELECT * FROM role_turns WHERE id=?", (row['turn_id'],)).fetchone()
             if parent is None:

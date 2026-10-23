@@ -70,9 +70,14 @@ READONLY_CHANNEL = ['read_file', 'list_dir', 'file_stat', 'disk_usage', 'memory_
 def test_tool_spec_omits_execution_tool_in_readonly():
     # Readonly turns get the narrow readonly channel instead of the execution
     # tool: they can look, but there is no command string to inject into.
-    assert names_in_request({"tools": tool_spec(["ops_read"], None, "readonly")}) == ["ask_user", "read_asset_memory"] + READONLY_CHANNEL
+    # read_many belongs to the read-only channel: every child it dispatches is a
+    # readonly tool, so it widens breadth, not capability (§52.4). It must never
+    # appear in a write-mode surface, which the next two assertions pin.
+    assert names_in_request({"tools": tool_spec(["ops_read"], None, "readonly")}) == ["ask_user", "read_asset_memory"] + READONLY_CHANNEL + ["read_many"]
     assert names_in_request({"tools": tool_spec(["ops_read"], None, "confirm")}) == ["ask_user", "read_asset_memory", "request_execution_account", "propose_change"]
     assert names_in_request({"tools": tool_spec(["ops_read"], None, "direct")}) == ["ask_user", "read_asset_memory", "request_execution_account", "propose_change"]
+    for mode in ("confirm", "direct"):
+        assert "read_many" not in names_in_request({"tools": tool_spec(["ops_read"], None, mode)}), mode
 
 
 def test_readonly_channel_tool_becomes_structured_task():

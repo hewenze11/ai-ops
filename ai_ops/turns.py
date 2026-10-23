@@ -313,6 +313,53 @@ READONLY_TOOLS = ('read_file', 'list_dir', 'file_stat', 'disk_usage', 'memory_in
 
 from .readonly_tools import ReadonlyRejected  # noqa: E402  (named in except below)
 
+READ_MANY = 'read_many'
+
+# One call, many hosts, one aligned answer (§52.4). Deliberately a *fan-out tool*
+# rather than letting the model emit several tool calls: several calls multiply
+# approvals and audit rows, deliver N scattered blobs the model must stitch, and
+# leave "the turn's authority" undefined. The model chooses what to read and
+# where; the control plane alone decides how many run at once.
+READ_MANY_SPEC = {
+    'type': 'function',
+    'function': {
+        'name': READ_MANY,
+        'description': (
+            'Read the same thing from many hosts and get one aligned answer. '
+            'Use this instead of calling a read tool once per host when you are '
+            'diagnosing something that affects several machines. Hosts are grouped '
+            'by outcome: "unreachable" and "timeout" mean the data was NOT read, '
+            'so do not treat those as evidence about the service.'),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'tool': {'type': 'string', 'enum': list(READONLY_TOOLS),
+                         'description': 'Which read to run on every host.'},
+                'params': {'type': 'object',
+                           'description': 'Parameters for that tool, same as its own call.'},
+                'asset_ids': {'type': 'array', 'items': {'type': 'string'},
+                              'maxItems': 50,
+                              'description': 'Hosts to read. At most 50 per call; split '
+                                             'larger jobs instead of truncating silently.'},
+                'run_as': {'type': 'string', 'description': 'Account to use on every host.'},
+            },
+            'required': ['tool', 'params', 'asset_ids', 'run_as'],
+        },
+    },
+}
+
+
+def _asset_row(db, asset_id):
+    """Minimal asset view for fan-out planning, as a plain dict.
+
+    Kept tiny on purpose: the planner only needs allowed_users and whether the
+    asset is retired, and passing the whole row invites it to drift into
+    decisions it has no business making.
+    """
+    row = db.execute('SELECT id,allowed_users,retired_at FROM assets WHERE id=?',
+                     (asset_id,)).fetchone()
+    return dict(row) if row is not None else None
+
 
 def _tool_output(task):
     """What the model sees of a finished task.
@@ -392,6 +439,9 @@ def tool_spec(users, search_provider=None, mode="confirm", egress=None):
         # execution tool. This is a real capability boundary (gate 1).
         from .readonly_tools import tool_spec as readonly_tool_spec
         specs.extend(readonly_tool_spec())
+        # Only in a readonly turn, because every child runs a readonly tool.
+        # Grouped reads are the one place where breadth is the point (§52.4).
+        specs.append(READ_MANY_SPEC)
     # readonly turns deliberately withhold the execution tool entirely. This is a
     # real capability boundary: a jailbroken prompt still has nothing to call.
     if users and mode != "readonly":
@@ -432,6 +482,32 @@ class RoleEngine:
         tools = tools_for_turn(turn, settings, self.search_provider, self.egress)
         return build_body(self.app, db, turn, settings, self.default_model, tools)
 
+    def _advance_fanout(self, db, parent, payload):
+        """Move a fan-out group forward. Returns True when the parent is settled.
+
+        Called from the turn loop while the parent task is still ``queued``.
+        This method owns two things the rest of the pipeline should not know:
+        when a group is complete, and what the parent's result looks like when
+        it is.
+        """
+        from .fanout_runner import FanoutRunner
+        group_id = payload.get('group_id')
+        done, answer = FanoutRunner(self.transaction, self.audit, None).status(db, group_id)
+        if not done:
+            return False
+        result = {'claim_id': None, 'status': 'succeeded', 'exit_code': 0,
+                  'stdout': json.dumps(answer, ensure_ascii=False),
+                  'stderr': '', 'error_code': None, 'output_truncated': False}
+        # "succeeded" here means the fan-out itself finished, not that every
+        # host answered: per-host failures are inside the answer, grouped by
+        # outcome. Marking the parent failed because one host was down would
+        # throw away the 49 results that did arrive.
+        db.execute('UPDATE tasks SET state=?,result=?,updated_at=? WHERE id=?',
+                   ('succeeded', json.dumps(result, ensure_ascii=False), time.time(), parent['id']))
+        self.audit(db, 'fanout.answer_ready', group_id, 'service',
+                   {'parent_task': parent['id'], 'summary': answer.get('summary')})
+        return True
+
     def advance(self, client):
         call_id = None
         # Reserve one head-of-role turn in a transaction. Different worker threads
@@ -452,6 +528,15 @@ class RoleEngine:
                         set_turn_state(db, row["id"], "failed", "PENDING_TASK_MISSING")
                         self.audit(db, "turn.failed", row["id"], "service", {"error": "PENDING_TASK_MISSING"})
                         continue
+                    # A fan-out parent is never executed anywhere: its whole job
+                    # is to be the one id the turn waits on while the children
+                    # run. Advancing it here keeps every other branch below
+                    # unchanged, because they all deal with real task rows.
+                    parent_payload = json.loads(task['payload']) if task['payload'] else {}
+                    if parent_payload.get('kind') == 'fanout':
+                        if not self._advance_fanout(db, task, parent_payload):
+                            continue
+                        task = db.execute("SELECT * FROM tasks WHERE id=?", (task['id'],)).fetchone()
                     if task["state"] == "unknown":
                         set_turn_state(db, row["id"], "blocked_unknown", "EXECUTION_UNKNOWN")
                         self.audit(db, "turn.blocked", row["id"], "service", {"task_id": task["id"]})
@@ -555,6 +640,55 @@ class RoleEngine:
                     return True
                 set_turn_state(db, turn['id'], 'waiting_user')
                 self.audit(db, 'question.created', question_id, 'model-tool', {'turn_id': turn['id'], 'tool_call_id': calls[0]['id']})
+                return True
+            if name == READ_MANY:
+                # Fan-out: one tool call, N hosts, one parent task the turn waits
+                # on. The children are ordinary readonly tasks, so nothing
+                # downstream (scrubbing, audit, cancellation) needs a new case.
+                from . import fanout
+                from .fanout_runner import FanoutRunner
+                try:
+                    if current['mode'] != 'readonly':
+                        raise ValueError('fan-out outside readonly mode')
+                    request = fanout.FanoutRequest.model_validate(arguments)
+                    tool = str((arguments or {}).get('tool') or '')
+                    params = (arguments or {}).get('params') or {}
+                    if not isinstance(params, dict):
+                        raise ValueError('params must be an object')
+                    users_now = json.loads(current['execution_users'])
+                    if request.run_as not in users_now:
+                        raise ValueError('Account not selected for turn')
+                    for asset_id in request.asset_ids:
+                        if not account_grants.permits(db, current['id'], asset_id, request.run_as):
+                            raise ValueError('Asset account not selected for turn')
+                    chosen, rejected = fanout.plan(
+                        request, tool, params,
+                        lambda aid: _asset_row(db, aid))
+                except (ValueError, fanout.FanoutRejected, ReadonlyRejected):
+                    set_turn_state(db, turn['id'], 'failed', 'MODEL_TOOL_AUTHORIZATION_OR_SCHEMA_REJECTED')
+                    self.audit(db, 'model.tool_rejected', turn['id'], 'service', {'call_id': calls[0]['id'], 'tool': name})
+                    return True
+                runner = FanoutRunner(self.transaction, self.audit, None)
+                group_id, children = runner.start(
+                    db, turn=current, tool=tool, params=params, asset_ids=chosen,
+                    rejected=rejected, run_as=request.run_as)
+                # The parent exists only so the turn keeps waiting on one id.
+                # Its payload carries no argv: it is not executed anywhere.
+                parent_id = str(uuid.uuid4())
+                parent_payload = {'kind': 'fanout', 'group_id': group_id,
+                                  'tool': tool, 'asset_id': '',
+                                  'idempotency_key': 'fanout-parent:' + group_id}
+                db.execute('INSERT INTO tasks(id,role_id,asset_id,payload,state,'
+                           'idempotency_key,created_at,updated_at,turn_id) '
+                           'VALUES(?,?,?,?,?,?,?,?,?)',
+                           (parent_id, current['role_id'], chosen[0],
+                            json.dumps(parent_payload, ensure_ascii=False),
+                            'queued', parent_payload['idempotency_key'],
+                            time.time(), time.time(), turn['id']))
+                db.execute("UPDATE role_turns SET state='waiting_tool',pending_task_id=? WHERE id=?", (parent_id, turn['id']))
+                self.audit(db, 'task.submitted', parent_id, 'model-tool',
+                           {'turn_id': turn['id'], 'kind': 'fanout', 'group_id': group_id,
+                            'tool': tool, 'assets': len(chosen), 'rejected': len(rejected)})
                 return True
             if name in READONLY_TOOLS:
                 # Gate 1/2 (readonly channel): a tool choice becomes a

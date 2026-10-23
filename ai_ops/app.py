@@ -229,6 +229,10 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         # AI_OPS_LOCAL_CONNECTOR_ENABLED=0 before startup.
         from .connector_local import ensure_local_asset
         ensure_local_asset(db)
+        # Fan-out groups (§52.4). Created here so a fresh install and an
+        # upgraded one end up with the same tables.
+        from . import fanout as _fanout
+        _fanout.migrate(db)
         # Do not repeat a provider call whose response was lost during a crash.
         interrupted = db.execute("SELECT id FROM role_turns WHERE state IN ('calling','tool_calling')").fetchall()
         for row in interrupted:
@@ -569,7 +573,9 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
                 AND NOT EXISTS (SELECT 1 FROM role_turns p WHERE p.role_id=rt.role_id AND p.seq<rt.seq
                   AND p.state NOT IN ('completed','failed','cancelled'))
                 AND NOT EXISTS (SELECT 1 FROM tasks prior WHERE prior.turn_id=t.turn_id AND prior.seq<t.seq
-                  AND prior.state IN ('queued','awaiting_approval','claimed','unknown'))
+                  AND prior.state IN ('queued','awaiting_approval','claimed','unknown')
+                  AND json_extract(prior.payload,'$.kind') IS NOT 'fanout')
+                AND json_extract(t.payload,'$.kind') IS NOT 'fanout'
                 ORDER BY rt.seq,t.seq LIMIT 1""", (asset_id,)).fetchone()
             # A reveal task has no parent turn: it is dispatched by an operator
             # looking at a completed read, not by the model. It is never queued
@@ -585,6 +591,11 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
                                       "('awaiting_approval','claimed','unknown') LIMIT 1", (asset_id,)).fetchone()
                     if busy is None:
                         row = reveal_row
+            # A fan-out parent is a bookkeeping row, not work for any host: it
+            # carries no argv and exists only so the turn can wait on one id.
+            # Claiming it here would leave a real Agent with nothing to run.
+            if row is not None and json.loads(row['payload'] or '{}').get('kind') == 'fanout':
+                row = None
             # Protocol 1.3 kinds (readonly/change) carry structured payloads an
             # older agent would misread. Leave the task queued and tell the
             # console which agent needs upgrading instead of shipping it.
@@ -668,6 +679,17 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
                 raise HTTPException(409, 'Cancelled outcome requires an acknowledged cancellation request')
             check_archives(db, task_id, body.output_archives)
             close_lease(db, task_id)
+            # A child of a fan-out reports like any other task, but the group
+            # needs to know before the turn loop looks at it. Recording here
+            # means the parent can complete on the same pass that the last
+            # child lands, instead of one poll later.
+            try:
+                from .fanout_runner import FanoutRunner
+                FanoutRunner(self.transaction, audit, None).child_reported(db, task_id)
+            except Exception:
+                # Fan-out bookkeeping must never reject a task result: the
+                # result is the durable evidence, the group state is derived.
+                pass
             # §51.4: a masked read produces a hit the operator can unlock. The
             # value never lands in this table -- only the rule ids and the
             # path -- so unlocking has to re-read the host.

@@ -198,8 +198,20 @@ class LocalExecutor:
         from .leases import close_lease
         import json
         payload = task['payload']
-        result = self._execute(payload['run_as'], payload['command'],
-                               payload.get('timeout_seconds', 60), cancel_event)
+        kind = payload.get('kind') or 'shell'
+        if kind == 'readonly':
+            result = self._run_readonly(payload, cancel_event)
+        elif kind == 'shell':
+            result = self._execute(payload['run_as'], payload['command'],
+                                   payload.get('timeout_seconds', 60), cancel_event)
+        else:
+            # `change` is deliberately NOT supported on the local connector:
+            # the control host runs the control plane, so "approve a change
+            # here" would let a compromised control plane edit its own
+            # deployment. Change sets must target a remote asset.
+            result = {'claim_id': None, 'exit_code': None, 'stdout': '', 'stderr': '',
+                      'error_code': 'KIND_NOT_SUPPORTED_ON_LOCAL:' + str(kind)[:32],
+                      'output_truncated': False, 'status': 'failed'}
         from . import scrubbing
         result = scrubbing.redact_result(result)
         with self.transaction() as db:
@@ -216,6 +228,65 @@ class LocalExecutor:
                 set_turn_state(db, parent['id'], 'completed' if result['status'] == 'succeeded' else 'failed')
             self.audit(db, 'task.result', task['id'], 'local:' + asset_id, result)
         return result
+
+    def _run_readonly(self, payload, cancel_event):
+        """Readonly task on the control host itself.
+
+        Same table, same re-derivation as the SSH connector: the tool+params
+        are re-expanded here and the wire argv must match. Runs as the
+        task's account via the same executor, still with no shell.
+        """
+        from . import connector_kinds
+        base = {'claim_id': None, 'exit_code': None, 'stdout': '', 'stderr': '',
+                'error_code': None, 'output_truncated': False, 'status': 'failed',
+                'credentials': []}
+        try:
+            program, argv = connector_kinds.readonly_command(payload)
+        except connector_kinds.KindRejected as error:
+            base['error_code'] = 'READONLY_REJECTED:' + str(error)[:80]
+            return base
+        return self._execute_argv(payload.get('run_as'), [program] + argv,
+                                  payload.get('timeout_seconds', 60), cancel_event,
+                                  base)
+
+    def _execute_argv(self, run_as, argv, timeout, cancel_event, base):
+        """Run an already-validated argv as ``run_as``. No shell."""
+        if os.name == 'nt':
+            # The readonly table is POSIX paths; the local control host on
+            # Windows cannot honour them, so refuse instead of half-working.
+            base['error_code'] = 'LOCAL_READONLY_POSIX_ONLY'
+            return base
+        prefix = [] if run_as in (None, '', 'root') else ['sudo', '-n', '-u', run_as, '--']
+        kwargs = {'start_new_session': True}
+        try:
+            proc = subprocess.Popen(prefix + argv, cwd='/', stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+        except Exception as error:
+            base['error_code'] = 'EXECUTION_FAILED'
+            base['stderr'] = type(error).__name__
+            return base
+        out, err = bytearray(), bytearray()
+        deadline = time.monotonic() + timeout
+        try:
+            self._pump(proc, out, err, deadline, cancel_event)
+        except Exception:
+            base['error_code'] = 'EXECUTION_FAILED'
+        if proc.poll() is None:
+            self._terminate(proc)
+        try:
+            exit_code = proc.wait(timeout=5)
+        except Exception:
+            self._terminate(proc)
+            exit_code = None
+        chunk = 65536
+        base['stdout'] = bytes(out[:chunk]).decode('utf-8', 'replace')
+        base['stderr'] = bytes(err[:chunk]).decode('utf-8', 'replace')
+        base['exit_code'] = exit_code
+        base['output_truncated'] = len(out) > chunk or len(err) > chunk
+        base['status'] = 'succeeded' if exit_code == 0 else 'failed'
+        base['error_code'] = base['error_code'] or (None if exit_code == 0
+                                                    else 'READONLY_EXIT_' + str(exit_code))
+        return base
 
     def _execute(self, run_as, command, timeout, cancel_event):
         result = {'claim_id': None, 'exit_code': None, 'stdout': '', 'stderr': '',

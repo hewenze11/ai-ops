@@ -280,10 +280,24 @@ class ConnectorExecutor:
     def run(self, asset_id, task, cancel_event):
         """Execute one claimed task and record its result. Returns the result dict."""
         from .leases import close_lease
-        info = self._connection(asset_id)
         payload = task['payload']
-        result = self._execute(info, payload['run_as'], payload['command'],
-                               payload.get('timeout_seconds', 60), cancel_event)
+        kind = payload.get('kind') or 'shell'
+        if kind == 'readonly':
+            result = self._run_readonly(payload, cancel_event)
+        elif kind == 'change':
+            result = self._run_change(payload, cancel_event)
+        elif kind == 'shell':
+            # Legacy shell path: this one does need the connection up front.
+            info = self._connection(asset_id)
+            result = self._execute(info, payload['run_as'], payload['command'],
+                                   payload.get('timeout_seconds', 60), cancel_event)
+        else:
+            # Unknown kinds are a protocol mismatch, not a reason to guess. An
+            # older control plane should never send one; if it does, refusing is
+            # the only behaviour that cannot execute something unexpected.
+            result = {'claim_id': None, 'exit_code': None, 'stdout': '', 'stderr': '',
+                      'error_code': 'KIND_UNKNOWN:' + str(kind)[:32],
+                      'output_truncated': False, 'status': 'failed'}
         # Scrub inline output before it becomes durable or model-visible. The raw
         # archive streamed during execution remains byte-exact operator evidence.
         from . import scrubbing
@@ -303,7 +317,84 @@ class ConnectorExecutor:
             self.audit(db, 'task.result', task['id'], 'connector:' + asset_id, result)
         return result
 
-    def _execute(self, info, run_as, command, timeout, cancel_event):
+    def _run_readonly(self, payload, cancel_event):
+        """Readonly task over SSH: re-derive argv from params, never a shell.
+
+        Reads run as the SSH login account (no sudo): elevating a read is
+        exactly the escalation this channel forbids.
+        """
+        from . import connector_kinds
+        base = {'claim_id': None, 'exit_code': None, 'stdout': '', 'stderr': '',
+                'error_code': None, 'output_truncated': False, 'status': 'failed'}
+        try:
+            program, argv = connector_kinds.readonly_command(payload)
+            remote = connector_kinds.remote_command(program, argv, run_as=None)
+        except connector_kinds.KindRejected as error:
+            base['error_code'] = 'READONLY_REJECTED:' + str(error)[:80]
+            return base
+        # Validate first, connect second: an invalid task must not even cause a
+        # connection attempt.
+        info = self._connection(payload.get('asset_id'))
+        result = self._execute(info, None, None, payload.get('timeout_seconds', 60),
+                               cancel_event, remote=remote)
+        result.setdefault('credentials', [])
+        return result
+
+    def _run_change(self, payload, cancel_event):
+        """Change set over SSH: re-expand each step and re-check the hash.
+
+        Fail-closed on every disagreement. Steps run in order and the first
+        failure stops the rest, matching the Agent's semantics: a change set is
+        atomic in intent, so the operator must be told which step actually ran.
+        """
+        from . import connector_kinds
+        base = {'claim_id': None, 'exit_code': None, 'stdout': '', 'stderr': '',
+                'error_code': None, 'output_truncated': False, 'status': 'failed'}
+        try:
+            resolved = connector_kinds.change_commands(payload)
+        except connector_kinds.KindRejected as error:
+            base['error_code'] = 'ACTION_REJECTED:' + str(error)[:80]
+            return base
+        info = self._connection(payload.get('asset_id'))
+        run_as = payload.get('run_as')
+        out, err, codes = [], [], []
+        exit_code, status = 0, 'succeeded'
+        for index, (step, program, argv) in enumerate(resolved):
+            if cancel_event is not None and cancel_event.is_set():
+                status, exit_code = 'cancelled', None
+                out.append('[step %d %s] cancelled before execution' % (index + 1, step.get('action')))
+                break
+            remote = connector_kinds.remote_command(program, argv, run_as=run_as)
+            result = self._execute(info, run_as, None, step.get('timeout_seconds', 120),
+                                   cancel_event, remote=remote)
+            out.append('[step %d %s] %s' % (index + 1, step.get('action'),
+                                            result.get('stdout') or ''))
+            if result.get('stderr'):
+                err.append(result['stderr'])
+            if result.get('status') != 'succeeded':
+                exit_code = result.get('exit_code')
+                status = result.get('status')
+                codes.append('%s: %s' % (step.get('action'), result.get('error_code')))
+                remaining = len(resolved) - index - 1
+                if remaining:
+                    # Never continue after a failure: later steps may assume
+                    # the earlier one succeeded, and "some of it ran" reported
+                    # as success is the worst outcome for an operator.
+                    out.append('[%d later step(s) skipped after failure]' % remaining)
+                break
+        base.update({'status': status, 'exit_code': exit_code,
+                     'stdout': '\n'.join(out)[:65536], 'stderr': '\n'.join(err)[:65536],
+                     'error_code': '; '.join(codes)[:300] or None})
+        return base
+
+    def _execute(self, info, run_as, command, timeout, cancel_event, remote=None):
+        """Run one command on the target.
+
+        ``command`` is a shell string and is only used for ``kind=shell`` tasks
+        (legacy/manual). ``remote`` is a fully quoted, shell-free command line
+        built by ``connector_kinds`` for readonly and change tasks; when given,
+        it is used verbatim and no ``/bin/sh -c`` wrapper is added.
+        """
         result = {'claim_id': None, 'exit_code': None, 'stdout': '', 'stderr': '',
                   'error_code': None, 'output_truncated': False, 'status': 'failed'}
         if info is None:
@@ -316,7 +407,17 @@ class ConnectorExecutor:
             result['error_code'] = _classify_connect_error(error)
             result['stderr'] = str(error)[:300] or type(error).__name__
             return result
-        remote = "sudo -n -u %s -- /bin/sh -c %s" % (run_as, _shell_quote(command))
+        if remote is None:
+            if command is None:
+                # A structured kind passed no remote line: refusing beats
+                # inventing one.
+                result['error_code'] = 'REMOTE_COMMAND_MISSING'
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                return result
+            remote = "sudo -n -u %s -- /bin/sh -c %s" % (run_as, _shell_quote(command))
         channel = None
         try:
             channel = client.get_transport().open_session(timeout=CONNECT_TIMEOUT)

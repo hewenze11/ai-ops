@@ -570,6 +570,7 @@ class RoleEngine:
                     run_as = str((arguments or {}).get('run_as') or '')
                     options = [k for k in (arguments or {}) if k not in ('asset_id', 'run_as')]
                     program, argv = build(name, {k: arguments.get(k) for k in options})
+                    clean_params = {k: arguments.get(k) for k in options}
                     users_now = json.loads(current['execution_users'])
                     if not account_grants.permits(db, current['id'], asset_id, run_as):
                         raise ValueError('Asset account not selected for turn')
@@ -582,7 +583,8 @@ class RoleEngine:
                     self.audit(db, 'model.tool_rejected', turn['id'], 'service', {'call_id': call_id, 'tool': name})
                     return True
                 task_id = str(uuid.uuid4())
-                payload = {'kind': 'readonly', 'tool': name, 'program': program, 'args': argv,
+                payload = {'kind': 'readonly', 'tool': name, 'params': clean_params,
+                           'program': program, 'args': argv,
                            'run_as': run_as, 'asset_id': asset_id, 'timeout_seconds': 60,
                            'execution_users': json.loads(current['execution_users']),
                            'role_id': current['role_id'], 'mode': current['mode'],

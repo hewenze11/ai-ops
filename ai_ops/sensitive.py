@@ -267,9 +267,18 @@ def install(app, transaction, audit, admin):
                     raise HTTPException(409, 'Only a file read can be revealed')
                 reveal_id = str(uuid.uuid4())
                 clone = {k: v for k, v in payload.items()
-                         if k in ('tool', 'params', 'program', 'args', 'run_as', 'asset_id',
+                         if k in ('tool', 'params', 'run_as', 'asset_id',
                                   'execution_users', 'timeout_seconds', 'role_id', 'mode',
                                   'execution_grants', 'authorization_revision')}
+                # Rebuild argv from params instead of inheriting it. A clone that
+                # copies a possibly-stale or missing `args` would ship an
+                # unrunnable task and fail at the host, far from the cause.
+                from .readonly_tools import build as build_argv, ReadonlyRejected
+                try:
+                    program, argv = build_argv(payload.get('tool'), payload.get('params') or {})
+                except ReadonlyRejected as error:
+                    raise HTTPException(409, 'The original read can no longer be expanded: %s' % error)
+                clone['program'], clone['args'] = program, argv
                 clone.update({'kind': 'reveal', 'hit_id': hit_id, 'source_turn_id': task['turn_id'],
                               'idempotency_key': 'reveal:' + hit_id})
                 db.execute('INSERT INTO tasks(id,role_id,asset_id,payload,state,idempotency_key,'

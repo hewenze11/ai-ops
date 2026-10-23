@@ -208,6 +208,87 @@ def default_lists():
     }
 
 
+def default_drift(db):
+    """What the platform's own tables now have that the seeded list lacks.
+
+    §44.1: a platform release must NOT silently re-bind lists -- the operator's
+    frozen snapshot is evidence of what was allowed on a given day. But a
+    security update is worthless if it never arrives, so the gap is surfaced
+    and the operator decides.
+
+    Comparing *code* against *the database snapshot* is the whole point: it
+    tells you the rules a newer build would have added, without touching what
+    is bound today. Removals are reported too, because a rule that disappeared
+    upstream may mean the action itself was withdrawn.
+    """
+    marker = db.execute("SELECT list_id FROM platform_defaults WHERE name='lists'").fetchone()
+    if marker is None:
+        return {'seeded': False, 'lists': []}
+    seeded_ids = json.loads(marker['list_id'])
+    current = default_lists()
+    report = []
+    for kind, body in current.items():
+        list_id = seeded_ids.get(kind)
+        row = db.execute('SELECT version,parent_id FROM name_lists WHERE id=?', (list_id,)).fetchone()
+        if row is None:
+            continue
+        existing = {x[0]: {'rule_id': x[0], 'action': x[1]} for x in db.execute(
+            'SELECT rule_id,action FROM name_list_rules WHERE list_id=?', (list_id,))}
+        wanted = {r.rule_id: r for r in body.rules}
+        missing = sorted(set(wanted) - set(existing))
+        removed = sorted(set(existing) - set(wanted))
+        # A rule whose action changed under the same id is a rewrite, not an add.
+        changed = sorted(rid for rid in set(wanted) & set(existing)
+                         if wanted[rid].action != existing[rid]['action'])
+        if missing or removed or changed:
+            report.append({
+                'kind': kind, 'list_id': list_id, 'version': row['version'],
+                'missing_rules': [{'rule_id': rid, 'action': wanted[rid].action} for rid in missing],
+                'removed_rules': [{'rule_id': rid, 'action': existing[rid]['action']} for rid in removed],
+                'changed_rules': [{'rule_id': rid, 'from': existing[rid]['action'],
+                                   'to': wanted[rid].action} for rid in changed],
+                'summary': '%d new, %d withdrawn, %d changed' % (len(missing), len(removed), len(changed)),
+            })
+    return {'seeded': True, 'lists': report,
+            'note': 'Nothing is re-bound automatically. Fork the list and bind it when you accept '
+                    'the change (§44.1).'}
+
+
+def apply_default_drift(db, kind, actor='admin'):
+    """Fork the seeded list with the platform's current rules and re-bind it.
+
+    Kept as an explicit action rather than a startup side effect: a security
+    patch that re-binds itself is a patch that can widen authority without a
+    human reading the diff. The fork records ``parent_id``, so the audit can
+    still walk back to what was in force before the update.
+    """
+    if kind not in ('readonly', 'write'):
+        raise HTTPException(422, 'Unknown default list kind')
+    marker = db.execute("SELECT list_id FROM platform_defaults WHERE name='lists'").fetchone()
+    if marker is None:
+        raise HTTPException(409, 'Platform defaults were never seeded')
+    seeded_ids = json.loads(marker['list_id'])
+    list_id = seeded_ids.get(kind)
+    if db.execute('SELECT 1 FROM name_lists WHERE id=?', (list_id,)).fetchone() is None:
+        raise HTTPException(404, 'Seeded list not found')
+    rules = [r.model_dump() for r in default_lists()[kind].rules]
+    new_id = fork_list(db, list_id, {'rules': rules}, actor=actor)
+    for mode in MODES:
+        if KIND_FOR_MODE[mode] != kind:
+            continue
+        row = db.execute('SELECT * FROM mode_bindings WHERE mode=?', (mode,)).fetchone()
+        if row is None:
+            set_binding(db, mode, readonly_list=new_id if kind == 'readonly' else None,
+                        write_list=new_id if kind == 'write' else None)
+        elif kind == 'readonly':
+            set_binding(db, mode, readonly_list=new_id, write_list=row['write_list'],
+                        deny_list=row['deny_list'])
+        else:
+            set_binding(db, mode, readonly_list=row['readonly_list'], write_list=new_id,
+                        deny_list=row['deny_list'])
+    return new_id
+
+
 def ensure_defaults(db, baseline_version):
     """Seed default lists and bindings exactly once per install.
 
@@ -231,6 +312,30 @@ def routes(app, transaction, audit, admin):
         with transaction() as db:
             return [view(db, r['id']) for r in db.execute(
                 'SELECT id FROM name_lists WHERE retired_at IS NULL ORDER BY created_at DESC')]
+
+    # Registered before /name-lists/{list_id} so 'platform-defaults' is never
+    # read as a list id (FastAPI matches in declaration order).
+    @app.get('/api/v1/name-lists/platform-defaults/drift', dependencies=[Depends(admin)])
+    def show_drift():
+        """What the running build would add to the seeded default lists.
+
+        Read-only on purpose: a platform security update must reach the
+        operator, but re-binding lists behind their back would erase the
+        evidence of what was allowed when (§44.1).
+        """
+        with transaction(write=False) as db:
+            return default_drift(db)
+
+    @app.post('/api/v1/name-lists/platform-defaults/{kind}/apply', dependencies=[Depends(admin)],
+              status_code=201)
+    def apply_drift(kind: str):
+        """Accept the platform's current rules: fork the seeded list and re-bind."""
+        with transaction() as db:
+            before = bindings(db)
+            new_id = apply_default_drift(db, kind)
+            audit(db, 'name_list.defaults_applied', new_id, 'admin',
+                  {'kind': kind, 'bindings_before': before, 'bindings_after': bindings(db)})
+            return {'list_id': new_id, 'list': view(db, new_id), 'bindings': bindings(db)}
 
     @app.get('/api/v1/name-lists/{list_id}', dependencies=[Depends(admin)])
     def get_one(list_id: str):

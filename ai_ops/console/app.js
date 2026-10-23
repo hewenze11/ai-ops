@@ -168,7 +168,14 @@
     } catch (err) {
       token = ""; resetSession();
       const box = $("login-error");
-      box.textContent = err.status === 403 ? "凭据无效。" : ("无法连接：" + err.message);
+      /* A browser-level abort (extension, proxy, cancelled request) arrives as
+         a bare AbortError with no HTTP status. Reporting that as "cannot
+         connect" sends the operator to check the server, which is usually
+         innocent. Name the actual likely cause instead. */
+      const aborted = !err.status && /abort/i.test((err.name || "") + " " + (err.message || ""));
+      box.textContent = err.status === 403 ? "凭据无效。"
+        : aborted ? "请求被浏览器或代理中断了（不是服务器没响应）。请用无痕窗口重试，或关闭拦截类扩展后再试。"
+        : ("无法连接：" + err.message);
       box.hidden = false;
     }
   };

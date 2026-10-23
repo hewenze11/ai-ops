@@ -332,6 +332,8 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     name_list_routes(app, transaction, audit, admin)
     from .namelist_checks import install as install_namelist_checks
     install_namelist_checks(app, transaction, audit, admin)
+    from .binding_impact import install as install_binding_impact
+    install_binding_impact(app, transaction, admin)
     from .credential_handles import install as install_credential_handles
     install_credential_handles(app, transaction, audit, admin)
     install_custom_tasks(app, transaction, audit, admin, current_admin_token)

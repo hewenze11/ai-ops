@@ -239,6 +239,52 @@ def install_connector(app, transaction, audit, admin):
         return {'reachable': True}
 
 
+def _discover(result, kind, payload):
+    """Turn secret-shaped output into handles, before masking destroys the value.
+
+    A handle is ``sha256(asset_id + value)`` truncated: it must be stable so the
+    same secret found twice is one entry, and it must not be reversible, because
+    the id travels into the console, the audit trail and the model's context.
+
+    Scoping the hash by asset is deliberate: a handle is only meaningful on the
+    host that reported it (§46.3), so the same value on two hosts produces two
+    handles rather than one shared entry that would look like a cross-host
+    licence.
+    """
+    import hashlib
+    from .baseline import apply as baseline_apply
+    if kind != 'readonly':
+        # A shell task's output is not a file read whose path we can cite, so a
+        # handle from it would have no evidence trail. Refusing here keeps the
+        # rule in one place instead of relying on every caller.
+        return []
+    asset_id = str(payload.get('asset_id') or '')
+    source = next((a for a in (payload.get('args') or []) if isinstance(a, str)
+                   and a.startswith('/')), '')
+    found: dict[str, dict] = {}
+    for field in ('stdout', 'stderr'):
+        text = result.get(field) or ''
+        if not text:
+            continue
+        _masked, rule_ids = baseline_apply(text)
+        if not rule_ids:
+            continue
+        for rule_id in rule_ids:
+            digest = hashlib.sha256(('%s\x00%s\x00%s' % (asset_id, rule_id, text[:4096])).encode()).hexdigest()
+            handle_id = 'cred-' + digest[:32]
+            found.setdefault(handle_id, {
+                'id': handle_id,
+                'name': '%s @ %s' % (rule_id, source or 'output'),
+                'note': 'Discovered in connector output; value not stored on the control plane.',
+                'source': source,
+                # 'pattern' keeps the console's existing false-positive veto
+                # working: an operator can dismiss a git sha that looked like a
+                # token without disabling discovery.
+                'kind': 'pattern',
+            })
+    return list(found.values())
+
+
 class ConnectorExecutor:
     """Executes queued tasks for ssh assets, mirroring the agent result contract."""
 
@@ -298,10 +344,18 @@ class ConnectorExecutor:
             result = {'claim_id': None, 'exit_code': None, 'stdout': '', 'stderr': '',
                       'error_code': 'KIND_UNKNOWN:' + str(kind)[:32],
                       'output_truncated': False, 'status': 'failed'}
+        # Discovery happens BEFORE masking, because masking destroys the value
+        # (§42): once the line reads [REDACTED] there is nothing left to key a
+        # handle on. The connector path holds no local credential store, so the
+        # control plane is the only place these can be inventoried -- which is
+        # also why it must never store the value itself.
+        credentials_found = _discover(result, kind, payload) if kind == 'readonly' else []
         # Scrub inline output before it becomes durable or model-visible. The raw
         # archive streamed during execution remains byte-exact operator evidence.
         from . import scrubbing
         result = scrubbing.redact_result(result)
+        if credentials_found:
+            result['credentials'] = credentials_found
         with self.transaction() as db:
             close_lease(db, task['id'])
             db.execute("UPDATE tasks SET state=?,result=?,updated_at=? WHERE id=?",
@@ -315,6 +369,14 @@ class ConnectorExecutor:
             elif parent['source'] == 'command':
                 set_turn_state(db, parent['id'], 'completed' if result['status'] == 'succeeded' else 'failed')
             self.audit(db, 'task.result', task['id'], 'connector:' + asset_id, result)
+            # Handles only; the values were consumed above and are never stored.
+            if credentials_found:
+                from .credential_handles import register as register_handles
+                fresh = register_handles(db, asset_id, credentials_found, actor='connector:' + asset_id)
+                if fresh:
+                    self.audit(db, 'credential.discovered', asset_id,
+                               'connector:' + asset_id,
+                               {'credential_ids': fresh, 'count': len(fresh)})
         return result
 
     def _run_readonly(self, payload, cancel_event):
@@ -337,7 +399,6 @@ class ConnectorExecutor:
         info = self._connection(payload.get('asset_id'))
         result = self._execute(info, None, None, payload.get('timeout_seconds', 60),
                                cancel_event, remote=remote)
-        result.setdefault('credentials', [])
         return result
 
     def _run_change(self, payload, cancel_event):

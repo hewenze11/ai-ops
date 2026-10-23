@@ -212,12 +212,27 @@ class LocalExecutor:
             result = {'claim_id': None, 'exit_code': None, 'stdout': '', 'stderr': '',
                       'error_code': 'KIND_NOT_SUPPORTED_ON_LOCAL:' + str(kind)[:32],
                       'output_truncated': False, 'status': 'failed'}
+        # Discovery before masking (§42): a masked line cannot be keyed.
+        credentials_found = []
+        if kind == 'readonly':
+            from .connector_ssh import _discover
+            credentials_found = _discover(result, kind, payload)
         from . import scrubbing
         result = scrubbing.redact_result(result)
+        if credentials_found:
+            result['credentials'] = credentials_found
         with self.transaction() as db:
             close_lease(db, task['id'])
             db.execute("UPDATE tasks SET state=?,result=?,updated_at=? WHERE id=?",
                        (result['status'], json.dumps(result), time.time(), task['id']))
+            if credentials_found:
+                from .credential_handles import register as register_handles
+                fresh = register_handles(db, asset_id, credentials_found,
+                                         actor='local:' + asset_id)
+                if fresh:
+                    self.audit(db, 'credential.discovered', asset_id,
+                               'local:' + asset_id,
+                               {'credential_ids': fresh, 'count': len(fresh)})
             parent = db.execute("SELECT * FROM role_turns WHERE id=(SELECT turn_id FROM tasks WHERE id=?)", (task['id'],)).fetchone()
             from .turns import set_turn_state
             if result['status'] == 'unknown':

@@ -24,11 +24,6 @@ include = ["ai_ops*"]
 
 [tool.setuptools.package-data]
 "ai_ops.console" = ["*.html", "*.css", "*.js"]
-# The governance console is a second bundle in a subdirectory; package-data
-# patterns do not recurse, so it needs its own explicit entry or the wheel
-# ships without it and /governance 404s in a container while working from a
-# source checkout.
-"ai_ops.console.governance" = ["*.html", "*.css", "*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

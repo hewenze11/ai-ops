@@ -60,29 +60,6 @@ def install_console(app, transaction, audit, admin):
     def script():
         return FileResponse(root / "app.js", media_type=ASSETS["app.js"], headers=headers)
 
-    # Governance console (stage 6): a separate static bundle under /governance.
-    # Same rules as the main console: no credential needed to fetch the
-    # bundle, the page carries nothing secret, every API call it makes goes
-    # through the admin dependency. Served only when the bundle is present so
-    # a source checkout without the frontend still starts.
-    gov = root / "governance"
-    if all((gov / name).is_file() for name in ASSETS):
-        gov_revision = hashlib.sha256(b"".join(
-            name.encode() + b"\0" + (gov / name).read_bytes() for name in sorted(ASSETS))).hexdigest()[:16]
-        gov_headers = {"Cache-Control": "no-store", "X-AI-Ops-UI-Revision": gov_revision}
-
-        @app.get("/governance", include_in_schema=False)
-        def governance_index():
-            html = (gov / "index.html").read_text(encoding="utf-8").replace("__AI_OPS_UI_REVISION__", gov_revision)
-            return HTMLResponse(html, headers=gov_headers)
-
-        @app.get("/governance/assets/{requested_revision}/{filename}", include_in_schema=False)
-        def governance_asset(requested_revision: str, filename: str):
-            if requested_revision != gov_revision or filename not in ("app.css", "app.js"):
-                raise HTTPException(404, "UI asset version not found; reload the page")
-            return FileResponse(gov / filename, media_type=ASSETS[filename],
-                                headers={**gov_headers, "Cache-Control": "public, max-age=31536000, immutable"})
-
     @app.get("/api/v1/roles", dependencies=[Depends(admin)])
     def list_roles(include_retired: bool = False):
         with app.state.read_transaction() as db:

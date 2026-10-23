@@ -184,7 +184,7 @@
   };
 
   /* ---------- navigation ---------- */
-  const VIEWS = [["chat", "聊天"], ["assets", "资产"], ["skills", "Skills"], ["documents", "文档"], ["logs", "日志"], ["custom", "定制任务"]];
+  const VIEWS = [["chat", "聊天"], ["assets", "资产"], ["skills", "Skills"], ["documents", "文档"], ["logs", "日志"], ["custom", "定制任务"], ["aiperm", "AI 权限"], ["credentials", "凭证库"]];
   let refreshTimer = null;
   let chatRenderVersion = 0;
   const stepExpansion = new Map();
@@ -783,8 +783,395 @@
     body.appendChild(head);
     const holder = el("div", "workspace-content");
     body.appendChild(holder);
-    const loaders = { assets: loadAssets, custom: loadCustom, skills: loadSkills, memory: loadMemory, documents: loadDocuments, logs: loadLogs };
+    const loaders = { assets: loadAssets, custom: loadCustom, skills: loadSkills, memory: loadMemory, documents: loadDocuments, logs: loadLogs, aiperm: loadPermissions, credentials: loadCredentialVault };
     (loaders[state.tab] || loadAssets)(holder).catch((err) => holder.appendChild(el("div", "card error", "加载失败：" + err.message)));
+  }
+
+  /* ================= AI 权限（黑白名单 + 模式） =================
+     名单是不可变快照：编辑在本地草稿里进行，点“保存”才 fork 出一个新版本，
+     并把各模式的绑定指向新版本。旧快照原地保留，正在跑的任务仍用它开始时的
+     那一份。所以这里永远不会 PATCH 一个已有名单。 */
+
+  const MODES = [
+    { id: "readonly", title: "只读排查", sub: "readonly", hint: "AI 只能运行只读名单里的工具，不会提出任何变更。", slots: ["readonly_list"] },
+    { id: "confirm", title: "提议 · 人批", sub: "confirm", hint: "AI 可以提出变更；每一个变更都等你点头。", slots: ["readonly_list", "write_list"] },
+    { id: "direct", title: "白名单直行", sub: "direct", hint: "写名单内的动作自动执行；名单之外的仍进审批。", slots: ["readonly_list", "write_list"] },
+  ];
+  const SLOT_LABEL = { readonly_list: "只读名单", write_list: "写名单", deny_list: "禁止名单" };
+  const KIND_LABEL = { readonly: "只读名单", write: "写名单", deny: "禁止名单" };
+
+  const permState = {
+    lists: null, bindings: null, editing: null, draft: null,
+    trouble: null, dirty: false, openRule: null,
+  };
+
+  /* 一条新规则的默认形状。用户要“自己命名 + 写具体规则”，所以两个字段都留空
+     由用户填，而不是塞一个看起来像示例的真规则进去。 */
+  function blankRule(kind) {
+    return { rule_id: "", action: "", hosts: [], note: "", enabled: true };
+  }
+
+  function ruleFromApi(r) {
+    return {
+      rule_id: r.rule_id, action: r.action,
+      hosts: Array.isArray(r.hosts) ? r.hosts.slice() : [],
+      note: r.note || "", enabled: true,
+    };
+  }
+
+  function listById(id) {
+    return (permState.lists || []).find((l) => l.id === id) || null;
+  }
+
+  /* 快照是一棵树（fork 出来的版本挂在父节点下）。同一 kind 的最新版本才是
+     “当前可用”的那一个；更老的只能读，不能再绑到模式上。 */
+  function versionsOfKind(kind) {
+    return (permState.lists || []).filter((l) => l.kind === kind)
+      .sort((a, b) => b.version - a.version || b.created_at - a.created_at);
+  }
+
+  function currentListFor(kind) {
+    const b = permState.bindings || {};
+    for (const mode of Object.values(b)) {
+      const id = mode && mode[kind === "readonly" ? "readonly_list" : kind === "write" ? "write_list" : "deny_list"];
+      const hit = id && listById(id);
+      if (hit) return hit;
+    }
+    return versionsOfKind(kind)[0] || null;
+  }
+
+  async function loadPermissions(host) {
+    const [lists, bindings] = await Promise.all([
+      api("GET", "/api/v1/name-lists"),
+      api("GET", "/api/v1/name-list-bindings"),
+    ]);
+    permState.lists = lists || [];
+    permState.bindings = bindings || {};
+    renderPermissions(host);
+  }
+
+  function renderPermissions(host) {
+    host.textContent = "";
+    const modes = card("模式：决定 AI 能走多远");
+    pageHelp(modes, "模式与名单的关系", [
+      "模式决定 AI 能不能提出变更：只读排查只运行只读工具；提议·人批允许提变更但每个都要你点头；白名单直行对写名单内的动作直接执行。",
+      "名单是不可变快照。改动任何一条规则后保存，都会生成一个新版本，并把对应模式指向新版本；旧版本保留在历史里，正在执行的任务继续用它开始时的那个版本。",
+      "只读模式用不到写名单，所以它的卡片里不显示写名单选择——显示一个永远用不上的下拉框只会让人以为它有用。",
+    ]);
+    const grid = el("div", "mode-grid");
+    MODES.forEach((mode) => grid.appendChild(modeCard(mode)));
+    modes.appendChild(grid);
+    host.appendChild(modes);
+
+    const lists = card("名单");
+    pageHelp(lists, "名单怎么编辑", [
+      "左侧只读与写名单，右侧禁止名单。每一行是一条规则：左边的名字是你给这条规则起的名字，右边是它对应的动作。",
+      "开关关掉再保存，等于在新快照里去掉这条规则；旧快照里的它还在，所以审计能查到“什么时候被关掉的”。",
+      "点每行末尾的 ⋯ 可以看完整写法（动作、生效主机、说明）。新规则用“添加规则”自己命名并填写。",
+      "保存前先点“校验”，它会指出空的规则名、重复的规则名、以及动作名里不允许的字符。校验不通过时保存按钮不会放行。",
+    ]);
+    const bar = el("div", "row wrap");
+    const save = el("button", "small", "保存为新快照");
+    save.onclick = () => saveDrafts(save);
+    const check = el("button", "ghost small", "校验");
+    check.onclick = () => { permState.trouble = validateDraft(); renderPermissions(host); };
+    bar.appendChild(check); bar.appendChild(save);
+    if (permState.dirty) bar.appendChild(el("span", "muted small", "有未保存的改动"));
+    lists.appendChild(bar);
+    if (permState.trouble) lists.appendChild(troublePanel(permState.trouble));
+
+    /* Two rows rather than three columns: rule ids like wr-k8s.rollout_restart
+       need the width, and a deny list with no rules would otherwise leave a
+       stubby column next to two tall ones. */
+    const pair = el("div", "list-pair");
+    const top = el("div", "list-row");
+    top.appendChild(listPanel(host, "readonly", "只读名单"));
+    top.appendChild(listPanel(host, "write", "写名单"));
+    pair.appendChild(top);
+    const bottom = el("div", "list-row");
+    bottom.appendChild(listPanel(host, "deny", "禁止名单"));
+    pair.appendChild(bottom);
+    lists.appendChild(pair);
+    host.appendChild(lists);
+  }
+
+  function modeCard(mode) {
+    const box = el("div", "card mode-card" + (mode.id === "readonly" ? " quiet" : ""));
+    const head = el("div", "mode-head");
+    head.appendChild(el("h3", "", mode.title));
+    head.appendChild(el("span", "mono muted small", mode.sub));
+    box.appendChild(head);
+    box.appendChild(el("p", "muted small", mode.hint));
+    mode.slots.forEach((slot) => {
+      const kind = slot === "readonly_list" ? "readonly" : slot === "write_list" ? "write" : "deny";
+      const row = el("div", "form-row");
+      row.appendChild(el("label", "form-label", SLOT_LABEL[slot]));
+      const sel = el("select");
+      const current = (permState.bindings[mode.id] || {})[slot];
+      const options = versionsOfKind(kind);
+      const none = el("option", "", "（不绑定）"); none.value = "";
+      sel.appendChild(none);
+      options.forEach((l) => {
+        const o = el("option", "", l.name + "  v" + l.version);
+        o.value = l.id; if (l.id === current) o.selected = true;
+        sel.appendChild(o);
+      });
+      sel.onchange = () => bindSlot(mode.id, slot, sel.value);
+      row.appendChild(sel);
+      box.appendChild(row);
+    });
+    box.appendChild(el("p", "muted small", "进行中的任务冻结着各自开始时的名单。"));
+    return box;
+  }
+
+  async function bindSlot(mode, slot, listId) {
+    const body = Object.assign({}, permState.bindings[mode] || {});
+    body[slot] = listId || null;
+    try {
+      permState.bindings[mode] = await api("PUT", "/api/v1/name-list-bindings/" + encodeURIComponent(mode), body);
+      say("模式 " + mode + " 的 " + SLOT_LABEL[slot] + " 已更新");
+    } catch (err) {
+      say("绑定失败：" + err.message, "error");
+    }
+    renderConsole();
+  }
+
+  function listPanel(host, kind, title) {
+    const box = el("div", "card list-panel");
+    const head = el("div", "row wrap");
+    head.appendChild(el("h3", "", title));
+    const versions = versionsOfKind(kind);
+    const sel = el("select");
+    versions.forEach((l) => {
+      const o = el("option", "", l.name + "  v" + l.version + (isBound(kind, l.id) ? "  · 在用" : ""));
+      o.value = l.id;
+      if (permState.editing && permState.editing[kind] === l.id) o.selected = true;
+      sel.appendChild(o);
+    });
+    if (!versions.length) {
+      const o = el("option", "", "（还没有名单）"); o.value = ""; sel.appendChild(o);
+    }
+    sel.onchange = () => {
+      permState.editing = Object.assign({}, permState.editing, { [kind]: sel.value });
+      permState.draft = Object.assign({}, permState.draft);
+      permState.draft[kind] = versions.find((l) => l.id === sel.value) ? ruleFromListDraft(versions.find((l) => l.id === sel.value)) : null;
+      permState.dirty = false; permState.trouble = null;
+      renderPermissions(host);
+    };
+    sel.title = "切换查看这份名单的其他快照版本";
+    head.appendChild(sel);
+    box.appendChild(head);
+
+    if (!permState.draft) permState.draft = {};
+    if (!permState.draft[kind]) {
+      const target = versions.find((l) => l.id === (permState.editing || {})[kind]) || versions[0];
+      permState.draft[kind] = target ? ruleFromListDraft(target) : { name: "", rules: [] };
+      permState.editing = Object.assign({}, permState.editing, { [kind]: target ? target.id : "" });
+    }
+    const draft = permState.draft[kind];
+
+    const nameRow = el("div", "form-row");
+    nameRow.appendChild(el("label", "form-label", "名单名"));
+    const nameInput = el("input"); nameInput.value = draft.name;
+    nameInput.placeholder = draft.baseId ? "" : (title + "（新名单，请起个名字）");
+    nameInput.oninput = () => { draft.name = nameInput.value; permState.dirty = true; };
+    nameRow.appendChild(nameInput);
+    box.appendChild(nameRow);
+
+    const list = el("div", "rule-list");
+    if (!draft.rules.length) {
+      list.appendChild(el("p", "muted small", draft.baseId ? "这份名单还没有规则，用下面的按钮添加。" : "还没有这类名单。填写名字、添加规则后保存，就会创建第一份快照。"));
+    }
+    draft.rules.forEach((rule, index) => list.appendChild(ruleRow(host, kind, rule, index)));
+    box.appendChild(list);
+
+    const add = el("button", "ghost small", "＋ 添加规则");
+    add.onclick = () => { draft.rules.push(blankRule(kind)); permState.dirty = true; renderPermissions(host); };
+    box.appendChild(add);
+    return box;
+  }
+
+  function isBound(kind, listId) {
+    const key = kind === "readonly" ? "readonly_list" : kind === "write" ? "write_list" : "deny_list";
+    return Object.values(permState.bindings || {}).some((m) => m && m[key] === listId);
+  }
+
+  function ruleFromListDraft(list) {
+    return { name: list.name, rules: (list.rules || []).map(ruleFromApi), baseVersion: list.version, baseId: list.id };
+  }
+
+  function ruleRow(host, kind, rule, index) {
+    const row = el("div", "rule-row");
+    const toggle = el("input"); toggle.type = "checkbox"; toggle.checked = rule.enabled;
+    toggle.setAttribute("aria-label", "启用这条规则");
+    toggle.onchange = () => { rule.enabled = toggle.checked; permState.dirty = true; row.classList.toggle("off", !rule.enabled); };
+    row.appendChild(toggle);
+    const name = el("input"); name.value = rule.rule_id; name.placeholder = "规则名（你自己起）";
+    name.title = rule.rule_id || "";
+    name.oninput = () => { rule.rule_id = name.value; name.title = name.value; permState.dirty = true; };
+    row.appendChild(name);
+    const act = el("span", "rule-action", rule.action || "（未填动作）");
+    act.title = rule.action || "";
+    row.appendChild(act);
+    const more = el("button", "ghost small", "⋯");
+    more.type = "button";
+    more.setAttribute("aria-label", "查看和编辑这条规则的写法");
+    more.onclick = () => editRule(host, kind, rule, index);
+    row.appendChild(more);
+    if (!rule.enabled) row.classList.add("off");
+    return row;
+  }
+
+  function editRule(host, kind, rule, index) {
+    const box = el("div", "rule-editor");
+    const action = el("input"); action.value = rule.action; action.placeholder = "例如 service.restart";
+    const hosts = el("input"); hosts.value = (rule.hosts || []).join(", "); hosts.placeholder = "留空=全部主机，或用逗号分隔主机 ID";
+    const note = el("textarea"); note.rows = 3; note.value = rule.note; note.placeholder = "这条规则是干什么的，写给未来的自己看";
+    [["动作", action], ["生效主机", hosts], ["说明", note]].forEach(([label, input]) => {
+      const kv = el("div", "kv"); kv.appendChild(el("div", "k", label)); kv.appendChild(el("div", "v")).appendChild(input);
+      box.appendChild(kv);
+    });
+    const ok = el("button", "small", "确认");
+    ok.onclick = () => {
+      rule.action = action.value.trim();
+      rule.hosts = hosts.value.split(",").map((s) => s.trim()).filter(Boolean);
+      rule.note = note.value;
+      permState.dirty = true;
+      renderPermissions(host);
+    };
+    const del = el("button", "ghost small danger", "删除这条规则");
+    del.onclick = () => {
+      permState.draft[kind].rules.splice(index, 1);
+      permState.dirty = true;
+      renderPermissions(host);
+    };
+    const bar = el("div", "row"); bar.appendChild(ok); bar.appendChild(del);
+    box.appendChild(bar);
+    rule._editor = box;
+    modal("规则写法", box);
+  }
+
+  /* 校验只管“写得对不对”，不管“该不该有”。重名必须拦住：后端按 rule_id 做主键，
+     静默去重会让用户以为加了却没加上。 */
+  function validateDraft() {
+    const out = [];
+    ["readonly", "write", "deny"].forEach((kind) => {
+      const draft = (permState.draft || {})[kind];
+      if (!draft) return;
+      const label = KIND_LABEL[kind];
+      if (!draft.name || !draft.name.trim()) out.push(label + "：名单名不能为空。");
+      const seen = new Map();
+      draft.rules.forEach((rule, i) => {
+        const where = label + " 第 " + (i + 1) + " 行";
+        const id = (rule.rule_id || "").trim();
+        if (!id) { out.push(where + "：规则名不能为空。"); return; }
+        if (!/^[A-Za-z0-9_.:-]+$/.test(id)) out.push(where + "（" + id + "）：规则名只能用字母、数字、下划线、点、冒号、短横线。");
+        if (seen.has(id)) out.push(where + "（" + id + "）：规则名和第 " + seen.get(id) + " 行重复。");
+        else seen.set(id, i + 1);
+        if (!(rule.action || "").trim()) out.push(where + "（" + id + "）：动作不能为空。");
+        if (!rule.enabled) return;
+      });
+      const enabled = draft.rules.filter((r) => r.enabled).length;
+      if (!enabled) out.push(label + "：全部规则都被关掉了，保存出来会是一份空名单。");
+    });
+    return out;
+  }
+
+  function troublePanel(items) {
+    const box = el("div", "card warn");
+    box.appendChild(el("h4", "", items.length ? "校验未通过（" + items.length + "）" : "校验通过"));
+    if (!items.length) { box.appendChild(el("p", "small", "可以保存为新快照了。")); return box; }
+    const ul = el("ul", "small");
+    items.forEach((t) => ul.appendChild(el("li", "", t)));
+    box.appendChild(ul);
+    return box;
+  }
+
+  async function saveDrafts(button) {
+    const trouble = validateDraft();
+    permState.trouble = trouble;
+    if (trouble.length) { renderConsole(); return; }
+    button.disabled = true; button.textContent = "保存中…";
+    const created = [];
+    try {
+      for (const kind of ["readonly", "write", "deny"]) {
+        const draft = permState.draft[kind];
+        if (!draft) continue;
+        const body = {
+          kind,
+          name: draft.name.trim(),
+          rules: draft.rules.filter((r) => r.enabled).map((r) => ({
+            rule_id: r.rule_id.trim(), action: r.action.trim(), hosts: r.hosts || [], note: r.note || "",
+          })),
+        };
+        if (!body.rules.length) continue;
+        const list = await api("POST", "/api/v1/name-lists", body);
+        created.push(list);
+      }
+      /* 新快照建好后把各模式指向它。只改用到这个 kind 的槽位，不动别的绑定。 */
+      for (const list of created) {
+        const slot = list.kind === "readonly" ? "readonly_list" : list.kind === "write" ? "write_list" : "deny_list";
+        for (const mode of MODES) {
+          if (!mode.slots.includes(slot)) continue;
+          const current = Object.assign({}, permState.bindings[mode.id] || {});
+          if (!current[slot]) continue;
+          current[slot] = list.id;
+          permState.bindings[mode.id] = await api("PUT", "/api/v1/name-list-bindings/" + encodeURIComponent(mode.id), current);
+        }
+      }
+      permState.dirty = false; permState.draft = null; permState.editing = null; permState.trouble = null;
+      readCache.clear();
+      say(created.length ? "已保存为 " + created.length + " 份新快照，模式已指向新版本" : "没有需要保存的改动");
+      renderConsole();
+    } catch (err) {
+      say("保存失败：" + err.message, "error");
+      button.disabled = false; button.textContent = "保存为新快照";
+    }
+  }
+
+  /* ================= 凭证库 =================
+     只显示“句柄”，不显示值：值留在被管理的主机上，主服务只知道它存在。
+     所以这一页永远不会出现能直接复制的明文口令，也没有“显示”按钮。 */
+
+  async function loadCredentialVault(host) {
+    const [assets, handles] = await Promise.all([
+      api("GET", "/api/v1/assets?include_retired=true&include_disabled_local=true"),
+      api("GET", "/api/v1/credentials"),
+    ]);
+    const box = card("凭证库");
+    pageHelp(box, "凭证库是什么", [
+      "这里列出的是 AI 在被管理主机上“发现”的凭证，以及你在资产设置里登记过的连接凭证。主服务只保存一个句柄（它叫什么、在哪台主机、哪种类型），不保存值。",
+      "值留在那台主机上，要用的时候由那台主机上的执行体去取。所以这里没有“显示明文”按钮——不是藏起来了，是主服务里本来就没有。",
+      "本机（主服务所在的那台）走进程内直读，不需要 SSH 凭证，所以它下面通常没有连接凭证。没有凭证不等于不能管，只是走的是另一条路。",
+      "被 dismiss 的凭证默认不显示；勾上“显示已忽略”能看到它们和忽略原因。忽略不是删除，审计里留着记录。",
+    ]);
+    const counts = (handles && handles.counts_by_asset) || {};
+    const rows = [];
+    (assets || []).forEach((asset) => {
+      const own = (handles && handles.items ? handles.items : []).filter((h) => h.asset_id === asset.id);
+      if (!own.length) {
+        rows.push([asset.name || asset.id, asset.id, asset.connection_type || "-", "—", "没有发现凭证", ""]);
+      } else {
+        own.forEach((h) => {
+          rows.push([
+            asset.name || asset.id, asset.id, asset.connection_type || "-",
+            h.kind || "-",
+            (h.label || h.credential_id || "-") + (h.dismissed ? "（已忽略）" : ""),
+            h.source || "-",
+          ]);
+        });
+      }
+    });
+    const found = rows.filter((r) => r[4] !== "没有发现凭证").length;
+    box.appendChild(el("p", "muted small", "共 " + found + " 条凭证句柄。值不在主服务里：这里只有\"哪台主机上有什么\"，口令本身留在那台主机上。" + counts_summary(counts)));
+    box.appendChild(table(["主机", "主机 ID", "连接方式", "类型", "凭证", "来源"], rows));
+    host.appendChild(box);
+  }
+
+  function counts_summary(counts) {
+    const keys = Object.keys(counts || {});
+    if (!keys.length) return "当前没有记录到任何凭证。";
+    return "分布：" + keys.map((k) => k + " ×" + counts[k]).join("，");
   }
 
   function resourceIdentity(id) {

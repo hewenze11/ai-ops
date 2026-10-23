@@ -91,4 +91,7 @@
   Agent 侧额外收紧：reveal **只允许 `read_file`**（目录列表/journal 流全量解锁是另一个功能、另一个威胁模型）；**root 一律拒绝**，不提供 `allow_root_readonly` 旁路；输出上限 256KB；不回传 credentials 句柄（看一眼就入库等于副作用）。
   测试：主服务 652（+3），Agent 111（+5）。新增 `test_reveal_bytes_never_land_in_the_task_result` 直接断言明文不在 `tasks.result` 里、且在 `reveal_secret` 里、取回后行被删。
 - 2026-10-23 顺手堵一洞：`turns.py` 的 `clean_params` 原样拷贝模型传入的**任意**键进 payload。`kind` 目前硬编码所以不可利用，但“模型能写的 payload 字段”与“派发器写的字段”同名，一次「合并 payload」重构就能把 kind 变成模型可选。已加 `_RESERVED` 黑名单。
-- 2026-10-23 待办：①`read_sanitized` 中间层（前置条件：先加谓词工具就要先做这个）；②前端最后统一由用户重做。
+- 2026-10-23 阶段 6.11 解锁链路的端到端演练（`scripts/rehearse_reveal.py`）。**当场拓出一个真 bug**：reveal 的 clone 原来直接继承原任务的 `args`。但存量任务 payload 里不一定有 `args`（发字段后来才加的），于是真机上 Agent 会“没东西可执行”而在主机端失败——**离原因很远，而且是在出事时**。改为 clone 自己用 `readonly_tools.build(params)` 重算 argv，推导不出就 409。
+  演练脚本走真实 HTTP（建资产/建角色/记录命中/unlock/派发/领取/上报/取回/审计），然后直接查库核实明文去向：不在 `tasks.result`、在 `reveal_secret`、取回后删除、审计流里没有。退出码即结论。
+  两条测试纳入套件：一条跑正常链，一条**把 bug 重新引回去**（stash 前先脱敏）验证它真会报红。**不会失败的检查等于装饰**。
+- 2026-10-23 待办：①`read_sanitized` 中间层——**明确结论：当前工具集无谓词工具（grep/wc/find 全在禁用表），§45.1 预言机攻击不成立**，此条仅为“将来加谓词工具”的前置条件，现在写就是空壳，不做；②前端最后统一由用户重做。

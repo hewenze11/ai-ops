@@ -45,7 +45,8 @@ def migrate(db):
         if name not in columns:
             db.execute('ALTER TABLE tasks ADD COLUMN ' + name + ' ' + kind)
     presence = {r[1] for r in db.execute('PRAGMA table_info(agent_presence)')}
-    for name, kind in [('busy', 'INTEGER NOT NULL DEFAULT 0'), ('busy_by', 'TEXT'), ('busy_task', 'TEXT')]:
+    for name, kind in [('busy', 'INTEGER NOT NULL DEFAULT 0'), ('busy_by', 'TEXT'), ('busy_task', 'TEXT'),
+                       ('waiting_controllers', 'INTEGER'), ('max_concurrent_tasks', 'INTEGER')]:
         if name not in presence:
             db.execute('ALTER TABLE agent_presence ADD COLUMN ' + name + ' ' + kind)
 
@@ -84,6 +85,13 @@ class Heartbeat(Strict):
     busy: bool = False
     busy_by: str | None = Field(default=None, max_length=64)
     busy_task: str | None = Field(default=None, max_length=128)
+    # §52: how many controllers are ahead of the caller on this host, and how
+    # many tasks the Agent will run at once. `busy` keeps its original meaning
+    # ("this host is occupied"); these two add the part a control plane needs to
+    # decide between "wait" and "tell the operator now". Both are optional so a
+    # pre-§52 Agent still reports successfully.
+    waiting_controllers: int | None = Field(default=None, ge=0, le=1000)
+    max_concurrent_tasks: int | None = Field(default=None, ge=1, le=1000)
 
 
 class Control(Strict):
@@ -144,7 +152,7 @@ def install_execution(app, transaction, audit, admin, agent_auth, policy=None):
             heartbeat_sample(db, asset_id, now)
             from .observability import record_state
             record_state(db, asset_id, body, now)
-            db.execute('INSERT INTO agent_presence(asset_id,instance_id,agent_version,protocol_version,last_seen,busy,busy_by,busy_task) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(asset_id) DO UPDATE SET instance_id=excluded.instance_id,agent_version=excluded.agent_version,protocol_version=excluded.protocol_version,last_seen=excluded.last_seen,busy=excluded.busy,busy_by=excluded.busy_by,busy_task=excluded.busy_task', (asset_id, body.instance_id, body.agent_version, body.protocol_version, now, 1 if body.busy else 0, body.busy_by, body.busy_task))
+            db.execute('INSERT INTO agent_presence(asset_id,instance_id,agent_version,protocol_version,last_seen,busy,busy_by,busy_task,waiting_controllers,max_concurrent_tasks) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(asset_id) DO UPDATE SET instance_id=excluded.instance_id,agent_version=excluded.agent_version,protocol_version=excluded.protocol_version,last_seen=excluded.last_seen,busy=excluded.busy,busy_by=excluded.busy_by,busy_task=excluded.busy_task,waiting_controllers=excluded.waiting_controllers,max_concurrent_tasks=excluded.max_concurrent_tasks', (asset_id, body.instance_id, body.agent_version, body.protocol_version, now, 1 if body.busy else 0, body.busy_by, body.busy_task, body.waiting_controllers, body.max_concurrent_tasks))
             if old is None or old['instance_id'] != body.instance_id or now - old['last_seen'] > 30:
                 audit(db, 'agent.connected', asset_id, 'agent:' + asset_id, body.model_dump())
             # A host that just came back clears the offline debounce, so it can

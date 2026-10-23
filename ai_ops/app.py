@@ -178,6 +178,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         from .management import SCHEMA as MANAGEMENT_SCHEMA
         from .namelists import SCHEMA as NAMELISTS_SCHEMA
         from .credential_handles import SCHEMA as CREDENTIAL_SCHEMA
+        from .sensitive import SCHEMA as SENSITIVE_SCHEMA
         db.execute("PRAGMA journal_mode=WAL")
         from .execution import SCHEMA as EXEC_SCHEMA, migrate as migrate_execution
         from .leases import SCHEMA as LEASE_SCHEMA, migrate as migrate_leases
@@ -187,7 +188,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA + LEASE_SCHEMA + CONNECTOR_SCHEMA + LOCAL_SCHEMA + LIFECYCLE_SCHEMA + MEMORY_SCHEMA + ASSET_MEMORY_SCHEMA + ALARM_SCHEMA + CHANNEL_SCHEMA + ALERT_NOTIFY_SCHEMA + MANAGEMENT_SCHEMA)
         from .observability import SCHEMA as OBSERVABILITY_SCHEMA
         from .role_lifecycle import SCHEMA as ROLE_LIFECYCLE_SCHEMA
-        db.executescript(OBSERVABILITY_SCHEMA + ROLE_LIFECYCLE_SCHEMA + ATTACHMENT_SCHEMA + NAMELISTS_SCHEMA + CREDENTIAL_SCHEMA)
+        db.executescript(OBSERVABILITY_SCHEMA + ROLE_LIFECYCLE_SCHEMA + ATTACHMENT_SCHEMA + NAMELISTS_SCHEMA + CREDENTIAL_SCHEMA + SENSITIVE_SCHEMA)
         migrate(db)
         migrate_execution(db)
         migrate_leases(db)
@@ -353,6 +354,8 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     install_leases(app, transaction, audit, admin)
     from .inbox import install as install_inbox
     install_inbox(app, transaction, audit, admin)
+    from .sensitive import install as install_sensitive
+    install_sensitive(app, transaction, audit, admin)
     from .connector_ssh import install_connector, start_connector_workers
     install_connector(app, transaction, audit, admin)
     from .connector_local import install_local_connector, start_local_connector_workers
@@ -630,6 +633,27 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
                 raise HTTPException(409, 'Cancelled outcome requires an acknowledged cancellation request')
             check_archives(db, task_id, body.output_archives)
             close_lease(db, task_id)
+            # §51.4: a masked read produces a hit the operator can unlock. The
+            # value never lands in this table -- only the rule ids and the
+            # path -- so unlocking has to re-read the host.
+            if body.status in ('succeeded', 'failed'):
+                from . import sensitive
+                task_payload = json.loads(row['payload']) if row['payload'] else {}
+                if task_payload.get('kind') == 'readonly':
+                    from .scrubbing import MASK, secret_kinds
+                    text = (body.stdout or '') + '\n' + (body.stderr or '')
+                    if MASK in text:
+                        rules = secret_kinds(text)
+                        if rules:
+                            source = next((a for a in (task_payload.get('args') or [])
+                                           if a.startswith('/')), '')
+                            hit = sensitive.record(db, turn_id=row['turn_id'], task_id=task_id,
+                                                   asset_id=asset_id, path=source,
+                                                   rule_ids=rules,
+                                                   baseline_version=sensitive._baseline_version())
+                            audit(db, 'sensitive.hit', hit, 'service',
+                                  {'turn_id': row['turn_id'], 'path': source,
+                                   'rule_ids': rules, 'task_id': task_id})
             db.execute("UPDATE tasks SET state=?,result=?,updated_at=? WHERE id=?", (body.status, result, time.time(), task_id))
             parent = db.execute("SELECT * FROM role_turns WHERE id=?", (row['turn_id'],)).fetchone()
             if parent is None:

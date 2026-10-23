@@ -90,11 +90,18 @@ def inbox(db):
     accounts = [_account_view(db, r) for r in db.execute(
         "SELECT a.* FROM account_requests a JOIN role_turns t ON t.id=a.turn_id "
         "WHERE a.state='pending' AND t.state='waiting_user' ORDER BY a.created_at,a.id")]
+    # §51.4: masked reads show up as unlock cards in the same list, because
+    # "the AI is blocked" and "you may want to see this value" are both
+    # "a human decision is pending here".
+    from .sensitive import pending as pending_hits
+    hits = pending_hits(db)
     return {'approvals': approvals, 'questions': questions, 'account_requests': accounts,
-            'total': len(approvals) + len(questions) + len(accounts),
+            'sensitive_hits': hits,
+            'total': len(approvals) + len(questions) + len(accounts) + len(hits),
             'note': 'Answer endpoints: POST /api/v1/tasks/{task_id}/approve|reject, '
                     '/api/v1/turns/{turn_id}/questions/{question_id}/answer, '
-                    '/api/v1/turns/{turn_id}/account-requests/{request_id}/answer'}
+                    '/api/v1/turns/{turn_id}/account-requests/{request_id}/answer, '
+                    '/api/v1/sensitive-hits/{hit_id}/unlock'}
 
 
 def install(app, transaction, audit, admin):

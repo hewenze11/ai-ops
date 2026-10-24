@@ -290,6 +290,11 @@ MODES = ("readonly", "confirm", "direct")
 # decides. The model is never told which mode it is in (docs §43.2).
 PROPOSE_CHANGE = 'propose_change'
 
+# Both wait tools are dispatched through the change-set path: the job is a write
+# and must be authorised exactly like one (§52.5).
+START_TASK = 'start_task'
+CHECK_TASK = 'check_task'
+
 PROPOSE_CHANGE_SPEC = {'type': 'function', 'function': {'name': 'propose_change',
     'description': 'Propose one or more changes to run on a host. The service validates every action, '
                    'decides whether it runs immediately or needs human approval, and reports the outcome. '
@@ -448,6 +453,10 @@ def tool_spec(users, search_provider=None, mode="confirm", egress=None):
         # Writes only ever go through propose_change; there is no tool that takes
         # a raw command string any more (docs §39.1).
         specs.append(PROPOSE_CHANGE_SPEC)
+        # Same authority as propose_change, different relationship to time: the
+        # model does not have to wait for a fifteen-minute job (§52.5).
+        from .waiting import tool_specs as wait_tool_specs
+        specs.extend(wait_tool_specs())
     if search_provider is not None:
         from .search import search_tool_spec, fetch_tool_spec
         specs.append(search_tool_spec())
@@ -477,6 +486,10 @@ class RoleEngine:
         self.search_provider = search_provider
         # None means "free fetch is off"; see search.EgressPolicy (§41).
         self.egress = egress
+
+    def _task_lookup(self, db):
+        return lambda task_id: db.execute('SELECT * FROM tasks WHERE id=?',
+                                          (task_id,)).fetchone()
 
     def request_body(self, db, turn, settings):
         tools = tools_for_turn(turn, settings, self.search_provider, self.egress)
@@ -508,13 +521,79 @@ class RoleEngine:
                    {'parent_task': parent['id'], 'summary': answer.get('summary')})
         return True
 
+    def _start_task(self, db, turn, call, arguments, steps, asset_id, run_as,
+                    users_now, digest, needs_human, messages):
+        """Queue the job and park the turn on a handle instead of on the task.
+
+        The task row is built here rather than shared with propose_change on
+        purpose: the two differ in exactly the parts that matter (where the turn
+        waits), and a shared builder would hide that difference behind a flag.
+        """
+        from . import waiting
+        task_id = str(uuid.uuid4())
+        auth = account_grants.authority(db, turn['id'])
+        payload = {'kind': 'change', 'asset_id': asset_id, 'run_as': run_as,
+                   'execution_users': users_now, 'role_id': turn['role_id'],
+                   'mode': turn['mode'], 'steps': steps,
+                   'approval': {'payload_sha256': digest},
+                   'reason': str((arguments or {}).get('reason') or '')[:1000],
+                   'timeout_seconds': max(s['timeout_seconds'] for s in steps),
+                   'idempotency_key': 'start:' + call['id'],
+                   'authorization_revision': auth['authorization_revision'],
+                   'execution_grants': auth['execution_grants']}
+        db.execute('INSERT INTO tasks(id,role_id,asset_id,payload,state,idempotency_key,created_at,updated_at,turn_id) VALUES(?,?,?,?,?,?,?,?,?)',
+                   (task_id, turn['role_id'], asset_id, json.dumps(payload, ensure_ascii=False),
+                    'awaiting_approval' if needs_human else 'queued',
+                    payload['idempotency_key'], time.time(), time.time(), turn['id']))
+        seconds = (arguments or {}).get('wait_seconds')
+        seconds = min(max(int(seconds), 1), waiting.MAX_TIMEOUT_SECONDS) \
+            if isinstance(seconds, int) else waiting.DEFAULT_TIMEOUT_SECONDS
+        handle_id = waiting.issue(db, turn=turn, task={'id': task_id},
+                                  asset_id=asset_id, seconds=seconds)
+        body = waiting.describe(db, handle_id, self._task_lookup(db))
+        body['started'] = True
+        body['note'] = ('Job queued%s. It keeps running even if you stop waiting. '
+                        'Use check_task with this handle.'
+                        % (' and waiting for approval' if needs_human else ''))
+        messages.append({'role': 'tool', 'tool_call_id': call['id'],
+                         'content': json.dumps(body, ensure_ascii=False)})
+        # Park on the handle, but *in the model's hands*: the next step is a
+        # model call that sees the handle as tool output. Without that step the
+        # model could never call check_task -- it would have to guess a handle
+        # it was never shown -- and "keep working while the job runs" would be
+        # a promise in a tool description with nothing behind it.
+        #
+        # This is what separates start_task from propose_change: both wait on a
+        # task id, but this one waits *and* lets the model speak first.
+        db.execute("UPDATE role_turns SET messages=?,state='waiting_task',pending_task_id=? WHERE id=?",
+                   (json.dumps(messages, ensure_ascii=False), task_id, turn['id']))
+        db.execute("UPDATE trigger_events SET state='waiting_task' WHERE turn_id=?", (turn['id'],))
+        db.execute("UPDATE trigger_events SET state='ready' WHERE turn_id=?", (turn['id'],))
+        self.audit(db, 'wait.opened', handle_id, 'model-tool',
+                   {'turn_id': turn['id'], 'task_id': task_id, 'handle': handle_id,
+                    'wait_seconds': seconds, 'gating': 'approval' if needs_human else 'auto',
+                    'payload_sha256': digest,
+                    'steps': [[s['action'], s['program'], s['args']] for s in steps]})
+
+    def _check_task(self, db, turn, call, arguments, messages):
+        """Immediate status. Never blocks: a sleep loop is blocking renamed."""
+        from . import waiting
+        body = waiting.status(db, str((arguments or {}).get('handle') or ''),
+                             turn['id'], self._task_lookup(db))
+        messages.append({'role': 'tool', 'tool_call_id': call['id'],
+                         'content': json.dumps(body, ensure_ascii=False)})
+        db.execute("UPDATE role_turns SET messages=?,state='ready' WHERE id=?",
+                   (json.dumps(messages, ensure_ascii=False), turn['id']))
+        self.audit(db, 'wait.checked', turn['id'], 'model-tool',
+                   {'handle': arguments.get('handle') if isinstance(arguments, dict) else None})
+
     def advance(self, client):
         call_id = None
         # Reserve one head-of-role turn in a transaction. Different worker threads
         # can call models for different roles, never concurrently for one role.
         with self.transaction() as db:
             rows = db.execute("""SELECT t.*,m.config AS model_config FROM role_turns t JOIN role_models m ON m.role_id=t.role_id
-                WHERE t.source!='command' AND t.state IN ('queued','ready','waiting_tool')
+                WHERE t.source!='command' AND t.state IN ('queued','ready','waiting_tool','waiting_task')
                 AND NOT EXISTS(SELECT 1 FROM role_turns p WHERE p.role_id=t.role_id AND p.seq<t.seq AND p.state NOT IN ('completed','failed','cancelled'))
                 ORDER BY t.seq""").fetchall()
             chosen = None
@@ -522,6 +601,37 @@ class RoleEngine:
                 settings = json.loads(row["model_config"])
                 if not settings["enabled"]:
                     continue
+                if row["state"] == "waiting_task":
+                    # A parked turn on a wait handle. Every way a handle can
+                    # end (job finished, deadline, the user stopped waiting)
+                    # is resolved in one place, so this branch only has to
+                    # notice that the turn became runnable again, and that
+                    # conclusion has to be read from a *fresh* row.
+                    from . import waiting
+                    task_lookup = self._task_lookup(db)
+                    # Two different reasons a parked turn may run, in order of
+                    # authority. First the handle: a finished job (or a deadline)
+                    # is news the model must see, and it outranks a status ping --
+                    # answering "still running" over a settled job would make the
+                    # model wait again. Only if nothing came back is the turn's
+                    # own last question (check_task) answered.
+                    waiting.resolve_ready(db, task_lookup, self.audit)
+                    row = db.execute("SELECT * FROM role_turns WHERE id=?", (row['id'],)).fetchone()
+                    if row['state'] == waiting.STATE:
+                        # Nothing came back from the handle. The model gets to
+                        # speak next: either it has a question waiting to be
+                        # answered, or it has not yet seen the handle it asked
+                        # for. Either way the turn runs now; the transcript
+                        # decides what the next step actually is.
+                        waiting.release_for_check(db, row['id'], task_lookup)
+                    # Reads below need to see what just happened. Committing
+                    # mid-transaction does not refresh this connection's
+                    # snapshot of rows read earlier: that row is still the
+                    # pre-resolve copy. Re-read it instead.
+                    row = db.execute("SELECT * FROM role_turns WHERE id=?", (row['id'],)).fetchone()
+                    if row['state'] != 'ready':
+                        continue
+                    row = db.execute("SELECT * FROM role_turns WHERE id=?", (row['id'],)).fetchone()
                 if row["state"] == "waiting_tool":
                     task = db.execute("SELECT * FROM tasks WHERE id=?", (row["pending_task_id"],)).fetchone()
                     if task is None:
@@ -604,7 +714,7 @@ class RoleEngine:
                 if len(calls) != 1:
                     raise ValueError("Unsupported tool")
                 name = calls[0]["function"]["name"]
-                if name not in ("web_search", "fetch_page", "ask_user", "read_asset_memory", "request_execution_account", PROPOSE_CHANGE, *READONLY_TOOLS):
+                if name not in ("web_search", "fetch_page", "ask_user", "read_asset_memory", "request_execution_account", PROPOSE_CHANGE, START_TASK, CHECK_TASK, *READONLY_TOOLS):
                     raise ValueError("Unsupported tool")
                 arguments = json.loads(calls[0]["function"]["arguments"])
             except Exception:
@@ -690,6 +800,9 @@ class RoleEngine:
                            {'turn_id': turn['id'], 'kind': 'fanout', 'group_id': group_id,
                             'tool': tool, 'assets': len(chosen), 'rejected': len(rejected)})
                 return True
+            if name == CHECK_TASK:
+                self._check_task(db, current, calls[0], arguments, messages)
+                return True
             if name in READONLY_TOOLS:
                 # Gate 1/2 (readonly channel): a tool choice becomes a
                 # structured program+argv task. No shell, no free-form command.
@@ -741,7 +854,7 @@ class RoleEngine:
                 db.execute("UPDATE role_turns SET state='waiting_tool',pending_task_id=? WHERE id=?", (task_id, turn['id']))
                 self.audit(db, 'task.submitted', task_id, 'model-tool', {'turn_id': turn['id'], 'kind': 'readonly', 'program': program, 'args': argv})
                 return True
-            if name == PROPOSE_CHANGE:
+            if name == PROPOSE_CHANGE or name == START_TASK:
                 # Gate 3/4: the model proposes, the policy engine decides.
                 # The change set is expanded to concrete argv here and never
                 # reaches a shell unless the action itself is `shell.run`
@@ -751,7 +864,7 @@ class RoleEngine:
                         raise ValueError('change set outside a write mode')
                     # The model may not smuggle authority in extra keys; only
                     # these four are meaningful, anything else is a rejection.
-                    if not isinstance(arguments, dict) or set(arguments) - {'asset_id', 'run_as', 'reason', 'actions'}:
+                    if not isinstance(arguments, dict) or set(arguments) - ({'asset_id', 'run_as', 'reason', 'actions', 'wait_seconds'} if name == START_TASK else {'asset_id', 'run_as', 'reason', 'actions'}):
                         raise ValueError('unexpected arguments')
                     asset_id = str((arguments or {}).get('asset_id') or '')
                     run_as = str((arguments or {}).get('run_as') or '')
@@ -811,6 +924,13 @@ class RoleEngine:
                                {'reasons': codes, 'asset_id': asset_id, 'actions': [s['action'] for s in steps]})
                     return True
                 needs_human = any(verdict == 'approve' for _, verdict, _ in verdicts)
+                if name == START_TASK:
+                    # Same authorisation as propose_change, different relationship
+                    # to time: the turn parks on a handle it can leave at will.
+                    self._start_task(db, current, calls[0], arguments, steps,
+                                     asset_id, run_as, users_now, digest,
+                                     needs_human, messages)
+                    return True
                 task_id = str(uuid.uuid4())
                 auth = account_grants.authority(db, turn['id'])
                 payload = {'kind': 'change', 'asset_id': asset_id, 'run_as': run_as,
@@ -918,6 +1038,13 @@ def install_turns(app, transaction, audit, admin, default_model="", search_provi
         from .attachments import for_turn
         data['attachments'] = for_turn(db, row['id'])
         data.update(account_grants.authority(db, row['id']))
+        data.setdefault('wait', None)
+        handle = db.execute("SELECT * FROM wait_handles WHERE turn_id=? ORDER BY created_at DESC LIMIT 1",
+                            (row['id'],)).fetchone()
+        if handle is not None:
+            data['wait'] = {'handle': handle['id'], 'task_id': handle['task_id'],
+                            'state': handle['state'], 'reason': handle['reason'],
+                            'deadline': handle['deadline']}
         data['account_requests'] = account_grants.requests(db, row['id'])
         data['authorization_events'] = [dict(r) for r in db.execute('SELECT * FROM authority_events WHERE turn_id=? ORDER BY seq', (row['id'],))]
         return data
@@ -1012,7 +1139,7 @@ def install_turns(app, transaction, audit, admin, default_model="", search_provi
             row = db.execute("SELECT * FROM role_turns WHERE id=?", (turn_id,)).fetchone()
             if row is None:
                 raise HTTPException(404, "Turn not found")
-            if row["state"] not in ("queued", "ready", "waiting_tool", "waiting_user", "calling", "tool_calling"):
+            if row["state"] not in ("queued", "ready", "waiting_tool", "waiting_task", "waiting_user", "calling", "tool_calling"):
                 raise HTTPException(409, "Cannot cancel unknown/terminal turn; resolve unknown execution explicitly")
             task = db.execute("SELECT * FROM tasks WHERE id=?", (row["pending_task_id"],)).fetchone()
             if task and task['state'] == 'unknown':
@@ -1025,6 +1152,25 @@ def install_turns(app, transaction, audit, admin, default_model="", search_provi
             set_turn_state(db, turn_id, "cancelled")
             audit(db, "turn.cancelled", turn_id, "admin", {})
         return {"state": "cancelled"}
+
+    @app.post("/api/v1/turns/{turn_id}/stop-waiting", dependencies=[Depends(admin)])
+    def stop_waiting(turn_id: str):
+        """Release a turn that is waiting on a long job. The job keeps running.
+
+        Deliberately separate from ``cancel``: a cancelled turn stops thinking,
+        this one just stops waiting (§52.5). Conflating them would tell the user
+        their fifteen-minute build no longer matters.
+        """
+        from . import waiting
+        with transaction() as db:
+            row = db.execute("SELECT * FROM role_turns WHERE id=?", (turn_id,)).fetchone()
+            if row is None:
+                raise HTTPException(404, "Turn not found")
+            if row['state'] != waiting.STATE:
+                raise HTTPException(409, 'This turn is not waiting on a job')
+            if not waiting.abandon(db, turn_id, audit):
+                raise HTTPException(409, 'Nothing was waiting')
+        return {'state': 'ready', 'job_keeps_running': True}
 
     @app.post("/api/v1/documents", dependencies=[Depends(admin)], status_code=201)
     def create_document(body: Document):

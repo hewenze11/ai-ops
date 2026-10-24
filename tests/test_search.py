@@ -122,7 +122,7 @@ def test_web_search_tool_spec_exposed_only_when_provider_configured():
     assert [t['function']['name'] for t in tool_spec([], FakeProvider(), 'confirm', opting_in)][-2:] == ['web_search', 'fetch_page']
     # Decision tool never grants execution authority.
     with_user = [t["function"]["name"] for t in tool_spec(["ops_read"], FakeProvider())]
-    assert with_user == ["ask_user", "read_asset_memory", "request_execution_account", "propose_change", "web_search"]
+    assert with_user == ["ask_user", "read_asset_memory", "request_execution_account", "propose_change", "start_task", "check_task", "web_search"]
 
 
 def test_fetch_is_refused_without_an_egress_policy():

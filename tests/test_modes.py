@@ -74,8 +74,12 @@ def test_tool_spec_omits_execution_tool_in_readonly():
     # readonly tool, so it widens breadth, not capability (§52.4). It must never
     # appear in a write-mode surface, which the next two assertions pin.
     assert names_in_request({"tools": tool_spec(["ops_read"], None, "readonly")}) == ["ask_user", "read_asset_memory"] + READONLY_CHANNEL + ["read_many"]
-    assert names_in_request({"tools": tool_spec(["ops_read"], None, "confirm")}) == ["ask_user", "read_asset_memory", "request_execution_account", "propose_change"]
-    assert names_in_request({"tools": tool_spec(["ops_read"], None, "direct")}) == ["ask_user", "read_asset_memory", "request_execution_account", "propose_change"]
+    # start_task/check_task travel with propose_change: same authorisation, a
+    # different relationship to time (§52.5). A readonly turn never gets them,
+    # which the line above pins.
+    write_surface = ["ask_user", "read_asset_memory", "request_execution_account", "propose_change", "start_task", "check_task"]
+    assert names_in_request({"tools": tool_spec(["ops_read"], None, "confirm")}) == write_surface
+    assert names_in_request({"tools": tool_spec(["ops_read"], None, "direct")}) == write_surface
     for mode in ("confirm", "direct"):
         assert "read_many" not in names_in_request({"tools": tool_spec(["ops_read"], None, mode)}), mode
 
@@ -117,7 +121,7 @@ def test_tools_for_turn_defaults_unknown_mode_to_confirm():
     turn = {"execution_users": json.dumps(["ops_read"]), "mode": "totally-unknown"}
     names = [t["function"]["name"] for t in tools_for_turn(turn, {}, None)]
     # Unknown mode must not silently become direct; it behaves like confirm.
-    assert names == ["ask_user", "read_asset_memory", "request_execution_account", "propose_change"]
+    assert names == ["ask_user", "read_asset_memory", "request_execution_account", "propose_change", "start_task", "check_task"]
 
 
 def test_readonly_model_request_has_no_execution_tool():

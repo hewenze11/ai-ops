@@ -233,6 +233,8 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         # upgraded one end up with the same tables.
         from . import fanout as _fanout
         _fanout.migrate(db)
+        from . import waiting as _waiting
+        _waiting.migrate(db)
         # Do not repeat a provider call whose response was lost during a crash.
         interrupted = db.execute("SELECT id FROM role_turns WHERE state IN ('calling','tool_calling')").fetchall()
         for row in interrupted:
@@ -569,7 +571,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
             # FIFO is now by parent ROLE TURN, not command insertion order.
             # A multi-step model turn may add a child after a later manual turn.
             row = db.execute("""SELECT t.* FROM tasks t JOIN role_turns rt ON rt.id=t.turn_id
-                WHERE t.state='queued' AND t.asset_id=? AND rt.state='waiting_tool'
+                WHERE t.state='queued' AND t.asset_id=? AND rt.state IN ('waiting_tool','waiting_task')
                 AND NOT EXISTS (SELECT 1 FROM role_turns p WHERE p.role_id=rt.role_id AND p.seq<rt.seq
                   AND p.state NOT IN ('completed','failed','cancelled'))
                 AND NOT EXISTS (SELECT 1 FROM tasks prior WHERE prior.turn_id=t.turn_id AND prior.seq<t.seq
@@ -737,7 +739,18 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
                 return {"accepted": True, "duplicate": False}
             if body.status == 'unknown':
                 set_turn_state(db, parent['id'], 'blocked_unknown', 'EXECUTION_UNKNOWN')
-            elif body.status == 'cancelled' or row['cancel_requested_at'] is not None:
+            elif body.status == 'cancelled':
+                # Two situations share the 'cancelled' task state, and conflating
+                # them breaks the wait design:
+                #  * an ordinary cancel -- the turn ends, as before;
+                #  * a job abandoned mid-wait whose cancellation reached the host
+                #    before it finished -- the user only stopped waiting and the
+                #    turn is already thinking again. Cancelling it here would end
+                #    a conversation because a build was interrupted.
+                still = db.execute('SELECT state FROM role_turns WHERE id=?', (parent['id'],)).fetchone()
+                if still is None or still['state'] != 'ready':
+                    set_turn_state(db, parent['id'], 'cancelled')
+            elif row['cancel_requested_at'] is not None:
                 # A completion racing with cancel remains an honest task result,
                 # but no more model tools run in this cancelled parent turn.
                 set_turn_state(db, parent['id'], 'cancelled')

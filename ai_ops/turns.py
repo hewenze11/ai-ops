@@ -714,7 +714,7 @@ class RoleEngine:
                 if len(calls) != 1:
                     raise ValueError("Unsupported tool")
                 name = calls[0]["function"]["name"]
-                if name not in ("web_search", "fetch_page", "ask_user", "read_asset_memory", "request_execution_account", PROPOSE_CHANGE, START_TASK, CHECK_TASK, *READONLY_TOOLS):
+                if name not in ("web_search", "fetch_page", "ask_user", "read_asset_memory", "request_execution_account", PROPOSE_CHANGE, START_TASK, CHECK_TASK, READ_MANY, *READONLY_TOOLS):
                     raise ValueError("Unsupported tool")
                 arguments = json.loads(calls[0]["function"]["arguments"])
             except Exception:
@@ -757,16 +757,28 @@ class RoleEngine:
                 # downstream (scrubbing, audit, cancellation) needs a new case.
                 from . import fanout
                 from .fanout_runner import FanoutRunner
+                # ``FanoutRequest`` deliberately only describes *who* is read
+                # (asset_ids + one account). The tool and its parameters are
+                # read from the raw arguments, because they are validated by the
+                # planner (``build``), not by the request model -- putting them
+                # in the model would make "what may the model ask" and "what may
+                # the executor run" the same object, which is exactly the
+                # confusion the two-step validation exists to prevent.
                 try:
                     if current['mode'] != 'readonly':
                         raise ValueError('fan-out outside readonly mode')
-                    request = fanout.FanoutRequest.model_validate(arguments)
                     tool = str((arguments or {}).get('tool') or '')
                     params = (arguments or {}).get('params') or {}
                     if not isinstance(params, dict):
                         raise ValueError('params must be an object')
+                    request = fanout.FanoutRequest.model_validate(
+                        {'asset_ids': (arguments or {}).get('asset_ids'),
+                         'run_as': (arguments or {}).get('run_as')})
                     users_now = json.loads(current['execution_users'])
-                    if request.run_as not in users_now:
+                    # ``run_as`` names one account; the turn carries asset-scoped
+                    # grants, so asking "is this username in the turn" is not a
+                    # check -- the same name on two hosts is two decisions.
+                    if not request.run_as:
                         raise ValueError('Account not selected for turn')
                     for asset_id in request.asset_ids:
                         if not account_grants.permits(db, current['id'], asset_id, request.run_as):

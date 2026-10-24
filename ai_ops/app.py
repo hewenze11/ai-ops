@@ -570,13 +570,24 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
                             "busy_by": presence['busy_by']}
             # FIFO is now by parent ROLE TURN, not command insertion order.
             # A multi-step model turn may add a child after a later manual turn.
+            #
+            # Within one turn, only readonly work may overlap (§52.8). The
+            # earlier blanket rule ("one unfinished task per turn") also
+            # serialised reads the model issued back to back, which is the
+            # whole point of letting it fan in. It cannot simply be dropped:
+            # a read overlapping a change means the model is reading a host
+            # while something is editing it, and the result is uninterpretable.
+            # Approvals and writes keep the old rule untouched -- a turn still
+            # has exactly one unfinished write intent at a time.
             row = db.execute("""SELECT t.* FROM tasks t JOIN role_turns rt ON rt.id=t.turn_id
                 WHERE t.state='queued' AND t.asset_id=? AND rt.state IN ('waiting_tool','waiting_task')
                 AND NOT EXISTS (SELECT 1 FROM role_turns p WHERE p.role_id=rt.role_id AND p.seq<rt.seq
                   AND p.state NOT IN ('completed','failed','cancelled'))
                 AND NOT EXISTS (SELECT 1 FROM tasks prior WHERE prior.turn_id=t.turn_id AND prior.seq<t.seq
                   AND prior.state IN ('queued','awaiting_approval','claimed','unknown')
-                  AND json_extract(prior.payload,'$.kind') IS NOT 'fanout')
+                  AND json_extract(prior.payload,'$.kind') IS NOT 'fanout'
+                  AND NOT (json_extract(t.payload,'$.kind') = 'readonly'
+                           AND json_extract(prior.payload,'$.kind') = 'readonly'))
                 AND json_extract(t.payload,'$.kind') IS NOT 'fanout'
                 ORDER BY rt.seq,t.seq LIMIT 1""", (asset_id,)).fetchone()
             # A reveal task has no parent turn: it is dispatched by an operator

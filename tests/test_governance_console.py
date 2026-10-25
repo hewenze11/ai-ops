@@ -45,7 +45,7 @@ def client(tmp_path, monkeypatch, bundle):
 
 def test_index_serves_the_bundle_with_a_concrete_revision(client):
     body = client.get("/governance").text
-    revision = client.governance_state["revision"]
+    revision = governance_console.governance_revision()
 
     assert "__AI_OPS_UI_REVISION__" not in body
     assert f"/governance/assets/{revision}/app.js" in body
@@ -57,11 +57,34 @@ def test_the_entry_point_is_never_cached(client):
         response = client.get(path)
         assert response.status_code == 200
         assert response.headers["cache-control"] == "no-store"
-        assert response.headers["x-ai-ops-ui-revision"] == client.governance_state["revision"]
+        # Computed per request, so it equals whatever is on disk right now.
+        assert response.headers["x-ai-ops-ui-revision"] == governance_console.governance_revision()
+
+
+def test_a_rebuilt_bundle_is_served_without_a_restart(client, bundle):
+    """The failure this prevents: a deploy that changes nothing.
+
+    The revision used to be hashed once at install time. Swapping the bundle
+    under a running process then left the worker pinned to the old hash -- the
+    page kept requesting bytes that no longer matched what was on disk, so the
+    change silently did not take effect. It reads as 'my edit was ignored' in
+    development and as 'the rollback did not happen' in production, and both
+    send people looking in the wrong place.
+    """
+    before = client.get("/governance").headers["x-ai-ops-ui-revision"]
+    (bundle / "app.js").write_text("console.log('rebuilt')", encoding="utf-8")
+
+    after = client.get("/governance").headers["x-ai-ops-ui-revision"]
+
+    assert after != before
+    fresh = client.get(f"/governance/assets/{after}/app.js")
+    assert fresh.status_code == 200 and "rebuilt" in fresh.text
+    # And the superseded hash is gone, not silently served.
+    assert client.get(f"/governance/assets/{before}/app.js").status_code == 404
 
 
 def test_assets_under_the_current_revision_are_immutable(client):
-    revision = client.governance_state["revision"]
+    revision = governance_console.governance_revision()
     response = client.get(f"/governance/assets/{revision}/app.js")
 
     assert response.status_code == 200
@@ -84,7 +107,7 @@ def test_a_stale_shell_gets_404_not_last_weeks_bytes(client):
 
 def test_only_the_two_named_assets_are_reachable(client, bundle):
     (bundle / "secrets.txt").write_text("nope", encoding="utf-8")
-    revision = client.governance_state["revision"]
+    revision = governance_console.governance_revision()
 
     assert client.get(f"/governance/assets/{revision}/secrets.txt").status_code == 404
     assert client.get(f"/governance/assets/{revision}/index.html").status_code == 404

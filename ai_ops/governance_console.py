@@ -59,8 +59,7 @@ def _revision(root):
 
 def install_governance(app):
     root = governance_dir()
-    revision = _revision(root)
-    headers = {"Cache-Control": "no-store", "X-AI-Ops-UI-Revision": revision}
+    headers = {"Cache-Control": "no-store"}
 
     def _read(name):
         path = root / name
@@ -73,25 +72,34 @@ def install_governance(app):
     @app.get(MOUNT, include_in_schema=False)
     @app.get(MOUNT + "/", include_in_schema=False)
     def index():
+        # Computed per request, NOT once at startup. Hashing at import time
+        # means a bundle shipped or replaced under a running process is never
+        # served -- the revision stays pinned to whatever was on disk when the
+        # worker started, and every request keeps pointing at bytes that may no
+        # longer match. During development that reads as "my change did not
+        # take effect"; during a deploy it reads as a rollback that did not
+        # happen. The file set is three files, so the cost is a few hundred KB
+        # of reading per page load, which is nothing next to being wrong.
+        revision = _revision(root)
         html = _read("index.html").read_text(encoding="utf-8")
-        # The page must not cache the entry point, otherwise an operator keeps
-        # an old shell talking to a new API -- which surfaces as "the approve
-        # button does nothing" rather than "reload the page".
-        return HTMLResponse(html.replace("__AI_OPS_UI_REVISION__", revision), headers=headers)
+        return HTMLResponse(html.replace("__AI_OPS_UI_REVISION__", revision), headers={
+            **headers, "X-AI-Ops-UI-Revision": revision})
 
     @app.get(MOUNT + "/assets/{requested_revision}/{filename}", include_in_schema=False)
     def versioned_asset(requested_revision: str, filename: str):
         if filename not in ("app.css", "app.js"):
             raise HTTPException(404, "Not found")
+        revision = _revision(root)
         # Immutable for a full year *only* under the hash that produced it. A
         # stale shell asking for last week's bundle gets a 404 telling it to
         # reload, rather than bytes from a different build marked immutable.
         if requested_revision != revision:
             raise HTTPException(404, "UI asset version not found; reload the page")
         return FileResponse(root / filename, media_type=ASSETS[filename],
-                            headers={**headers, "Cache-Control": "public, max-age=31536000, immutable"})
+                            headers={**headers, "X-AI-Ops-UI-Revision": revision,
+                                     "Cache-Control": "public, max-age=31536000, immutable"})
 
-    return {"revision": revision, "root": str(root)}
+    return {"revision": _revision(root), "root": str(root)}
 
 
 def governance_revision():

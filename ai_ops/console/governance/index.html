@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>治理控制台 · AI 运维</title>
+<meta name="aiops-ui-revision" content="__AI_OPS_UI_REVISION__">
+<link rel="stylesheet" href="/governance/assets/__AI_OPS_UI_REVISION__/app.css">
+</head>
+<body>
+
+<!-- Token gate. Not a login page: one field, because the only credential is a
+     token the operator already has. Rendered separately from the app so a 401
+     can drop straight back here without losing what was on screen. -->
+<div id="gate" class="gate">
+  <form id="gate-form" class="gate-card" autocomplete="off">
+    <div class="gate-mark" aria-hidden="true"></div>
+    <h1>治理控制台</h1>
+    <p class="gate-lead">AI 每一步的可把控之处。</p>
+    <label class="field">
+      <span>管理员 Token</span>
+      <input id="token" type="password" required minlength="32" autocomplete="off"
+             spellcheck="false" placeholder="粘贴部署时生成的 Token">
+    </label>
+    <button type="submit" class="btn btn-primary btn-block">进入</button>
+    <p id="gate-error" class="gate-error" role="alert" hidden></p>
+    <p class="gate-note">
+      凭据仅存于本标签页（关闭即失效），不写入本地存储。
+      页面版本 <code>__AI_OPS_UI_REVISION__</code>
+    </p>
+  </form>
+</div>
+
+<div id="shell" class="shell" hidden>
+  <header class="topbar">
+    <div class="topbar-brand">
+      <span class="brand-dot" aria-hidden="true"></span>
+      <span class="brand-name">治理控制台</span>
+    </div>
+
+    <nav id="tabs" class="tabs" role="tablist" aria-label="板块">
+      <button class="tab" role="tab" data-view="inbox" aria-selected="true">
+        收件箱<span id="tab-badge" class="tab-badge" hidden>0</span>
+      </button>
+      <button class="tab" role="tab" data-view="lists" aria-selected="false">名单与模式</button>
+      <button class="tab" role="tab" data-view="creds" aria-selected="false">凭证库</button>
+      <button class="tab" role="tab" data-view="audit" aria-selected="false">审计</button>
+    </nav>
+
+    <div class="topbar-right">
+      <span id="sync" class="sync" role="status" aria-live="polite"></span>
+      <button id="refresh" class="btn btn-quiet btn-icon" title="立即刷新（自动刷新每 5 秒）" aria-label="刷新">⟳</button>
+      <button id="lock" class="btn btn-quiet" title="清除本页凭据">退出</button>
+    </div>
+  </header>
+
+  <main id="main" class="main">
+    <section id="view-inbox" class="view"></section>
+    <section id="view-lists" class="view" hidden></section>
+    <section id="view-creds" class="view" hidden></section>
+    <section id="view-audit" class="view" hidden></section>
+  </main>
+
+  <!-- Detail drawer: a turn transcript, an audit run, a credential history.
+       One surface for all drill-ins so the operator learns it once. -->
+  <div id="drawer" class="drawer" hidden>
+    <div class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
+      <div class="drawer-head">
+        <h2 id="drawer-title">详情</h2>
+        <button id="drawer-close" class="btn btn-quiet btn-icon" aria-label="关闭">✕</button>
+      </div>
+      <div id="drawer-body" class="drawer-body"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</div>
+
+<script src="/governance/assets/__AI_OPS_UI_REVISION__/app.js"></script>
+</body>
+</html>

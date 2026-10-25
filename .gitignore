@@ -21,3 +21,6 @@ connector/
 # local scratch scripts
 scratch_*.py
 
+
+# Local visual-review screenshots.
+.shots/

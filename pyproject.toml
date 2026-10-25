@@ -24,6 +24,11 @@ include = ["ai_ops*"]
 
 [tool.setuptools.package-data]
 "ai_ops.console" = ["*.html", "*.css", "*.js"]
+# The governance bundle lives one level deeper. Without this line the wheel
+# ships the workbench but not the permission console, and every install that
+# does not run from the source tree answers /governance with a 503 -- the
+# source checkout hides it completely, which is why it survived to a real host.
+"ai_ops.console.governance" = ["*.html", "*.css", "*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

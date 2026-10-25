@@ -374,6 +374,8 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     install_asset_lifecycle(app, transaction, audit, admin)
     from .console import install_console
     install_console(app, transaction, audit, admin)
+    from .governance_console import install_governance
+    app.state.governance_console = install_governance(app)
     from .channels import install_channels
     install_channels(app, transaction, audit, admin, current_admin_token)
     from .alert_notify import install_alert_notify

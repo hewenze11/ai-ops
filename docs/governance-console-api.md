@@ -34,12 +34,15 @@
   "approvals": [ {...审批卡} ],
   "questions": [ {...问题卡} ],
   "account_requests": [ {...账号申请卡} ],
-  "total": 3,
+  "sensitive_hits": [ {...敏感解锁卡} ],
+  "total": 4,
   "note": "..."
 }
 ```
 
-三种卡片**混排在一个列表**里（按 `created_at` 排序由前端决定），每种卡片的"决定动作"不同。轮询刷新（建议 5s），无 WebSocket。
+**四种卡片**混排在一个列表里（排序由前端决定），每种卡片的"决定动作"不同。轮询刷新（建议 5s），无 WebSocket。
+
+> 注意：`total` 是四者之和，包含 `sensitive_hits`。若只算三种会与 `total` 对不上，顶部红点会显示错误的数字。
 
 #### 审批卡 `kind: "approval"`
 
@@ -119,6 +122,38 @@ AI 请求在本轮对话中获得某台机某个 OS 账号的执行权。
 
 ### 3.2 上下文
 
+#### 敏感解锁卡 `kind: "sensitive_hit"`
+
+AI 只读排查时读到一段被脱敏规则打码的内容（密钥样式）。AI 拿到的是掩码；你可以选择让它在主机上**再读一次同一路径**，而这一次的原文只回给你，不进对话、不进任务结果。
+
+```json
+{
+  "kind": "sensitive_hit",
+  "hit_id": "uuid", "turn_id": "uuid", "task_id": "uuid",
+  "asset_id": "web1", "asset_name": "生产 Web-1",
+  "path": "/opt/app/.env",
+  "rule_ids": ["baseline:private-key"],
+  "baseline_version": "2026-10-22.1",
+  "created_at": 1760000000.0,
+  "unlock_scope": "one re-read of this same path, returned to the operator only",
+  "expires_in_seconds": 300
+}
+```
+
+- `rule_ids` 是命中的规则名，不是命中的**值**——这张卡本身不含任何原文，所以"解锁"只能回主机重读，不能从控制面凭空吐出。
+- `unlock_scope` 与 `expires_in_seconds` 由服务端给出，界面**原样展示**，不要自己改写文案：用户必须清楚"一次、同路径、只给我"这三个限定。
+
+决定：`POST /api/v1/sensitive-hits/{hit_id}/unlock` → `{"hit_id", "reveal_token", ...}`
+
+取回：`GET /api/v1/sensitive-hits/{hit_id}/revealed`
+- 首次请求派发一次重读任务，返回 202（**授权不消耗**），需稍后再取。
+- 拿到字节才返回 `revealed: true` 并消耗授权（一次性）。
+- 超时或读取失败返回 `revealed: false`，如实告知，不要伪造。
+
+**硬约束**：这是全页唯一会显示原文的地方，天然与第 5 节"凭证库不得出现查看明文"冲突——两者不矛盾：凭证库是**清单**（值永远在主机上），解锁卡是**针对这一次读取的临时放行**。界面必须把这条区别说清，否则用户会以为凭证库里也能点开看。
+
+### 3.3 上下文
+
 卡片上可提供"查看对话"入口：`GET /api/v1/turns/{turn_id}` 返回完整轮次（`prompt`、`messages[]`、`state`、`steps`、`questions`、`account_requests`、`execution_grants` 等）。`messages` 是 OpenAI 风格消息数组（role: system/user/assistant/tool），`assistant` 的 `tool_calls[].function.{name,arguments}`，`tool` 消息的 `content` 是 JSON 字符串。只需能展开看，不必做聊天 UI。
 
 ## 4. 名单与模式
@@ -138,8 +173,39 @@ AI 请求在本轮对话中获得某台机某个 OS 账号的执行权。
    "rules": [{"rule_id": "service.reload", "action": "service.reload", "hosts": ["tag:prod"], "note": "说明"}]}
   ```
   - `hosts` 为空数组 = 全部主机；否则是主机标签列表（如 `tag:prod`），规则只在带这些标签的主机上生效。
-- `GET /api/v1/name-lists/{id}` → 单个。
-- `POST /api/v1/name-lists/{id}/fork` body `{"name": "新名字（可选）", "rules": [...]（可选，省略则复制）}` → 201 新名单。
+- `GET /api/v1/name-lists/{list_id}` → 单个。（路径参数名是 `list_id`）
+- `POST /api/v1/name-lists/{list_id}/fork` body `{"name": "新名字（可选）", "rules": [...]（可选，省略则复制）}` → 201 新名单。
+- `POST /api/v1/name-lists` → 201 新建（body 同 fork 的形状）。
+
+#### 机械检查与预演（建议做进 fork 之前）
+
+改名单最容易犯的错不是写错规则，是**写的规则根本不会被命中**，或与另一张名单相矛盾。这三个接口专治这个：
+
+- `POST /api/v1/name-lists/{list_id}/check` body 可带候选 `rules`（省略则查当前）→ 报告：
+  - **死规则**：被另一条更宽的规则完全覆盖，永远不会裁定。
+  - **跨名单冲突**：allow 与 deny 同时命中某动作（引擎固定“禁止优先”，所以不是 bug，但“我明明允许了还是被拦”会耗尽信任）。
+  - 不自动修复，只报出来。
+- `POST /api/v1/name-lists/{list_id}/dry-run` body `{"action": "service.reload", "hosts": ["prod"]}` → 返回**由哪条规则裁定**（含规则 id）。
+  **进岀都没有文件内容**，只回答“会/不会、因为哪条”。
+- `GET /api/v1/name-lists/{list_id}/status` → 该名单的绑定与使用情况摘要。
+
+#### 平台默认漂移
+
+平台会随版本更新自己的默认名单。你的库里的快照会慢慢落后，接口告诉你差在哪：
+
+- `GET /api/v1/name-lists/platform-defaults/drift` → 新增 / 撤销 / 变更的规则清单。
+- `POST /api/v1/name-lists/platform-defaults/{kind}/apply` → 接受变更：fork 出新版本再改绑（带 `parent_id`，审计可回溯）。
+
+**任何情况都不自动改绑**——自动打安全补丁同时不问就改权限，是两件不能捆在一起的事。界面上要能让用户看见“有更新”，但不做成一键默默生效。
+
+#### 重绑影响面
+
+- `GET /api/v1/name-list-bindings/impact` → 改绑定会影响什么：
+  - 当前绑定的名单 id、多久前改的；
+  - **会受影响的定时任务清单**（危险源）；
+  - **运行中轮次不受影响**的计数（入队时已固化名单，这反而安全）。
+
+两项分开列，**故意不混**——真实风险与直觉相反，危险的是定时任务，不是运行中的对话。这只是告警面，不阻止重绑。
 - `GET /api/v1/name-list-bindings` → `{"readonly": {"readonly_list": id, "write_list": id|null, "deny_list": id|null}, "confirm": {...}, "direct": {...}}`（缺某模式 = 用平台默认）。
 - `PUT /api/v1/name-list-bindings/{mode}` body `{"readonly_list": id|null, "write_list": id|null, "deny_list": id|null}` → 返回全部 bindings。
 - `PUT /api/v1/assets/{asset_id}/tags` body `{"tags": ["prod", "web"]}` → `{"asset_id", "tags"}`；资产列表见 `GET /api/v1/assets`（每项含 `id`、`name`、`allowed_users[]`、`tags[]`、`connection_type`、`health`）。
@@ -154,16 +220,18 @@ Agent 在服务器上读到密钥样子的内容时，**不回传明文**，而�
 
 ### 5.2 接口
 
-- `GET /api/v1/credentials?asset_id=&include_dismissed=false` →
-  ```json
+- `GET /api/v1/credentials?asset_id=&include_dismissed=false` →  ```json
   {"items": [{"id": "cred-xxx", "asset_id": "web1", "name": "unnamed-3", "note": "", "source": "/opt/app/.env",
               "kind": "pattern|path|file|connector", "created_at": ..., "last_seen_at": ..., "dismissed": 0, "dismissed_reason": null}],
    "counts_by_asset": {"web1": 5}, "note": "Handles only; values stay on the managed host."}
   ```
   - `kind`: `pattern` 正则命中片段（可能误报，如 git sha）；`path` 路径规则命中整文件；`file` 文件凭证；`connector` 无 Agent 的降级路径（值经过控制面，要标出来）。
-- `PUT /api/v1/assets/{asset_id}/credentials/{id}` body `{"name": "...", "note": "..."}`（任一可省）→ 更新后的句柄。`source`/`kind`/`id` **不可改**（传了会 422）——它们是证据。
-- `POST /api/v1/assets/{asset_id}/credentials/{id}/dismiss` body `{"reason": "不是密钥"}` → 误报否决，之后不再上报。
-- `GET /api/v1/assets/{asset_id}/credentials/{id}/history` → `[{"seq", "event": "discovered|annotated|dismissed", "actor", "detail"(JSON字符串), "created_at"}]`
+- `PUT /api/v1/assets/{asset_id}/credentials/{credential_id}` body `{"name": "...", "note": "..."}`（任一可省）→ 更新后的句柄。`source`/`kind`/`id` **不可改**（传了会 422）——它们是证据。
+- `POST /api/v1/assets/{asset_id}/credentials/{credential_id}/dismiss` body `{"reason": "不是密钥"}` → 误报否决，之后不再上报。
+- `GET /api/v1/assets/{asset_id}/credentials/{credential_id}/history` → `[{"seq", "event": "discovered|annotated|dismissed", "actor", "detail"(JSON字符串), "created_at"}]`
+- `GET /api/v1/assets/{asset_id}/credentials` → 该资产的句柄清单。
+
+（注意路径参数名是 `credential_id`，不是 `id`。）
 
 **硬约束**：界面任何地方不得出现"查看明文/复制值"之类的入口，哪怕灰掉也不要。
 
@@ -183,6 +251,7 @@ Agent 在服务器上读到密钥样子的内容时，**不回传明文**，而�
 - `GET /api/v1/roles` → `[{"id","name",...}]`
 - `GET /api/v1/assets` → 资产数组
 - `GET /api/v1/operator/attention` → `{"unknown_executions":[], "awaiting_approvals":[], "stale_leases":[], "offline_assets":[]}`（可用于顶部红点；`awaiting_approvals` 与 inbox 重复，取 inbox 为准）
+- `GET /api/v1/sensitive-hits` → 与 `inbox.sensitive_hits` 同形状，独立取用（默认最多 100 条，最新在前）
 - `GET /healthz` → 200
 
 ## 8. 明确不做

@@ -111,18 +111,28 @@ def test_web_search_tool_runs_inline_without_assets():
 
 def test_web_search_tool_spec_exposed_only_when_provider_configured():
     from ai_ops.search import EgressPolicy
-    from ai_ops.turns import tool_spec
+    from ai_ops.turns import tool_spec, READONLY_TOOLS
+    # Read tools are part of every mode now, so they are the baseline this test
+    # adds to rather than a list it can repeat literally.
+    read_channel = ['read_file', 'list_dir', 'file_stat', 'disk_usage', 'memory_info',
+                    'process_list', 'service_status', 'journal_logs', 'k8s_get', 'k8s_logs']
+    assert list(READONLY_TOOLS) == read_channel
+    base = ['ask_user', 'read_asset_memory'] + read_channel + ['read_many']
+    # request_execution_account is offered whenever the mode can write at all,
+    # independent of whether an account is already granted.
+    writable = base + ['request_execution_account']
     # fetch_page is NOT advertised without an egress policy: a tool that always
     # fails teaches the model to retry and promises what the service refuses.
     names = [t["function"]["name"] for t in tool_spec([], FakeProvider())]
-    assert names == ["ask_user", "read_asset_memory", "request_execution_account", "web_search"]
-    assert [t['function']['name'] for t in tool_spec([], None)] == ['ask_user', 'read_asset_memory', 'request_execution_account']
+    assert sorted(names) == sorted(writable + ['web_search'])
+    assert sorted(t['function']['name'] for t in tool_spec([], None)) == sorted(writable)
     # Opted-in fetch appears only with an allowing policy.
     opting_in = EgressPolicy(allow_fetch=True)
     assert [t['function']['name'] for t in tool_spec([], FakeProvider(), 'confirm', opting_in)][-2:] == ['web_search', 'fetch_page']
-    # Decision tool never grants execution authority.
+    # Decision tool never grants execution authority: the write surface is added
+    # on top of the same read channel, and search stays optional.
     with_user = [t["function"]["name"] for t in tool_spec(["ops_read"], FakeProvider())]
-    assert with_user == ["ask_user", "read_asset_memory", "request_execution_account", "propose_change", "start_task", "check_task", "web_search"]
+    assert sorted(with_user) == sorted(base + ['request_execution_account', 'propose_change', 'start_task', 'check_task', 'web_search'])
 
 
 def test_fetch_is_refused_without_an_egress_policy():

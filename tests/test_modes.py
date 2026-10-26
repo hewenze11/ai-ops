@@ -68,20 +68,37 @@ READONLY_CHANNEL = ['read_file', 'list_dir', 'file_stat', 'disk_usage', 'memory_
 
 
 def test_tool_spec_omits_execution_tool_in_readonly():
-    # Readonly turns get the narrow readonly channel instead of the execution
-    # tool: they can look, but there is no command string to inject into.
-    # read_many belongs to the read-only channel: every child it dispatches is a
-    # readonly tool, so it widens breadth, not capability (§52.4). It must never
-    # appear in a write-mode surface, which the next two assertions pin.
-    assert names_in_request({"tools": tool_spec(["ops_read"], None, "readonly")}) == ["ask_user", "read_asset_memory"] + READONLY_CHANNEL + ["read_many"]
+    # Read-only tools are available in EVERY mode, because inspecting a host is
+    # the prerequisite for proposing a change worth approving. What separates the
+    # modes is the write surface: readonly has none, confirm/direct have
+    # propose_change. The old shape (readonly tools only in readonly mode) left a
+    # confirm turn unable to look at anything, which is how a model ended up
+    # retrying forever.
+    readonly_surface = ["ask_user", "read_asset_memory"] + READONLY_CHANNEL + ["read_many"]
+    assert names_in_request({"tools": tool_spec(["ops_read"], None, "readonly")}) == readonly_surface
     # start_task/check_task travel with propose_change: same authorisation, a
     # different relationship to time (§52.5). A readonly turn never gets them,
     # which the line above pins.
-    write_surface = ["ask_user", "read_asset_memory", "request_execution_account", "propose_change", "start_task", "check_task"]
-    assert names_in_request({"tools": tool_spec(["ops_read"], None, "confirm")}) == write_surface
-    assert names_in_request({"tools": tool_spec(["ops_read"], None, "direct")}) == write_surface
+    write_extras = ["request_execution_account", "propose_change", "start_task", "check_task"]
     for mode in ("confirm", "direct"):
-        assert "read_many" not in names_in_request({"tools": tool_spec(["ops_read"], None, mode)}), mode
+        names = names_in_request({"tools": tool_spec(["ops_read"], None, mode)})
+        # Same read channel as a readonly turn, plus the write surface. Order is
+        # an implementation detail, so compare membership rather than sequences.
+        assert set(names) == set(readonly_surface) | set(write_extras), mode
+        assert "propose_change" in names, mode
+    # Without a selected account there is nothing to propose against, so the
+    # write surface stays closed even in a write mode — but reads remain open.
+    for mode in ("confirm", "direct", "readonly"):
+        names = names_in_request({"tools": tool_spec([], None, mode)})
+        assert "propose_change" not in names, mode
+        assert "read_file" in names, mode
+
+
+def test_readonly_channel_never_reaches_the_write_surface():
+    # readonly turns must not carry any tool that can change a host.
+    names = names_in_request({"tools": tool_spec(["ops_read"], None, "readonly")})
+    for forbidden in ("propose_change", "start_task", "check_task", "request_execution_account"):
+        assert forbidden not in names
 
 
 def test_readonly_channel_tool_becomes_structured_task():
@@ -104,17 +121,41 @@ def test_readonly_channel_tool_becomes_structured_task():
     assert "command" not in task["payload"]
 
 
-def test_readonly_tool_is_refused_outside_readonly_mode():
-    # A prompt-injected model must not reach the readonly channel from a
-    # write-mode turn (it would be an unapproved read the user never granted).
+def test_readonly_tool_in_write_mode_still_requires_a_granted_account():
+    # The real risk the old test was reaching for: a write-mode turn must not
+    # become an unapproved read. That is enforced by the per-turn authority
+    # check, not by withholding the tool. Here the turn has no granted account,
+    # so the read is refused even though the tool is offered.
     client, _ = make_client()
     headers = {"Authorization": "Bearer " + ADMIN}
-    setup_role_with_asset(client, headers)
-    turn_id = send(client, headers, "direct")["turn_id"]
+    setup_role_with_asset(client, headers, users=("ops_read",))
+    turn_id = client.post("/api/v1/roles/ops/messages", headers=headers,
+                          json={"text": "read passwd", "execution_users": [],
+                                "mode": "direct", "idempotency_key": "nogrant-0001"}).json()["turn_id"]
     model = FakeModel([call_tool("read_file", {"asset_id": "web1", "run_as": "ops_read", "path": "/etc/passwd"})])
     client.app.state.role_engine.advance(model)
     turn = client.get(f"/api/v1/turns/{turn_id}", headers=headers).json()
     assert turn["state"] == "failed"
+    assert turn["error_code"] == "MODEL_TOOL_AUTHORIZATION_OR_SCHEMA_REJECTED"
+
+
+def test_readonly_tool_in_write_mode_runs_when_account_is_granted():
+    # The counterpart, and the bug this pair pins: a confirm turn CAN inspect a
+    # host it was granted. Refusing this is what made the model loop.
+    client, _ = make_client()
+    headers = {"Authorization": "Bearer " + ADMIN}
+    setup_role_with_asset(client, headers, users=("ops_read",))
+    turn_id = client.post("/api/v1/roles/ops/messages", headers=headers,
+                          json={"text": "check /tmp", "execution_users": ["ops_read"],
+                                "mode": "confirm", "idempotency_key": "granted-0001"}).json()["turn_id"]
+    model = FakeModel([call_tool("disk_usage", {"asset_id": "web1", "run_as": "ops_read", "path": "/tmp"}), final("looked")])
+    client.app.state.role_engine.advance(model)
+    turn = client.get(f"/api/v1/turns/{turn_id}", headers=headers).json()
+    assert turn["state"] == "waiting_tool"
+    task = client.get(f"/api/v1/tasks/{turn['pending_task_id']}", headers=headers).json()
+    assert task["state"] == "queued"
+    assert task["payload"]["kind"] == "readonly"
+    assert task["payload"]["tool"] == "disk_usage"
 
 
 def test_tools_for_turn_defaults_unknown_mode_to_readonly():

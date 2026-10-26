@@ -442,14 +442,19 @@ def tool_spec(users, search_provider=None, mode="confirm", egress=None):
     specs = [question_tool_spec(), asset_memory_tool_spec()]
     if mode != 'readonly':
         specs.append(account_grants.request_spec())
-    else:
-        # Read-only turns get the narrow readonly surface instead of the
-        # execution tool. This is a real capability boundary (gate 1).
-        from .readonly_tools import tool_spec as readonly_tool_spec
-        specs.extend(readonly_tool_spec())
-        # Only in a readonly turn, because every child runs a readonly tool.
-        # Grouped reads are the one place where breadth is the point (§52.4).
-        specs.append(READ_MANY_SPEC)
+    # Read-only tools are available in EVERY mode. They used to be gated behind
+    # ``mode == 'readonly'``, which left a confirm/direct turn with no way to look
+    # at the host at all: the model could only propose a change, never inspect
+    # what it was about to change. The observed failure was a model that wanted
+    # ``disk_usage``, was refused by propose_change with ACTION_UNKNOWN, and then
+    # reconsidered forever. Reading is not a privilege escalation — it is the
+    # prerequisite for proposing a change worth approving — so the strictest
+    # tool set is now ``readonly tools + no propose_change``, not "no tools".
+    from .readonly_tools import tool_spec as readonly_tool_spec
+    specs.extend(readonly_tool_spec())
+    # Grouped reads fan out to the same read-only channel, so they carry the same
+    # authority and belong in every mode too (§52.4).
+    specs.append(READ_MANY_SPEC)
     # readonly turns deliberately withhold the execution tool entirely. This is a
     # real capability boundary: a jailbroken prompt still has nothing to call.
     if users and mode != "readonly":
@@ -842,12 +847,11 @@ class RoleEngine:
             if name in READONLY_TOOLS:
                 # Gate 1/2 (readonly channel): a tool choice becomes a
                 # structured program+argv task. No shell, no free-form command.
-                # Unlike confirm/direct there is no approval prompt: these are
-                # provably non-mutating argv, so they can run inline like a
-                # search. The Agent re-validates independently at execve.
+                # These run inline with no approval prompt because they are
+                # provably non-mutating argv — that is true in every mode, so a
+                # confirm/direct turn can inspect a host before proposing a
+                # change. The Agent re-validates independently at execve.
                 try:
-                    if current['mode'] != 'readonly':
-                        raise ValueError('readonly tool outside readonly mode')
                     from .readonly_tools import build
                     asset_id = str((arguments or {}).get('asset_id') or '')
                     run_as = str((arguments or {}).get('run_as') or '')

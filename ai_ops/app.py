@@ -15,6 +15,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import Field, SecretStr, model_validator
 
 from . import scrubbing
+from .actions import MAX_ACTIONS
 from .models import Identifier, StrictModel, UserName, new_id
 
 PROTOCOL = "1.0"
@@ -121,6 +122,14 @@ class Result(StrictModel):
     error_code: str | None = Field(default=None, max_length=100)
     output_truncated: bool = False
     output_archives: dict | None = None
+    # Per-step outcome for a change set, reported by the Agent that ran it.
+    # This is BOOKKEEPING, not authority: the service already expanded and
+    # hashed every step before dispatch, so the authoritative record of what ran
+    # is the task payload. The Agent's own account is kept because it is the
+    # only witness to which step failed and why, and that is what the operator
+    # needs to read. It is never used to decide whether something succeeded —
+    # an Agent claiming success cannot override a failing exit_code.
+    change_report: list[dict] = Field(default_factory=list, max_length=MAX_ACTIONS)
     # Handles the Agent registered while running this task (§42). Ids and names
     # only: a value in this field would be a leak, and the field is unknown to
     # the model, which sees a short notice instead.
@@ -130,6 +139,12 @@ class Result(StrictModel):
     def success_requires_zero(self):
         if self.status == "succeeded" and self.exit_code != 0:
             raise ValueError("succeeded requires exit_code=0")
+        # An Agent may not report a multi-step change as globally succeeded while
+        # its own per-step report shows a failure.
+        if self.status == "succeeded" and any(
+                isinstance(step, dict) and step.get("status") not in (None, "succeeded")
+                for step in self.change_report):
+            raise ValueError("succeeded contradicts a failed step in change_report")
         return self
 
 

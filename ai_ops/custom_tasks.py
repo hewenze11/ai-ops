@@ -127,7 +127,9 @@ class CustomTask(BaseModel):
     prompt: str = Field(min_length=1, max_length=32000)
     execution_users: list[USER] = Field(default_factory=list, max_length=100)
     execution_grants: list[account_grants.Grant] = Field(default_factory=list, max_length=100)
-    mode: Literal["readonly", "confirm", "direct"] = "confirm"
+    # Any registered mode id, including a derived one. An unattended task pins its
+    # mode, so the id must resolve; a deleted mode is refused at delete time.
+    mode: str = Field(default="confirm", min_length=1, max_length=200)
     # An unattended task never relies on inheritance (§44.3). A trigger/schedule
     # that writes must say so explicitly; a default would mean a write-capable
     # task is created by someone who never saw a mode picker. The check lives in

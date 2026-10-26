@@ -117,11 +117,13 @@ def test_readonly_tool_is_refused_outside_readonly_mode():
     assert turn["state"] == "failed"
 
 
-def test_tools_for_turn_defaults_unknown_mode_to_confirm():
+def test_tools_for_turn_defaults_unknown_mode_to_readonly():
     turn = {"execution_users": json.dumps(["ops_read"]), "mode": "totally-unknown"}
     names = [t["function"]["name"] for t in tools_for_turn(turn, {}, None)]
-    # Unknown mode must not silently become direct; it behaves like confirm.
-    assert names == ["ask_user", "read_asset_memory", "request_execution_account", "propose_change", "start_task", "check_task"]
+    # An unresolvable mode must not hand out a write surface: it gets the
+    # read-only channel, never propose_change.
+    assert "propose_change" not in names
+    assert "disk_usage" in names
 
 
 def test_readonly_model_request_has_no_execution_tool():
@@ -199,8 +201,15 @@ def test_mode_is_immutable_across_the_turn():
     assert turn["execution_users"] == ["ops_read"]
 
 
-def test_all_three_modes_accepted_and_bad_mode_rejected():
-    client, _ = make_client()
+def test_all_three_modes_accepted_and_unknown_mode_falls_back_to_readonly():
+    """Mode ids are data now, so an unknown id is not a schema error.
+
+    A derived mode is a legitimate id, which means the API cannot reject an
+    unknown string at the schema layer any more. What matters instead is what it
+    resolves to: an id the mode table does not know must never hand out a write
+    surface, so it resolves to the read-only behaviour.
+    """
+    client, db_path = make_client()
     headers = {"Authorization": "Bearer " + ADMIN}
     setup_role_with_asset(client, headers)
     for i, mode in enumerate(MODES):
@@ -208,7 +217,12 @@ def test_all_three_modes_accepted_and_bad_mode_rejected():
                         json={"text": "x", "execution_users": [], "mode": mode,
                               "idempotency_key": f"idem-{i:08d}"})
         assert r.status_code == 202
-    bad = client.post("/api/v1/roles/ops/messages", headers=headers,
-                      json={"text": "x", "execution_users": [], "mode": "yolo",
-                            "idempotency_key": "idem-bad-0001"})
-    assert bad.status_code == 422
+    unknown = client.post("/api/v1/roles/ops/messages", headers=headers,
+                          json={"text": "x", "execution_users": [], "mode": "yolo",
+                                "idempotency_key": "idem-bad-0001"})
+    assert unknown.status_code == 202
+    import sqlite3
+    from ai_ops import modes as modes_module
+    with sqlite3.connect(db_path) as db:
+        db.row_factory = sqlite3.Row
+        assert modes_module.behavior_of(db, "yolo") == "readonly"

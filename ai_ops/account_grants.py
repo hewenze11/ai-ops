@@ -5,6 +5,7 @@ import uuid
 from fastapi import Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from .models import Identifier, UserName
+from .modes import behavior_of
 
 class Grant(BaseModel):
     model_config = ConfigDict(extra='forbid')
@@ -99,7 +100,7 @@ def request_spec():
 
 def create_request(db, turn, call, arguments):
     body = AccountRequest.model_validate(arguments)
-    if turn['mode'] not in ('direct', 'confirm'):
+    if behavior_of(db, turn['mode']) == 'readonly':
         raise ValueError('Readonly turns cannot gain execution authority')
     asset = db.execute('SELECT id FROM assets WHERE id=? AND retired_at IS NULL', (body.asset_id,)).fetchone()
     if not asset or not isinstance(call.get('id'), str) or not 1 <= len(call['id']) <= 200:
@@ -134,7 +135,7 @@ def install(app, transaction, audit, admin):
                 raise HTTPException(409, 'Pending account tool does not match')
             grant = {'asset_id': req['asset_id'], 'username': req['username']}
             if body.decision == 'approve':
-                if turn['mode'] not in ('direct', 'confirm'):
+                if behavior_of(db, turn['mode']) == 'readonly':
                     raise HTTPException(409, 'Readonly authority cannot be upgraded')
                 validate_grants(db, [grant])
                 if auth['legacy_unscoped']:

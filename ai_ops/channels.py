@@ -105,11 +105,15 @@ def install_channels(app, transaction, audit, admin, admin_token_provider):
 
     @app.post("/api/v1/channels/pairings", dependencies=[Depends(admin)], status_code=201)
     def create_pairing(body: Pairing):
-        if body.mode not in ("readonly", "confirm", "direct"):
-            raise HTTPException(422, "Unknown mode")
-        code = secrets.token_urlsafe(18)
-        now = time.time()
         with transaction() as db:
+            # Channel pairings bind an identity to a mode, so the id must be one
+            # the service knows how to authorise. Anything else is refused at
+            # pairing time rather than silently resolving later.
+            if db.execute('SELECT 1 FROM execution_modes WHERE id=?', (body.mode,)).fetchone() is None \
+                    and body.mode not in ('readonly', 'confirm', 'direct'):
+                raise HTTPException(422, "Unknown mode")
+            code = secrets.token_urlsafe(18)
+            now = time.time()
             if not db.execute("SELECT 1 FROM roles WHERE id=?", (body.role_id,)).fetchone():
                 raise HTTPException(404, "Role not found")
             from .role_lifecycle import require_active

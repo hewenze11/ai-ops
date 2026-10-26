@@ -254,7 +254,10 @@ class Message(BaseModel):
 
     execution_users: list[USER] = Field(default_factory=list, max_length=100)
     execution_grants: list[account_grants.Grant] = Field(default_factory=list, max_length=100)
-    mode: Literal["readonly", "confirm", "direct"] = "confirm"
+    # Any registered mode id, including a derived one. Validated against the mode
+    # table when the turn is enqueued; resolving an unknown id falls back to the
+    # readonly behaviour rather than to a write surface.
+    mode: str = Field(default="confirm", min_length=1, max_length=200)
     idempotency_key: str = Field(min_length=8, max_length=128)
 
 
@@ -468,14 +471,21 @@ def tool_spec(users, search_provider=None, mode="confirm", egress=None):
     return specs
 
 
-def tools_for_turn(turn, settings, search_provider, egress=None):
-    """Expose tools according to the turn's immutable mode + selected accounts."""
+def tools_for_turn(turn, settings, search_provider, egress=None, behavior=None):
+    """Expose tools according to the turn's immutable mode + selected accounts.
+
+    ``behavior`` is the capability the turn's mode resolves to (readonly /
+    confirm / direct), looked up from the mode table by the caller. Derived modes
+    carry their parent's behaviour, so this function never has to know about
+    them: it branches on capability, never on a mode name.
+    """
     users = json.loads(turn["execution_users"])
-    mode = turn["mode"]
-    # Defense in depth: modes are validated on entry, but never trust a stored
-    # value blindly. An unknown mode must not silently become "direct".
+    mode = behavior or turn["mode"]
+    # Defense in depth: an unknown or missing behaviour must never hand out a
+    # write surface. Falling back to readonly withholds the change tool
+    # entirely, which is the strictest outcome available here.
     if mode not in MODES:
-        mode = "confirm"
+        mode = "readonly"
     return tool_spec(users, search_provider, mode, egress) or None
 
 
@@ -491,8 +501,22 @@ class RoleEngine:
         return lambda task_id: db.execute('SELECT * FROM tasks WHERE id=?',
                                           (task_id,)).fetchone()
 
+    def behavior(self, db, turn):
+        """The capability this turn's mode resolves to, read from the mode table.
+
+        Every gate that used to compare ``turn['mode']`` against literal names now
+        calls this. A derived mode shares its parent's capability, so a fork can
+        never be a quieter way to get ``direct``.
+        """
+        from . import modes as modes_module
+        return modes_module.behavior_of(db, turn['mode'])
+
     def request_body(self, db, turn, settings):
-        tools = tools_for_turn(turn, settings, self.search_provider, self.egress)
+        # Resolve the mode's capability here, once, from the mode table. Everything
+        # downstream branches on this behaviour rather than on a mode name, so a
+        # fork cannot widen authority by being named something.
+        tools = tools_for_turn(turn, settings, self.search_provider, self.egress,
+                               self.behavior(db, turn))
         return build_body(self.app, db, turn, settings, self.default_model, tools)
 
     def _advance_fanout(self, db, parent, payload):
@@ -872,7 +896,7 @@ class RoleEngine:
                 # reaches a shell unless the action itself is `shell.run`
                 # (human-only, never unattended).
                 try:
-                    if current['mode'] not in ('confirm', 'direct'):
+                    if self.behavior(db, current) == 'readonly':
                         raise ValueError('change set outside a write mode')
                     # The model may not smuggle authority in extra keys; only
                     # these four are meaningful, anything else is a rejection.
@@ -909,7 +933,7 @@ class RoleEngine:
                 # exist for this task at all (§44.3). Name rules can only narrow
                 # what the action table already allows, never widen it.
                 allowed, scope = name_rules(db, current)
-                verdicts = actions.plan(current['mode'], steps, **trigger['policy'])
+                verdicts = actions.plan(self.behavior(db, current), steps, **trigger['policy'])
                 codes = [reason for _, verdict, reason in verdicts if verdict == 'reject']
                 for step in steps:
                     if step['action'] not in allowed:
@@ -1005,7 +1029,7 @@ class RoleEngine:
                 # A readonly turn must never execute. If the model emits the tool
                 # anyway (it should not have it), reject rather than run. Reject
                 # the turn: silently ignoring could let the model keep "trying".
-                if current["mode"] not in ("confirm", "direct"):
+                if self.behavior(db, current) == "readonly":
                     raise ValueError("Execution tool requires a valid execution mode")
                 command = ExecuteCommand.model_validate(arguments)
                 users = json.loads(current["execution_users"])
@@ -1021,7 +1045,7 @@ class RoleEngine:
             task_id = str(uuid.uuid4())
             # Only the immutable turn mode decides gating. confirm -> human must
             # approve; direct -> queued now. (readonly was rejected above.)
-            state = "awaiting_approval" if current["mode"] == "confirm" else "queued"
+            state = "awaiting_approval" if self.behavior(db, current) == "confirm" else "queued"
             payload = {**command.model_dump(), "role_id": current["role_id"], "execution_users": users, "mode": current["mode"], "idempotency_key": "model:" + call_id}
             payload['authorization_revision'] = account_grants.authority(db, turn['id'])['authorization_revision']
             payload['execution_grants'] = account_grants.authority(db, turn['id'])['execution_grants']

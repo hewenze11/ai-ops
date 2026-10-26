@@ -181,6 +181,7 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         from .alert_notify import SCHEMA as ALERT_NOTIFY_SCHEMA
         from .management import SCHEMA as MANAGEMENT_SCHEMA
         from .namelists import SCHEMA as NAMELISTS_SCHEMA
+        from .modes import SCHEMA as MODES_SCHEMA, seed as seed_modes
         from .credential_handles import SCHEMA as CREDENTIAL_SCHEMA
         from .sensitive import SCHEMA as SENSITIVE_SCHEMA
         db.execute("PRAGMA journal_mode=WAL")
@@ -192,7 +193,10 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + CUSTOM_SCHEMA + TURN_SCHEMA + EXEC_SCHEMA + LEASE_SCHEMA + CONNECTOR_SCHEMA + LOCAL_SCHEMA + LIFECYCLE_SCHEMA + MEMORY_SCHEMA + ASSET_MEMORY_SCHEMA + ALARM_SCHEMA + CHANNEL_SCHEMA + ALERT_NOTIFY_SCHEMA + MANAGEMENT_SCHEMA)
         from .observability import SCHEMA as OBSERVABILITY_SCHEMA
         from .role_lifecycle import SCHEMA as ROLE_LIFECYCLE_SCHEMA
-        db.executescript(OBSERVABILITY_SCHEMA + ROLE_LIFECYCLE_SCHEMA + ATTACHMENT_SCHEMA + NAMELISTS_SCHEMA + CREDENTIAL_SCHEMA + SENSITIVE_SCHEMA)
+        db.executescript(OBSERVABILITY_SCHEMA + ROLE_LIFECYCLE_SCHEMA + ATTACHMENT_SCHEMA + NAMELISTS_SCHEMA + MODES_SCHEMA + CREDENTIAL_SCHEMA + SENSITIVE_SCHEMA)
+        # The three built-in modes must exist before any turn can resolve a
+        # capability, so this runs at schema time rather than on first request.
+        seed_modes(db)
         migrate(db)
         migrate_execution(db)
         migrate_leases(db)
@@ -378,6 +382,9 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
     install_asset_lifecycle(app, transaction, audit, admin)
     from .console import install_console
     install_console(app, transaction, audit, admin)
+
+    from .modes import routes as mode_routes
+    mode_routes(app, transaction, audit, admin)
     from .governance_console import install_governance
     app.state.governance_console = install_governance(app)
     from .channels import install_channels

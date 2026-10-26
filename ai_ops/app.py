@@ -23,6 +23,10 @@ PROTOCOL = "1.0"
 class Role(StrictModel):
     id: Identifier = Field(default_factory=lambda: new_id('role'))
     name: str = Field(min_length=1, max_length=200)
+    # The operator's own instructions for this role, injected into every turn
+    # as ROLE_INSTRUCTIONS. It is text, not authority: it cannot add accounts,
+    # change the mode or grant tools, and it never overrides the trust boundary.
+    prompt: str = Field(default='', max_length=32000)
 
 
 class Asset(StrictModel):
@@ -394,12 +398,32 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
 
     @app.post("/api/v1/roles", dependencies=[Depends(admin)], status_code=201)
     def create_role(body: Role):
+        from .role_lifecycle import set_instructions
         with transaction() as db:
             if db.execute("SELECT 1 FROM roles WHERE id=?", (body.id,)).fetchone():
                 raise HTTPException(409, "Role already exists")
-            db.execute("INSERT INTO roles VALUES(?,?)", (body.id, body.name))
+            db.execute("INSERT INTO roles(id,name) VALUES(?,?)", (body.id, body.name))
+            set_instructions(db, body.id, body.prompt)
             audit(db, "role.created", body.id, "admin", body.model_dump())
         return body
+
+    @app.get("/api/v1/roles", dependencies=[Depends(admin)])
+    def roles_with_instructions(include_retired: bool = False):
+        """Roles with their instructions.
+
+        ``has_prompt`` is included so the console can warn about a role that
+        silently runs on the platform default behaviour instead of the
+        operator's intended one.
+        """
+        with transaction(write=False) as db:
+            from .role_lifecycle import view_rows
+            return view_rows(db, include_retired)
+
+    @app.get("/api/v1/roles/{role_id}", dependencies=[Depends(admin)])
+    def role_detail(role_id: Identifier):
+        with transaction(write=False) as db:
+            from .role_lifecycle import one_view
+            return one_view(db, role_id)
 
     @app.post("/api/v1/assets", dependencies=[Depends(admin)], status_code=201)
     def provision_asset(body: Asset):

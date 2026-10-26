@@ -57,6 +57,8 @@ class Skill(BaseModel):
 class RoleUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1, max_length=200)
+    # Optional so a caller that only renames cannot wipe the instructions.
+    prompt: str | None = Field(default=None, max_length=32000)
 
 
 class RoleCreate(BaseModel):
@@ -196,12 +198,27 @@ def install_management(app, transaction, audit, admin):
         return {"id": body.id, "name": body.name}
 
     @app.put("/api/v1/roles/{role_id}", dependencies=[Depends(admin)])
-    def rename_role(role_id: ID, body: RoleUpdate):
+    def update_role(role_id: ID, body: RoleUpdate):
+        """Rename a role and optionally replace its instructions.
+
+        This is the only PUT on a role. Instructions are written through the
+        role_prompts helper so the character cap and the audit entry are shared
+        with role creation.
+        """
+        from .role_lifecycle import instructions_for, set_instructions
         with transaction() as db:
             require_role(db, role_id)
             db.execute("UPDATE roles SET name=? WHERE id=?", (body.name, role_id))
-            audit(db, "role.renamed", role_id, "admin", body.model_dump())
-        return {"id": role_id, "name": body.name}
+            prompt_changed = False
+            if body.prompt is not None:
+                prompt_changed = set_instructions(db, role_id, body.prompt) != body.prompt.strip()
+            prompt = instructions_for(db, role_id)
+            audit(db, "role.updated", role_id, "admin",
+                  {"name": body.name, "prompt_changed": prompt_changed,
+                   "prompt_chars": len(prompt)})
+        # Read the value inside the transaction: the handle is closed once the
+        # block exits, and re-reading it afterwards fails at runtime.
+        return {"id": role_id, "name": body.name, "prompt": prompt}
 
     # ---- assets ------------------------------------------------------------
     @app.put("/api/v1/assets/{asset_id}/notes", dependencies=[Depends(admin)])

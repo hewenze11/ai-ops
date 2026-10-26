@@ -62,8 +62,12 @@ def install_console(app, transaction, audit, admin):
 
     @app.get("/api/v1/roles", dependencies=[Depends(admin)])
     def list_roles(include_retired: bool = False):
+        # Instructions are part of a role's identity here, not an optional extra:
+        # a console that cannot show them cannot tell the operator whether a role
+        # runs on their instructions or on the platform default behaviour.
+        from .role_lifecycle import view_rows
         with app.state.read_transaction() as db:
-            return [dict(r) for r in db.execute('SELECT r.id,r.name,x.retired_at FROM roles r LEFT JOIN retired_roles x ON x.role_id=r.id WHERE (? OR x.role_id IS NULL) ORDER BY r.id', (include_retired,))]
+            return view_rows(db, include_retired)
 
     @app.get("/api/v1/console/tasks", dependencies=[Depends(admin)])
     def list_tasks(limit: int = 100):

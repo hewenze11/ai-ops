@@ -82,7 +82,9 @@ def test_roles_route_and_archives_use_own_model_key(env):
     app,c,p=env
     create(c,'a',independent())
     create(c,'b',independent('model-b','unit-only-key-b'))
-    create(c,'inherited',{'enabled':True,'max_model_steps':6})
+    # Legacy stored roles remain compatible, but new console roles cannot inherit.
+    assert c.post('/api/v1/roles', json={'id':'inherited','name':'inherited'}).status_code == 201
+    assert c.put('/api/v1/roles/inherited/model', json={'enabled':True,'max_model_steps':6}).status_code == 200
     seen=[]
     def complete(self,body):
         seen.append((body['model'],self.key_file.read_text(),json.dumps(body)))
@@ -107,7 +109,8 @@ def test_roles_route_and_archives_use_own_model_key(env):
 
 def test_unlimited_not_large_number_and_existing_migration(env):
     app,c,p=env
-    create(c,'a',{'enabled':True})
+    assert c.post('/api/v1/roles', json={'id':'a','name':'a'}).status_code == 201
+    assert c.put('/api/v1/roles/a/model', json={'enabled':True}).status_code == 200
     tid=c.post('/api/v1/roles/a/messages',json={'text':'hello','idempotency_key':'unlimited-test'}).json()['turn_id']
     with app.state.transaction() as db: db.execute('UPDATE role_turns SET model_steps=123456789 WHERE id=?',(tid,))
     class Fake:

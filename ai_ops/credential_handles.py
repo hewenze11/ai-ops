@@ -146,7 +146,7 @@ def install(app, transaction, audit, admin):
                 summary.setdefault(row['asset_id'], 0)
                 summary[row['asset_id']] += 1
             return {'items': rows, 'counts_by_asset': summary,
-                    'note': 'Handles only; values stay on the managed host.'}
+                    'note': '仅返回凭证记录，不返回明文；Agent 凭证留在被管主机，SSH 登录凭证由控制端连接器保存。'}
 
     @app.get('/api/v1/assets/{asset_id}/credentials', dependencies=[Depends(admin)])
     def asset_handles(asset_id: str, include_dismissed: bool = False):

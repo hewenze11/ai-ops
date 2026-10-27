@@ -5,11 +5,12 @@ from fastapi import Depends
 
 def model_status(app):
     threads = getattr(app.state, 'model_worker_threads', [])
+    legacy_provider = bool(os.environ.get('AI_OPS_MODEL_BASE_URL') and os.environ.get('AI_OPS_MODEL_KEY_FILE'))
     return {'worker_running': bool(threads and any(t.is_alive() for t in threads)),
-            'provider_configured': bool(os.environ.get('AI_OPS_MODEL_BASE_URL') and os.environ.get('AI_OPS_MODEL_KEY_FILE')),
+            'provider_configured': legacy_provider,
             'default_model': app.state.role_engine.default_model,
-            'provider_scope': 'role_or_global',
-            'configuration_help': '角色可继承全局默认接口，或独立配置 OpenAI 兼容 HTTPS 接口、模型和 API Key。独立密钥写入服务端受控文件，读取只返回已配状态；留空保留，明确清除才移除引用。原生 Claude/Gemini 协议不在本轮支持范围。全局环境与只读密钥文件继续兼容。'}
+            'provider_scope': 'role_or_global' if legacy_provider else 'role',
+            'configuration_help': '每个新角色需独立配置 OpenAI 兼容 HTTPS 接口、模型和 API Key。密钥只写入服务端受控文件，读取只返回已配状态；编辑时留空仅保留该角色的 Key，不借用其他角色的配置。'}
 
 
 def install(app, admin):

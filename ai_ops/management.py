@@ -18,6 +18,7 @@ import secrets
 import time
 import urllib.error
 import urllib.request
+from typing import Literal
 
 from fastapi import Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
@@ -61,16 +62,19 @@ class RoleUpdate(BaseModel):
     prompt: str | None = Field(default=None, max_length=32000)
 
 
-class RoleCreate(BaseModel):
-    """Create a role from the console.
+class ConsoleRoleModel(RoleModel):
+    # New roles never borrow a deployment-wide identity. The legacy role-model
+    # endpoint still understands stored inherit configs for existing clients.
+    provider_mode: Literal['independent'] = 'independent'
 
-    Optional role settings and file-based credentials commit together.
-    Omitting model preserves the legacy name-only API behavior.
-    """
+
+class RoleCreate(BaseModel):
+    """Create a role and its independent provider configuration atomically."""
     model_config = ConfigDict(extra="forbid")
     id: ID = Field(default_factory=lambda: new_id('role'))
     name: str = Field(min_length=1, max_length=200)
-    model: RoleModel | None = None
+    model: ConsoleRoleModel = Field(default_factory=ConsoleRoleModel)
+    prompt: str = Field(default='', max_length=32000)
 
 
 class AssetCreate(BaseModel):
@@ -191,6 +195,8 @@ def install_management(app, transaction, audit, admin):
                 if db.execute("SELECT 1 FROM roles WHERE id=?", (body.id,)).fetchone():
                     raise HTTPException(409, "Role already exists")
                 db.execute("INSERT INTO roles(id,name) VALUES(?,?)", (body.id, body.name))
+                from .role_lifecycle import set_instructions
+                set_instructions(db, body.id, body.prompt)
                 if body.model is not None:
                     settings = app.state.role_providers.prepare(body.id, body.model, {}, created)
                     db.execute("INSERT INTO role_models VALUES(?,?)", (body.id, json.dumps(settings)))

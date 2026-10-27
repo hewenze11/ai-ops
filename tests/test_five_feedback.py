@@ -13,7 +13,9 @@ def client(tmp_path):
 
 def test_generated_ids_atomic_model_and_compatibility(tmp_path):
     app, c = client(tmp_path)
-    role = c.post('/api/v1/console/roles', json={'name': '角色', 'model': {'enabled': True}})
+    role = c.post('/api/v1/console/roles', json={'name': '角色', 'model': {
+        'enabled': True, 'base_url': 'https://provider.example/v1',
+        'model': 'role-model', 'api_key': 'test-role-key'}})
     assert role.status_code == 201
     rid = role.json()['id']
     assert rid.startswith('role-')
@@ -35,7 +37,7 @@ def test_generated_ids_atomic_model_and_compatibility(tmp_path):
     assert c.post('/api/v1/roles/legacy/messages',json=message).status_code == 409
     assert c.post(f'/api/v1/roles/{rid}/messages',json=message).status_code == 409
     assert c.get('/api/v1/roles/legacy/turns').json() == []
-    assert c.get('/api/v1/runtime/model').json()['provider_scope'] == 'role_or_global'
+    assert c.get('/api/v1/runtime/model').json()['provider_scope'] == 'role'
 
 
 def test_true_state_history_ownership_ttl_and_logs(tmp_path):

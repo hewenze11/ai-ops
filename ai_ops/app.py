@@ -216,6 +216,13 @@ def create_app(db_path: str, admin_token: str, default_model: str = "", admin_to
         migrate_execution(db)
         migrate_leases(db)
         migrate_connector(db)
+        # Existing SSH assets predate the credential inventory. Backfill only
+        # missing handles; a restart must not undo an operator's annotation.
+        from .connector_ssh import sync_login_credential
+        for connection in db.execute("SELECT asset_id FROM asset_connections c WHERE connection_type='ssh' "
+                                     "AND NOT EXISTS (SELECT 1 FROM credential_handles h WHERE "
+                                     "h.asset_id=c.asset_id AND h.id='connector-login')").fetchall():
+            sync_login_credential(db, connection['asset_id'])
         migrate_local(db)
         migrate_lifecycle(db)
         # Schema 7: asset credential rotation keeps a previous token hash for an

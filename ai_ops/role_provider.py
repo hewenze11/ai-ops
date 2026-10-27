@@ -119,14 +119,14 @@ class RoleProviders:
                 raise HTTPException(503, '角色密钥存储不可写；配置未保存') from None
         if ref:
             data['credential_ref'] = ref
-        if data['provider_mode'] == 'independent':
+        if data['provider_mode'] == 'independent' and data['enabled']:
             try:
                 data['base_url'] = validate_base_url(data['base_url'])
             except ValueError as e:
                 raise HTTPException(422, str(e)) from None
             if not data['model']:
                 raise HTTPException(422, '独立接口需要填写模型名称')
-            if data['enabled'] and not ref:
+            if not ref:
                 raise HTTPException(422, '请配置独立 API Key，或先关闭模型')
         return data
 

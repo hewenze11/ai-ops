@@ -53,6 +53,24 @@ def save_connection(db, asset):
         (asset.id, asset.connection_type, asset.ssh_host, asset.ssh_port, asset.ssh_user,
          asset.ssh_auth_kind, asset.ssh_secret_ref, asset.ssh_host_key))
     db.execute("UPDATE assets SET connection_type=? WHERE id=?", (asset.connection_type, asset.id))
+    sync_login_credential(db, asset.id)
+
+
+def sync_login_credential(db, asset_id):
+    """Index the real connector credential without exposing its value or path."""
+    from .credential_handles import register
+    row = db.execute('SELECT * FROM asset_connections WHERE asset_id=?', (asset_id,)).fetchone()
+    if row is None or row['connection_type'] != 'ssh' or not row['ssh_secret_ref']:
+        return
+    source = 'ssh://%s@%s:%s' % (row['ssh_user'], row['ssh_host'], row['ssh_port'])
+    handle_id = 'connector-login'
+    register(db, asset_id, [{'id': handle_id, 'name': 'SSH 登录凭证',
+                            'note': '由连接器保存，仅用于该机器的 SSH 登录；不向模型返回密钥。',
+                            'source': source, 'kind': 'connector'}], actor='admin')
+    # The source is connection metadata, not a user annotation. Repointing the
+    # connector must not leave the credential inventory describing the old host.
+    db.execute('UPDATE credential_handles SET source=?,dismissed=0,dismissed_reason=NULL '
+               'WHERE asset_id=? AND id=?', (source, asset_id, handle_id))
 
 
 def connection_view(db, asset_id):

@@ -70,6 +70,44 @@ def test_purge_refused_while_execution_unresolved(env):
     assert "a" in [a["id"] for a in c.get("/api/v1/assets", headers=h).json()]
 
 
+def test_purge_removes_every_table_that_references_the_asset(env):
+    """Purge must clear EVERY table with a foreign key onto `assets`.
+
+    The previous implementation hand-listed the tables to delete and missed
+    several (host_tags, credential_handles, sensitive_hits, account_requests).
+    The final `DELETE FROM assets` then hit a foreign-key error, rolled the
+    transaction back after half the history was already gone, and left the
+    operator with an asset that could not be removed. This test populates a row
+    in each referencing table so that a table added in future -- and forgotten
+    here -- fails loudly instead of silently restoring the bug.
+    """
+    c, h, _, path = env
+    now = time.time()
+    with sqlite3.connect(path) as db:
+        db.execute("PRAGMA foreign_keys=OFF")
+        db.execute("INSERT INTO host_tags(asset_id,tag) VALUES('a','prod')")
+        db.execute("INSERT INTO asset_state_samples(asset_id,received_at,state,controller,protocol) "
+                   "VALUES('a',?,'healthy','c','1.1')", (now,))
+        db.execute("INSERT INTO controller_observations(asset_id,controller,observed_at) "
+                   "VALUES('a','c',?)", (now,))
+        db.execute("INSERT INTO credential_handles(id,asset_id,name,kind,created_at,last_seen_at) "
+                   "VALUES('h1','a','handle','ssh',?,?)", (now, now))
+        db.commit()
+
+    resp = c.post("/api/v1/assets/a/purge", headers=h, json={"confirm_asset_id": "a"})
+    assert resp.status_code == 200, resp.text
+
+    # Nothing anywhere still points at the purged asset.
+    leftovers = {}
+    with sqlite3.connect(path) as db:
+        db.row_factory = sqlite3.Row
+        for table, column in al._asset_fk_children(db):
+            n = db.execute('SELECT count(*) FROM "%s" WHERE "%s"=?' % (table, column), ("a",)).fetchone()[0]
+            if n:
+                leftovers[table] = n
+    assert leftovers == {}, "purge left rows behind: %s" % leftovers
+
+
 def test_offline_detection_emits_event(env):
     c, h, tokens, path = env
     now = time.time()

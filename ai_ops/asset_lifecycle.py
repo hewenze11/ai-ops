@@ -76,6 +76,27 @@ class PurgeIn(BaseModel):
     confirm_asset_id: ID
 
 
+# Response key overrides. The purge response is read by the console and by tests,
+# so keys that existed before the schema-driven rewrite keep their old names.
+_COUNT_KEYS = {'asset_account_notes': 'account_notes'}
+
+
+def _asset_fk_children(db):
+    """Every table with a foreign key onto ``assets``, as (table, column) pairs.
+
+    Derived from the live schema instead of a constant list: a hand-maintained
+    list is exactly what made purge fail once tables gained an ``asset_id`` and
+    nobody updated this module.
+    """
+    rows = db.execute(
+        "SELECT m.name AS child, p.'from' AS col "
+        "FROM sqlite_master AS m, pragma_foreign_key_list(m.name) AS p "
+        "WHERE m.type='table' AND p.'table'='assets' "
+        "ORDER BY m.name"
+    ).fetchall()
+    return [(r['child'], r['col']) for r in rows]
+
+
 def _unresolved(db, asset_id):
     return db.execute(
         "SELECT id,state FROM tasks WHERE asset_id=? AND state IN ('claimed','unknown') ORDER BY seq",
@@ -120,6 +141,16 @@ def install_asset_lifecycle(app, transaction, audit, admin):
         Refused while any task is claimed/unknown: we will not delete the record
         of a run whose outcome is still unknown — that is precisely the evidence
         an operator may need. Resolve or abandon it first.
+
+        Deletion order is derived from the schema, not hand-listed. The previous
+        hand-written list silently missed tables that also hold a foreign key to
+        `assets` (host_tags, credential_handles, sensitive_hits,
+        account_requests), so the final `DELETE FROM assets` raised a
+        foreign-key error and the transaction rolled back *after* several child
+        tables had already been emptied -- leaving an asset that could not be
+        removed plus rows pointing at nothing. Reading the schema means a table
+        added later is handled without anyone remembering to update this
+        function.
         """
         if body.confirm_asset_id != asset_id:
             raise HTTPException(422, 'confirm_asset_id must equal the path asset id')
@@ -140,19 +171,19 @@ def install_asset_lifecycle(app, transaction, audit, admin):
                 db.execute('DELETE FROM output_archives WHERE task_id=?', (task_id,))
                 db.execute('DELETE FROM task_controls WHERE task_id=?', (task_id,))
                 db.execute('DELETE FROM task_leases WHERE task_id=?', (task_id,))
+            # Child rows of heartbeat streams are keyed by stream, not by asset.
+            db.execute('DELETE FROM heartbeat_attempts WHERE stream_id IN (SELECT id FROM heartbeat_streams WHERE asset_id=?)', (asset_id,))
             # Detach tasks from turns, then remove the turns they belonged to.
             db.execute('UPDATE tasks SET turn_id=NULL WHERE asset_id=?', (asset_id,))
             db.execute('DELETE FROM tasks WHERE asset_id=?', (asset_id,))
-            db.execute('DELETE FROM heartbeat_attempts WHERE stream_id IN (SELECT id FROM heartbeat_streams WHERE asset_id=?)', (asset_id,))
-            db.execute('DELETE FROM heartbeat_streams WHERE asset_id=?', (asset_id,))
-            db.execute('DELETE FROM heartbeat_samples WHERE asset_id=?', (asset_id,))
-            db.execute('DELETE FROM asset_state_samples WHERE asset_id=?', (asset_id,))
-            db.execute('DELETE FROM controller_observations WHERE asset_id=?', (asset_id,))
-            counts['agent_presence'] = db.execute('DELETE FROM agent_presence WHERE asset_id=?', (asset_id,)).rowcount
-            db.execute('DELETE FROM asset_connections WHERE asset_id=?', (asset_id,))
-            db.execute('DELETE FROM asset_lifecycle WHERE asset_id=?', (asset_id,))
-            db.execute('DELETE FROM local_host WHERE asset_id=?', (asset_id,))
-            counts['account_notes'] = db.execute('DELETE FROM asset_account_notes WHERE asset_id=?', (asset_id,)).rowcount
+            for table, column in _asset_fk_children(db):
+                if table == 'tasks':
+                    continue  # already deleted above, together with its own children
+                result = db.execute('DELETE FROM "%s" WHERE "%s"=?' % (table, column), (asset_id,))
+                if result.rowcount:
+                    # `counts` keys are part of the response contract, so tables
+                    # whose key predates this rewrite keep their old name.
+                    counts[_COUNT_KEYS.get(table, table)] = result.rowcount
             db.execute('DELETE FROM assets WHERE id=?', (asset_id,))
             audit(db, 'asset.purged', asset_id, 'admin', {'counts': counts})
         return {'asset_id': asset_id, 'purged': True, 'counts': counts}

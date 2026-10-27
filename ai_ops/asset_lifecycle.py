@@ -5,9 +5,9 @@ Two product questions this answers (user, 2026-10-04):
 1. **Deleting a registered machine.** Removing a machine used to be a single,
    ambiguous action. Operators actually mean one of two different things:
 
-   * **Retire (注销)** — the machine is no longer ours to manage, but everything
+   * **Retire (注销)** - the machine is no longer ours to manage, but everything
      it ever did stays as evidence. Recoverable. This is the default.
-   * **Purge (彻底删除)** — the record must be gone. Destructive, requires an
+   * **Purge (彻底删除)** - the record must be gone. Destructive, requires an
      explicit typed confirmation, and refuses while any run is unresolved.
 
    History is evidence: a task that ran on a host is a fact that happened. So
@@ -97,6 +97,108 @@ def _asset_fk_children(db):
     return [(r['child'], r['col']) for r in rows]
 
 
+def _tables_with_asset_column(db):
+    """Every table that carries an ``asset_id`` column, whether or not it
+    declares a foreign key.
+
+    Foreign keys are not the whole story. Nine tables hold an `asset_id` with no
+    FK declared (`asset_offline_events`, `credential_events`, `wait_handles`,
+    `fanout_children`, `task_leases`, `blocked_kinds`, `local_host`,
+    `sensitive_hits`, `account_requests`). Purging only what the FK graph
+    mentions leaves those rows behind, pointing at an asset that no longer
+    exists -- the same class of mess the FK bug produced, just quieter because
+    nothing raises.
+    """
+    names = [r['name'] for r in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+    found = []
+    for name in names:
+        if name == 'assets':
+            continue
+        try:
+            columns = [c[1] for c in db.execute('PRAGMA table_info("%s")' % name)]
+        except Exception:
+            continue
+        if 'asset_id' in columns:
+            found.append(name)
+    return found
+
+
+def _dependent_chain(db, roots):
+    """Every table whose rows belong to an asset, children-first.
+
+    Two layers, because one is not enough:
+
+    * ``roots`` — tables that carry an ``asset_id`` column. These are deleted
+      with ``WHERE asset_id = ?``. This covers tables that declare no foreign key
+      at all (asset_offline_events, credential_events, wait_handles,
+      fanout_children, blocked_kinds, local_host, ...). Purging only whatever the
+      FK graph mentions leaves those rows behind, pointing at an asset that no
+      longer exists.
+    * grandchildren — tables with no ``asset_id`` that are reached through a
+      foreign key from some other asset-scoped table (``heartbeat_attempts``
+      through ``heartbeat_streams``). These are deleted through a rowid subquery
+      on their parent.
+
+    Ordering used to be a hand-written line for the single grandchild that
+    existed. That is the same shape of bug this module was already fixed for:
+    add another grandchild and the delete fails with a foreign key error *after*
+    several tables have been emptied. Deriving the order means that cannot
+    happen again.
+
+    Returns [(table, sql, uses_asset_param)] ordered so that a table is always
+    deleted before the table it points at.
+    """
+    names = [r['name'] for r in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+    columns = {}
+    for name in names:
+        columns[name] = [c[1] for c in db.execute('PRAGMA table_info("%s")' % name)]
+
+    # edge: child table -> (column, parent table)
+    edges = {}
+    for row in db.execute(
+            "SELECT m.name AS child, p.'from' AS col, p.'table' AS parent "
+            "FROM sqlite_master AS m, pragma_foreign_key_list(m.name) AS p "
+            "WHERE m.type='table'"):
+        if row['parent'] in columns:
+            edges.setdefault(row['child'], []).append((row['col'], row['parent']))
+
+    root_set = {t for t in roots if 'asset_id' in columns.get(t, [])}
+
+    # Walk down from the roots to find grandchildren and their depth.
+    depth = {t: 0 for t in root_set}
+    frontier = sorted(root_set)
+    while frontier:
+        nxt = []
+        for parent in frontier:
+            for child, parent_edges in edges.items():
+                for col, target in parent_edges:
+                    if target != parent or child in root_set or child in depth:
+                        continue
+                    depth[child] = depth[parent] + 1
+                    nxt.append(child)
+        frontier = sorted(set(nxt))
+
+    plan = []
+    for table in sorted(depth, key=lambda t: (-depth[t], t)):
+        if table in root_set:
+            plan.append((table, 'DELETE FROM "%s" WHERE "asset_id"=?' % table, True))
+            continue
+        # Grandchild: exactly one FK pointing at a table we are also deleting.
+        col, parent = edges[table][0]
+        plan.append((
+            table,
+            'DELETE FROM "%s" WHERE "%s" IN (SELECT rowid FROM "%s" WHERE asset_id=?)'
+            % (table, col, parent) if parent in root_set else
+            'DELETE FROM "%s" WHERE "%s" IN '
+            '(SELECT rowid FROM "%s" WHERE "asset_id" IN '
+            '(SELECT "asset_id" FROM "%s" WHERE "asset_id"=?))'
+            % (table, col, parent, parent),
+            True))
+    return plan
+
+
 def _unresolved(db, asset_id):
     return db.execute(
         "SELECT id,state FROM tasks WHERE asset_id=? AND state IN ('claimed','unknown') ORDER BY seq",
@@ -139,7 +241,7 @@ def install_asset_lifecycle(app, transaction, audit, admin):
         """Purge an asset and its dependent rows. Destructive and guarded.
 
         Refused while any task is claimed/unknown: we will not delete the record
-        of a run whose outcome is still unknown — that is precisely the evidence
+        of a run whose outcome is still unknown - that is precisely the evidence
         an operator may need. Resolve or abandon it first.
 
         Deletion order is derived from the schema, not hand-listed. The previous
@@ -163,7 +265,15 @@ def install_asset_lifecycle(app, transaction, audit, admin):
                 raise HTTPException(409, 'Asset has unresolved executions; resolve or abandon them first: '
                                     + ','.join(r['id'] for r in stuck))
             counts = {}
-            # Delete dependents in FK order, inside this one transaction.
+            # Delete dependents children-first. The order is derived from the
+            # schema (see _dependent_chain), not hand-listed: hand lists are
+            # what missed host_tags / credential_handles / sensitive_hits /
+            # account_requests, and what would miss any future grandchild.
+            roots = _tables_with_asset_column(db)
+            plan = _dependent_chain(db, roots)
+            # tasks own rows keyed by task_id that carry no asset_id; they are
+            # listed here because the generic plan only reaches tables that have
+            # an asset column or an FK onto one.
             task_ids = [r['id'] for r in db.execute('SELECT id FROM tasks WHERE asset_id=?', (asset_id,))]
             counts['tasks'] = len(task_ids)
             for task_id in task_ids:
@@ -171,15 +281,13 @@ def install_asset_lifecycle(app, transaction, audit, admin):
                 db.execute('DELETE FROM output_archives WHERE task_id=?', (task_id,))
                 db.execute('DELETE FROM task_controls WHERE task_id=?', (task_id,))
                 db.execute('DELETE FROM task_leases WHERE task_id=?', (task_id,))
-            # Child rows of heartbeat streams are keyed by stream, not by asset.
-            db.execute('DELETE FROM heartbeat_attempts WHERE stream_id IN (SELECT id FROM heartbeat_streams WHERE asset_id=?)', (asset_id,))
             # Detach tasks from turns, then remove the turns they belonged to.
             db.execute('UPDATE tasks SET turn_id=NULL WHERE asset_id=?', (asset_id,))
             db.execute('DELETE FROM tasks WHERE asset_id=?', (asset_id,))
-            for table, column in _asset_fk_children(db):
+            for table, sql, _uses_asset in plan:
                 if table == 'tasks':
                     continue  # already deleted above, together with its own children
-                result = db.execute('DELETE FROM "%s" WHERE "%s"=?' % (table, column), (asset_id,))
+                result = db.execute(sql, (asset_id,))
                 if result.rowcount:
                     # `counts` keys are part of the response contract, so tables
                     # whose key predates this rewrite keep their old name.
@@ -282,11 +390,11 @@ def _fanout_offline(transaction, audit, event, now):
             return
         title = '[资产失联] ' + (event['name'] or event['asset_id'])
         body = '\n'.join([
-            '资产：%s 已失联。' % event['asset_id'],
-            '静默时长：约 %d 秒（超过在线阈值 %d 秒）。' % (int(event['silent_for']), ONLINE_TTL),
+            '资产:%s 已失联。' % event['asset_id'],
+            '静默时长:约 %d 秒(超过在线阈值 %d 秒)。' % (int(event['silent_for']), ONLINE_TTL),
             '',
-            '说明：平台只负责“检测到失联”；是否通知、通知给谁由该 Webhook 决定。',
-            '平台不会自动重派该主机上的任务，也不会去探测它。',
+            '说明:平台只负责"检测到失联";是否通知、通知给谁由该 Webhook 决定。',
+            '平台不会自动重派该主机上的任务,也不会去探测它。',
         ])
         notify_id = enqueue_notification(
             db, turn_id=None, dedupe_key='offline:' + event['id'],

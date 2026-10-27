@@ -131,13 +131,18 @@ def _asset_lookup(db):
 
     Tolerating a missing table matters: `pending` is also called against focused
     fixtures that build only the tables under test. There, "no assets table"
-    means asset checks do not apply, NOT "this hit is orphaned" -- filtering
-    everything out would make the function report an empty inbox for a database
-    it simply has not been told about.
+    means asset checks do not apply, NOT "this hit is orphaned".
+
+    Only that specific condition is tolerated. A broad ``except Exception`` here
+    would silently switch the orphan filter OFF whenever the asset query failed
+    for any other reason (locked db, corrupted schema, renamed table), quietly
+    restoring the dead-card bug this function exists to prevent -- a failure that
+    looks like success. Those errors are raised.
     """
-    try:
-        db.execute('SELECT 1 FROM assets LIMIT 1')
-    except Exception:
+    exists = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name='assets'"
+    ).fetchone()
+    if exists is None:
         return None
 
     def resolve(asset_id):

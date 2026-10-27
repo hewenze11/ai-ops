@@ -58,6 +58,12 @@ def test_pending_lists_masked_hits_only(env):
     import sqlite3
     db = sqlite3.connect(tmp_path / 'control.db')
     db.row_factory = sqlite3.Row
+    # The hit lookup filters hits whose asset no longer exists, so this fixture
+    # needs the asset to exist. A database without an `assets` table is a
+    # different case (asset checks do not apply there) and is not what this
+    # test is about.
+    db.execute("INSERT OR REPLACE INTO assets(id,name,allowed_users,notes,token_hash) "
+               "VALUES('a1','A1','[]','','h')")
     first = sensitive.record(db, turn_id='t1', task_id='k1', asset_id='a1',
                              path='/a', rule_ids=['r1'], baseline_version='v')
     second = sensitive.record(db, turn_id='t1', task_id='k2', asset_id='a1',

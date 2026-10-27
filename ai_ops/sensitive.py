@@ -125,6 +125,27 @@ def record(db, *, turn_id, task_id, asset_id, path, rule_ids, baseline_version):
     return hit_id
 
 
+def _asset_lookup(db):
+    """Return a resolver (asset_id -> row or None), or None when there is no
+    `assets` table at all.
+
+    Tolerating a missing table matters: `pending` is also called against focused
+    fixtures that build only the tables under test. There, "no assets table"
+    means asset checks do not apply, NOT "this hit is orphaned" -- filtering
+    everything out would make the function report an empty inbox for a database
+    it simply has not been told about.
+    """
+    try:
+        db.execute('SELECT 1 FROM assets LIMIT 1')
+    except Exception:
+        return None
+
+    def resolve(asset_id):
+        return db.execute('SELECT name FROM assets WHERE id=?', (asset_id,)).fetchone()
+
+    return resolve
+
+
 def pending(db, turn_id=None):
     """Masked hits the operator has not unlocked yet (newest first)."""
     if turn_id:
@@ -134,8 +155,16 @@ def pending(db, turn_id=None):
         rows = db.execute("SELECT * FROM sensitive_hits WHERE reveal_state='masked' "
                           "ORDER BY created_at DESC LIMIT 100")
     out = []
+    resolve_asset = _asset_lookup(db)
     for row in rows:
-        asset = db.execute('SELECT name FROM assets WHERE id=?', (row['asset_id'],)).fetchone()
+        asset = resolve_asset(row['asset_id']) if resolve_asset else None
+        # A hit whose asset was purged cannot be acted on: unlocking re-reads the
+        # path through that asset, so the card would sit in the inbox forever
+        # with no way to resolve it. `sensitive_hits` keeps no foreign key (a hit
+        # must survive an asset purge as history), so the orphan is possible and
+        # has to be filtered here rather than assumed away.
+        if resolve_asset and asset is None:
+            continue
         out.append({'kind': 'sensitive_hit', 'hit_id': row['id'], 'turn_id': row['turn_id'],
                     'task_id': row['task_id'], 'asset_id': row['asset_id'],
                     'asset_name': asset['name'] if asset else None,

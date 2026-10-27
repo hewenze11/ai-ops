@@ -364,9 +364,21 @@ def routes(app, transaction, audit, admin):
 
     @app.put('/api/v1/name-list-bindings/{mode}', dependencies=[Depends(admin)])
     def bind(mode: str, body: dict):
+        # Partial update: a key that is absent means "leave this slot alone",
+        # an explicit null means "unbind it". Sending the whole triple every
+        # time was the only safe way to use this endpoint, and the obvious
+        # request -- change the deny list -- silently wiped the read and write
+        # lists, which is a data-loss bug a client cannot see in the response.
         with transaction() as db:
-            set_binding(db, mode, body.get('readonly_list'), body.get('write_list'), body.get('deny_list'))
-            audit(db, 'name_list.bound', mode, 'admin', body)
+            unknown = set(body) - {'readonly_list', 'write_list', 'deny_list'}
+            if unknown:
+                raise HTTPException(422, 'Unknown binding field: ' + ', '.join(sorted(unknown)))
+            current = bindings(db).get(mode) or {'readonly_list': None, 'write_list': None, 'deny_list': None}
+            slots = {}
+            for slot in ('readonly_list', 'write_list', 'deny_list'):
+                slots[slot] = body[slot] if slot in body else current.get(slot)
+            set_binding(db, mode, slots['readonly_list'], slots['write_list'], slots['deny_list'])
+            audit(db, 'name_list.bound', mode, 'admin', slots)
             return bindings(db)
 
     @app.put('/api/v1/assets/{asset_id}/tags', dependencies=[Depends(admin)])
